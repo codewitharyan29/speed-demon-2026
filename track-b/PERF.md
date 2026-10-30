@@ -11,7 +11,7 @@ They are only used to compare variants, never reported as results.
 | 0 | The reference, unchanged | | 56.35 | 2200 | 0 |
 | 1 | Baseline: query terms interned in a hash table, parallel corpus scan keeping postings only for query terms, sorted-list merges for BOOL, candidate intersection plus re-tokenising for PHRASE | 6ee4e92 | 0.772 | 328 | 50.613 (K 10.29, 334 lines) |
 | 2 | Binary-search probing for lopsided intersections, SWAR tokeniser, bigram postings for phrases | 08b7a67 | 0.469 | 375 | 54.788 (K 12.47, 409 lines) |
-| 3 | Terms in over 1/32 of the documents as shared bitsets (chosen from a 2% sample), (term, document) pairs packed into 4 bytes | pending | | | |
+| 3 | Terms in over 1/32 of the documents as shared bitsets (chosen from a 2% sample), (term, document) pairs packed into 4 bytes | f2ef5ee | 0.484 | 221 | 56.098 (K 13.24, 496 lines) |
 
 ## Local measurements behind step 2 (in-process ms, median)
 
@@ -52,3 +52,15 @@ A touch-only pass over the whole mapped corpus takes 3 ms, so page faults are no
 
 - T 0.772 -> 0.469 s (-39%), in line with the local 771 -> 562 ms. M rose 328 -> 375 MB: the bigram pairs added
   3.8 M (term, document) pairs and the scan keeps every pair at 8 bytes until the posting arrays are built.
+
+## Notes from board run f2ef5ee
+
+- M 375 -> 221 MB as the local `memory.peak` predicted (358 -> 213). T 0.469 -> 0.484 s is inside the local noise
+  (+/- 5%) so the bitset step cost no measurable time. Lines went 409 -> 496.
+
+## Experiments after step 3 (local, in-process ms median, full data; not yet on the board)
+
+| Variant | Result | Verdict |
+|---|---|---|
+| PGO: instrumented build and run on the full seed-1 data in the pinned rustc 1.99.1 image, `-Cprofile-use`, profile regenerated for the exact source measured | 726 -> 888 (+22%) | rejected: slower, with no profile-mismatch warning. Not investigated further; `tools/pgo.sh` reproduces it |
+| `-C target-cpu=native` through `.cargo/config.toml` (the scoring box builds the track itself) | 732 -> 706 | adopted: small but consistent in both minimum and median, two lines |
