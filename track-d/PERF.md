@@ -10,7 +10,7 @@ They are noisy in absolute terms (a Windows laptop VM, not the scoring box) and 
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 72.69 | 893 | 0 |
 | 1 | Baseline: sequential parse, CSR, early-exit Dijkstra with a binary heap, 12 threads over queries | fdc4472 | 1.310 | 289 | 44.275 (K 7.68, 158 lines) |
-| 2 | Parallel parse and CSR, parallel region-growing renumbering, radix heap, lazy `dist`, `MAP_POPULATE` | pending | | | |
+| 2 | Parallel parse and CSR, parallel region-growing renumbering, radix heap, lazy `dist`, `MAP_POPULATE` | bdfba23 | 0.399 | 272 | 55.446 (K 12.85, 292 lines) |
 
 ## Local measurements behind step 2 (full data, in-process ms, 12 CPUs)
 
@@ -35,3 +35,10 @@ parse + counting sort ~98, region growing ~38, new ids ~13, CSR rebuild ~46, sea
 - Bidirectional Dijkstra: would roughly halve settled nodes but needs a reverse CSR (+40 MB, +~45 ms to build) and a
   second `dist`; the estimated net gain is small against the memory and line-count cost. Needs a measurement.
 - PGO (last, because any later edit invalidates the profile), `get_unchecked` in the search loop, query ordering.
+
+## Notes from board run bdfba23
+
+- T fell 1.310 -> 0.399 s (3.3x) while lines went 158 -> 292: the time term gained far more than the size term lost.
+- M barely moved (289 -> 272 MB) although the per-thread `dist` arrays went from eager to lazy (-55 MB locally).
+  The board's memory.peak therefore seems to include the input mmap pages (92 MB graph.txt), probably because of
+  `MAP_POPULATE` faulting them in. Next experiment: drop `MAP_POPULATE`, or read the input in pieces, and compare M.
