@@ -14,10 +14,10 @@ const REGION: usize = 1 << 15;
 fn map(path: &str) -> &'static [u8] {
     let f = File::open(path).expect("open input");
     let len = f.metadata().unwrap().len() as usize;
-    // SAFETY: PROT_READ (1), MAP_PRIVATE (2) | MAP_POPULATE (0x8000, pre-faults the pages in one go) on a file we just opened; the length is the file's.
+    // SAFETY: PROT_READ (1), MAP_PRIVATE (2) on a file we just opened; the length is the file's.
     unsafe {
         std::slice::from_raw_parts(
-            mmap(std::ptr::null_mut(), len, 1, 2 | 0x8000, f.as_raw_fd(), 0),
+            mmap(std::ptr::null_mut(), len, 1, 2, f.as_raw_fd(), 0),
             len,
         )
     }
