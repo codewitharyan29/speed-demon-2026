@@ -8,22 +8,7 @@ extern "C" {
 
 const THREADS: usize = 12;
 const CHUNKS: usize = 48;
-
-/// Token bytes: lower-cased letters and digits map to themselves, every other byte (including all >= 0x80) to 0.
-static LOWER: [u8; 256] = {
-    let mut t = [0; 256];
-    let mut i = 0;
-    while i < 256 {
-        let c = i as u8;
-        t[i] = match c {
-            b'a'..=b'z' | b'0'..=b'9' => c,
-            b'A'..=b'Z' => c + 32,
-            _ => 0,
-        };
-        i += 1;
-    }
-    t
-};
+const ONES: u64 = 0x0101010101010101;
 
 /// Maps a file read-only. The mapping is never unmapped, so the slice is 'static.
 fn map(path: &str) -> &'static [u8] {
@@ -67,53 +52,147 @@ fn par<S, R: Send>(
     all.into_iter().map(|r| r.1).collect()
 }
 
-/// Fx-style hash step over one byte; the table index uses the high bits, which this mixes best.
-fn step(h: u64, b: u8) -> u64 {
-    (h.rotate_left(5) ^ b as u64).wrapping_mul(0x517cc1b727220a95)
+/// Eight bytes at `at` as a little-endian word; bytes past the end of `b` read as zero.
+fn load(b: &[u8], at: usize) -> u64 {
+    match b.get(at..at + 8) {
+        Some(s) => u64::from_le_bytes(s.try_into().unwrap()),
+        None => {
+            let (mut t, rest) = ([0; 8], b.get(at..).unwrap_or(&[]));
+            t[..rest.len()].copy_from_slice(rest);
+            u64::from_le_bytes(t)
+        }
+    }
 }
 
-/// Every distinct term the queries mention, in an open-addressing table (slot = word index + 1, 0 = empty).
-struct Terms {
-    words: Vec<&'static [u8]>,
+/// Bit 7 of each byte of `w` is set if that byte is an ASCII letter or digit. Eight bytes at once: a byte `x` is in
+/// lo..=hi when adding 0x80 - lo sets its top bit and adding 0x7F - hi does not (no carries, as x < 0x80 here).
+fn alnum(w: u64) -> u64 {
+    let x = w & ONES * 0x7F;
+    let l = (w | ONES * 0x20) & ONES * 0x7F;
+    let digit = (x + ONES * 0x50) & !(x + ONES * 0x46);
+    let letter = (l + ONES * 0x1F) & !(l + ONES * 0x05);
+    (digit | letter) & !w & ONES * 0x80
+}
+
+/// Calls `f(start, len)` for each token (maximal run of letters and digits) in b[from..to], until `f` returns false.
+/// Token edges are the places where `alnum` flips between neighbouring bytes, and edges alternate start, end, start...
+fn tokens(b: &[u8], from: usize, to: usize, mut f: impl FnMut(usize, usize) -> bool) {
+    let (mut base, mut prev, mut start, mut open) = (from, 0u64, 0, false);
+    while base <= to {
+        let mut w = load(b, base);
+        if to - base < 8 {
+            w &= (1u64 << (8 * (to - base))) - 1;
+        }
+        let a = alnum(w);
+        let mut edges = (a ^ (a << 8 | prev >> 56)) & ONES * 0x80;
+        prev = a;
+        while edges != 0 {
+            let at = base + (edges.trailing_zeros() >> 3) as usize;
+            edges &= edges - 1;
+            if open && !f(start, at - start) {
+                return;
+            }
+            start = at;
+            open = !open;
+        }
+        base += 8;
+    }
+}
+
+/// A token of up to 32 bytes, lower-cased, as four little-endian words (zero padded). Equal tokens give equal keys.
+fn key(b: &[u8], from: usize, len: usize) -> [u64; 4] {
+    let mut k = [0; 4];
+    for (i, word) in k.iter_mut().enumerate().take(len.div_ceil(8)) {
+        let n = (len - 8 * i).min(8);
+        *word = (load(b, from + 8 * i) | ONES * 0x20) & (u64::MAX >> (64 - 8 * n));
+    }
+    k
+}
+
+const M: u64 = 0x9E3779B97F4A7C15;
+
+fn hash(k: &[u64; 4]) -> u64 {
+    let mut h = k[0].wrapping_mul(M);
+    if k[1] | k[2] | k[3] != 0 {
+        for &w in &k[1..] {
+            h = (h.rotate_left(29) ^ w).wrapping_mul(M);
+        }
+    }
+    h
+}
+
+/// An open-addressing hash table that numbers distinct keys in order of first appearance (slot = id + 1, 0 = empty).
+struct Table<K> {
+    keys: Vec<K>,
     slots: Vec<u32>,
     bits: u32,
 }
 
-impl Terms {
-    /// The word's id, or the empty slot where it would go.
-    fn find(&self, h: u64, w: &[u8]) -> Result<u32, usize> {
+impl<K: PartialEq + Copy> Table<K> {
+    fn new(max_keys: usize) -> Self {
+        let bits = (max_keys * 2).next_power_of_two().trailing_zeros();
+        Table {
+            keys: Vec::new(),
+            slots: vec![0; 1 << bits],
+            bits,
+        }
+    }
+
+    /// The key's id, or the empty slot where it would go. `h` is the key's hash.
+    fn find(&self, h: u64, k: &K) -> Result<u32, usize> {
         let mask = self.slots.len() - 1;
         let mut i = (h >> (64 - self.bits)) as usize;
         loop {
             match self.slots[i] {
                 0 => return Err(i),
-                s if self.words[s as usize - 1] == w => return Ok(s - 1),
+                s if self.keys[s as usize - 1] == *k => return Ok(s - 1),
                 _ => i = (i + 1) & mask,
             }
         }
     }
 
-    fn intern(&mut self, w: &'static [u8]) -> u32 {
-        match self.find(w.iter().fold(0, |h, &b| step(h, b)), w) {
-            Ok(id) => id,
-            Err(slot) => {
-                self.words.push(w);
-                self.slots[slot] = self.words.len() as u32;
-                self.words.len() as u32 - 1
-            }
-        }
+    fn intern(&mut self, h: u64, k: K) -> u32 {
+        self.find(h, &k).unwrap_or_else(|slot| {
+            self.keys.push(k);
+            self.slots[slot] = self.keys.len() as u32;
+            self.keys.len() as u32 - 1
+        })
     }
 }
 
-/// A parsed query: term ids, and the operator byte (b'A', b'O' or b'N') between each neighbouring pair.
+/// An adjacent pair of terms, as one key.
+fn pair(a: u32, b: u32) -> u64 {
+    (a as u64) << 32 | b as u64
+}
+
+/// A parsed query: term ids, and the operator byte (b'A', b'O' or b'N') between each neighbouring pair. A phrase has
+/// no operators but the id of each adjacent pair of its terms.
 struct Query {
     phrase: bool,
     terms: Vec<u32>,
     ops: Vec<u8>,
+    pairs: Vec<u32>,
 }
 
 /// Merges sorted `a` with sorted `b` under `op`: AND keeps ids in both, OR in either, NOT in `a` only.
+/// When one side is far shorter than the other and the result can only be as long as the short side, it is cheaper
+/// to look each short id up in the long list by binary search than to walk the long list.
 fn combine(op: u8, a: &[u32], b: &[u32], out: &mut Vec<u32>) {
+    let probe = |short: &[u32], long: &[u32], keep: bool, out: &mut Vec<u32>| {
+        let mut from = 0;
+        for &x in short {
+            from += long[from..].partition_point(|&y| y < x);
+            if (from < long.len() && long[from] == x) == keep {
+                out.push(x);
+            }
+        }
+    };
+    if op != b'O' && a.len() * 16 < b.len() {
+        return probe(a, b, op == b'A', out);
+    }
+    if op == b'A' && b.len() * 16 < a.len() {
+        return probe(b, a, true, out);
+    }
     let (mut i, mut j) = (0, 0);
     while i < a.len() && j < b.len() {
         if a[i] < b[j] {
@@ -142,30 +221,25 @@ fn combine(op: u8, a: &[u32], b: &[u32], out: &mut Vec<u32>) {
     }
 }
 
-/// True if the tokens of `text` contain `words` at consecutive positions.
-fn has_phrase(text: &[u8], words: &[&[u8]], spans: &mut Vec<(usize, usize)>) -> bool {
-    spans.clear();
-    let mut i = 0;
-    while i < text.len() {
-        if LOWER[text[i] as usize] == 0 {
-            i += 1;
-            continue;
-        }
-        let from = i;
-        while i < text.len() && LOWER[text[i] as usize] != 0 {
-            i += 1;
-        }
-        spans.push((from, i));
-    }
-    spans.windows(words.len()).any(|win| {
-        win.iter().zip(words).all(|(&(a, b), w)| {
-            b - a == w.len()
-                && text[a..b]
-                    .iter()
-                    .zip(w.iter())
-                    .all(|(&c, &d)| LOWER[c as usize] == d)
-        })
-    })
+/// True if the tokens of b[from..to] contain `words` at consecutive positions. Bit-parallel (shift-and) matching:
+/// bit j of `state` says "the last tokens match words[0..=j]", so one pass finds the phrase, repeated words included.
+fn has_phrase(b: &[u8], from: usize, to: usize, words: &[[u64; 4]]) -> bool {
+    let (mut state, mut found) = (0u8, false);
+    tokens(b, from, to, |at, len| {
+        let k = if len <= 32 {
+            key(b, at, len)
+        } else {
+            [u64::MAX; 4]
+        };
+        let here = words
+            .iter()
+            .enumerate()
+            .fold(0u8, |m, (j, w)| m | ((*w == k) as u8) << j);
+        state = (state << 1 | 1) & here;
+        found = state >> (words.len() - 1) & 1 == 1;
+        !found
+    });
+    found
 }
 
 fn put(out: &mut Vec<u8>, mut x: u64) {
@@ -183,15 +257,11 @@ fn put(out: &mut Vec<u8>, mut x: u64) {
 }
 
 fn main() {
-    // Intern every term of every query.
+    // Intern every term of every query, and every adjacent pair of terms in a phrase. `used` says how a term is
+    // used: bit 0 in a BOOL query (needs a posting list), bit 1 in a phrase (needs pair tracking in the scan).
     let q = map("/data/queries.txt");
-    let tokens = q.iter().filter(|&&c| c == b' ' || c == b'\n').count();
-    let bits = (tokens * 2).next_power_of_two().trailing_zeros();
-    let mut terms = Terms {
-        words: Vec::new(),
-        slots: vec![0; 1 << bits],
-        bits,
-    };
+    let words = q.iter().filter(|&&c| c == b' ' || c == b'\n').count();
+    let (mut terms, mut grams, mut used) = (Table::new(words), Table::new(words), Vec::new());
     let queries: Vec<Query> = q
         .split(|&c| c == b'\n')
         .filter(|l| !l.is_empty())
@@ -204,20 +274,32 @@ fn main() {
                     ops.push(w[0]);
                 } else {
                     let w = w.strip_prefix(b"\"").unwrap_or(w);
-                    ids.push(terms.intern(w.strip_suffix(b"\"").unwrap_or(w)));
+                    let w = w.strip_suffix(b"\"").unwrap_or(w);
+                    let k = key(w, 0, w.len());
+                    let id = terms.intern(hash(&k), k);
+                    used.resize(terms.keys.len(), 0u8);
+                    used[id as usize] |= 1 + phrase as u8;
+                    ids.push(id);
                 }
             }
+            let pairs = ids
+                .windows(2)
+                .filter(|_| phrase)
+                .map(|w| grams.intern(pair(w[0], w[1]).wrapping_mul(M), pair(w[0], w[1])))
+                .collect();
             Query {
                 phrase,
                 terms: ids,
                 ops,
+                pairs,
             }
         })
         .collect();
-    let nterms = terms.words.len();
+    let (nterms, nkeys) = (terms.keys.len(), terms.keys.len() + grams.keys.len());
 
     // Scan the corpus in newline-aligned chunks. A chunk yields (term, doc) pairs for the query terms only,
-    // each once per document, in document order, plus the byte offset of each of its documents.
+    // each once per document, in document order, plus the byte offset of each of its documents. The first token
+    // of a line is the document id.
     let docs = map("/data/docs.txt");
     let cut = |i: usize| match i {
         0 => 0,
@@ -229,44 +311,48 @@ fn main() {
     };
     let scanned = par(
         CHUNKS,
-        || vec![0u32; nterms],
+        || vec![0u32; nkeys],
         |last, c| {
-            let (mut i, end) = (cut(c), cut(c + 1));
-            let (mut pairs, mut offs) = (Vec::new(), Vec::new());
-            while i < end {
-                offs.push(i as u32);
-                let mut id = 0u32;
-                while docs[i] != b'\t' {
-                    id = id * 10 + (docs[i] - b'0') as u32;
-                    i += 1;
+            let (mut doc, mut prev, mut pairs, mut offs) = (0, u32::MAX, Vec::new(), Vec::new());
+            let mut note = |id: u32, doc: u32, pairs: &mut Vec<(u32, u32)>| {
+                if last[id as usize] != doc + 1 {
+                    last[id as usize] = doc + 1;
+                    pairs.push((id, doc));
                 }
-                i += 1;
-                while docs[i] != b'\n' {
-                    if LOWER[docs[i] as usize] == 0 {
-                        i += 1;
-                        continue;
+            };
+            tokens(docs, cut(c), cut(c + 1), |at, len| {
+                let hit = if len > 32 {
+                    Err(0)
+                } else {
+                    let k = key(docs, at, len);
+                    terms.find(hash(&k), &k)
+                };
+                if at == 0 || docs[at - 1] == b'\n' {
+                    doc = docs[at..at + len]
+                        .iter()
+                        .fold(0, |x, &d| x * 10 + (d - b'0') as u32);
+                    offs.push(at as u32);
+                    prev = u32::MAX;
+                } else if let Ok(t) = hit {
+                    if used[t as usize] & 1 != 0 {
+                        note(t, doc, &mut pairs);
                     }
-                    let (mut h, mut word, mut len) = (0, [0u8; 32], 0);
-                    while LOWER[docs[i] as usize] != 0 {
-                        let b = LOWER[docs[i] as usize];
-                        h = step(h, b);
-                        if len < 32 {
-                            word[len] = b;
+                    if used[t as usize] & 2 != 0 {
+                        if let (true, Ok(g)) = (
+                            prev != u32::MAX,
+                            grams.find(pair(prev, t).wrapping_mul(M), &pair(prev, t)),
+                        ) {
+                            note(nterms as u32 + g, doc, &mut pairs);
                         }
-                        len += 1;
-                        i += 1;
+                        prev = t;
+                    } else {
+                        prev = u32::MAX;
                     }
-                    if len <= 32 {
-                        if let Ok(t) = terms.find(h, &word[..len]) {
-                            if last[t as usize] != id + 1 {
-                                last[t as usize] = id + 1;
-                                pairs.push((t, id));
-                            }
-                        }
-                    }
+                } else {
+                    prev = u32::MAX;
                 }
-                i += 1;
-            }
+                true
+            });
             (pairs, offs)
         },
     );
@@ -277,22 +363,22 @@ fn main() {
         CHUNKS,
         || (),
         |_, c| {
-            let mut row = vec![0u32; nterms];
+            let mut row = vec![0u32; nkeys];
             for &(t, _) in &scanned[c].0 {
                 row[t as usize] += 1;
             }
             row
         },
     );
-    let mut start = vec![0u32; nterms + 1];
-    for t in 0..nterms {
+    let mut start = vec![0u32; nkeys + 1];
+    for t in 0..nkeys {
         let mut at = start[t];
         for row in place.iter_mut() {
             (row[t], at) = (at, at + row[t]);
         }
         start[t + 1] = at;
     }
-    let post: Vec<AtomicU32> = (0..start[nterms]).map(|_| AtomicU32::new(0)).collect();
+    let post: Vec<AtomicU32> = (0..start[nkeys]).map(|_| AtomicU32::new(0)).collect();
     par(
         CHUNKS,
         || (),
@@ -313,13 +399,15 @@ fn main() {
     // Answer the queries, 64 per job.
     let lines = par(
         queries.len().div_ceil(64),
-        || (Vec::new(), Vec::new(), Vec::new()),
-        |(cur, tmp, spans), j| {
+        || (Vec::new(), Vec::new()),
+        |(cur, tmp), j| {
             let mut out = Vec::new();
             for query in &queries[j * 64..((j + 1) * 64).min(queries.len())] {
                 cur.clear();
                 if query.phrase {
-                    let mut order = query.terms.clone();
+                    // Documents holding every adjacent pair of the phrase; two terms need no more than that.
+                    let mut order: Vec<_> =
+                        query.pairs.iter().map(|&g| nterms as u32 + g).collect();
                     order.sort_by_key(|&t| list(t).len());
                     cur.extend_from_slice(list(order[0]));
                     for &t in &order[1..] {
@@ -327,17 +415,22 @@ fn main() {
                         combine(b'A', cur, list(t), tmp);
                         std::mem::swap(cur, tmp);
                     }
-                    let words: Vec<&[u8]> = query
+                    let words: Vec<_> = query
                         .terms
                         .iter()
-                        .map(|&t| terms.words[t as usize])
+                        .map(|&t| terms.keys[t as usize])
                         .collect();
-                    cur.retain(|&d| {
-                        let text = &docs[doc_off[d as usize] as usize..];
-                        let tab = text.iter().position(|&c| c == b'\t').unwrap();
-                        let len = text.iter().position(|&c| c == b'\n').unwrap();
-                        has_phrase(&text[tab + 1..len], &words, spans)
-                    });
+                    if words.len() > 2 {
+                        cur.retain(|&d| {
+                            let from = doc_off[d as usize] as usize;
+                            let end = doc_off
+                                .get(d as usize + 1)
+                                .map_or(docs.len(), |&next| next as usize)
+                                - 1;
+                            let tab = docs[from..].iter().position(|&c| c == b'\t').unwrap();
+                            has_phrase(docs, from + tab + 1, end, &words)
+                        });
+                    }
                 } else {
                     cur.extend_from_slice(list(query.terms[0]));
                     for (k, &op) in query.ops.iter().enumerate() {
