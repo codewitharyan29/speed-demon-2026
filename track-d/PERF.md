@@ -11,6 +11,7 @@ They are noisy in absolute terms (a Windows laptop VM, not the scoring box) and 
 | 0 | The reference, unchanged | | 72.69 | 893 | 0 |
 | 1 | Baseline: sequential parse, CSR, early-exit Dijkstra with a binary heap, 12 threads over queries | fdc4472 | 1.310 | 289 | 44.275 (K 7.68, 158 lines) |
 | 2 | Parallel parse and CSR, parallel region-growing renumbering, radix heap, lazy `dist`, `MAP_POPULATE` | bdfba23 | 0.399 | 272 | 55.446 (K 12.85, 292 lines) |
+| 3 | Drop `MAP_POPULATE` (to see whether the board charges the pre-faulted input pages to M) | pending | | | |
 
 ## Local measurements behind step 2 (full data, in-process ms, 12 CPUs)
 

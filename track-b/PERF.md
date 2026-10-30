@@ -10,7 +10,8 @@ They are only used to compare variants, never reported as results.
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 56.35 | 2200 | 0 |
 | 1 | Baseline: query terms interned in a hash table, parallel corpus scan keeping postings only for query terms, sorted-list merges for BOOL, candidate intersection plus re-tokenising for PHRASE | 6ee4e92 | 0.772 | 328 | 50.613 (K 10.29, 334 lines) |
-| 2 | Binary-search probing for lopsided intersections, SWAR tokeniser, bigram postings for phrases | pending | | | |
+| 2 | Binary-search probing for lopsided intersections, SWAR tokeniser, bigram postings for phrases | 08b7a67 | 0.469 | 375 | 54.788 (K 12.47, 409 lines) |
+| 3 | Terms in over 1/32 of the documents as shared bitsets (chosen from a 2% sample), (term, document) pairs packed into 4 bytes | pending | | | |
 
 ## Local measurements behind step 2 (in-process ms, median)
 
@@ -23,7 +24,15 @@ They are only used to compare variants, never reported as results.
 | Bigram postings: the scan also records, per document, each adjacent pair of phrase terms | 562 vs 646 | kept: a 2-term phrase is exactly its pair list; longer phrases intersect pair lists, so only a handful of candidates need re-tokenising (candidates were 214k docs / 439 MB before) |
 | Dense terms (sampled df over 1/32) as shared bitsets instead of pair lists | 587 vs 560; `memory.peak` 270 vs 359 MB | reverted: -89 MB, but not faster and +45 lines, about break-even on the score |
 
-## Where the time goes now (ms, local, 12 threads)
+## Local measurements behind step 3
+
+| Variant | Result | Verdict |
+|---|---|---|
+| Dense terms as bitsets (362 of 75.7 k terms; 10 MB) | pairs 24.9 M -> 14.9 M; `memory.peak` 359 -> 270 MB; time within noise | kept now: the board showed memory is the weak spot (375 MB) |
+| Pairs packed as `term << 14 | document-in-chunk` | another -60 MB; `memory.peak` 211 MB with both; time 604 -> 635 ms median (min 541 vs 550), within noise | kept; guarded by assertions on the key count and the chunk size |
+| Plain byte loop with `is_ascii_alphanumeric` instead of the SWAR tokeniser (-13 lines) | 699 vs 628 ms | reverted: the tokeniser pays for its lines now that the rest is faster (it showed no gain in the earlier test only because the probe cost hid it) |
+
+## Where the time goes (step 2 numbers) (ms, local, 12 threads)
 
 query parse 40 (single thread), scan 340-360, posting build 40, answering 100.
 Scan ablation (wall ms): tokenising only 78, +key and hash 105, +table probe 200, +used/last check 245, +bigram
@@ -38,3 +47,8 @@ A touch-only pass over the whole mapped corpus takes 3 ms, so page faults are no
 - Pairs packed into 4 bytes (term 17 bits, document-in-chunk 13 bits) to cut the intermediate arrays; 14.9-24.9 M pairs
   at 8 bytes each are most of the memory.
 - Parallel query parsing; PGO and `target-cpu=native` last.
+
+## Notes from board run 08b7a67
+
+- T 0.772 -> 0.469 s (-39%), in line with the local 771 -> 562 ms. M rose 328 -> 375 MB: the bigram pairs added
+  3.8 M (term, document) pairs and the scan keeps every pair at 8 bytes until the posting arrays are built.
