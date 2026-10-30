@@ -43,3 +43,10 @@ parse + counting sort ~98, region growing ~38, new ids ~13, CSR rebuild ~46, sea
 - M barely moved (289 -> 272 MB) although the per-thread `dist` arrays went from eager to lazy (-55 MB locally).
   The board's memory.peak therefore seems to include the input mmap pages (92 MB graph.txt), probably because of
   `MAP_POPULATE` faulting them in. Next experiment: drop `MAP_POPULATE`, or read the input in pieces, and compare M.
+
+## Experiments after step 3 (local, in-process ms median, full data; not yet on the board)
+
+| Variant | Result | Verdict |
+|---|---|---|
+| PGO: instrumented build and run on the full seed-1 data in the pinned rustc 1.99.1 image, `-Cprofile-use`, profile regenerated for the exact source measured | 639 -> 728 (+14%) | rejected: slower, with no profile-mismatch warning. Not investigated further; `tools/pgo.sh` reproduces it |
+| `-C target-cpu=native` through `.cargo/config.toml` (the scoring box builds the track itself) | 659 -> 642 | adopted: small but consistent in both minimum and median, two lines |

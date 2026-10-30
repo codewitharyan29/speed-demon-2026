@@ -17,6 +17,8 @@ for k, d in enumerate(args):
     write = f'std::fs::write("/out/{OUT}"'
     s = s.replace(write, 'eprintln!("end {}", t0.elapsed().as_micros());\n    ' + write, 1)
     open(p, "w", newline="\n").write(s)
+    if os.path.exists(os.path.join(tmp, ".cargo", "config.toml")) and "profile-use" in open(os.path.join(tmp, ".cargo", "config.toml")).read():
+        subprocess.run(["sh", os.path.join(os.path.dirname(os.path.abspath(__file__)), "pgo.sh"), T, tmp], check=True)  # profile must match the injected source
     subprocess.run(["docker", "build", "-q", "--network=none", "-t", f"sd-ab{k}", tmp], check=True, stdout=subprocess.DEVNULL)
     tags.append(f"sd-ab{k}")
 res = {t: [] for t in tags}
