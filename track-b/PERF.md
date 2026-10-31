@@ -210,6 +210,9 @@ Verified on full seeds 1 and 2, sample seeds 1-3, tiny seeds 1-6 and the worked 
 | Branch-free merge in `combine` (always write the smaller head, advance the output by whether `op` keeps it); `combine` made `u16`-only | 188 -> 188, 191 -> 196 | rejected: the merge's 7 M mispredicts are not what the evaluation waits on |
 | Bookkeeping by kind: each batch's tokens listed by kind (bitset term, list term) without a branch, then one loop per kind with no kind branch (the profile's largest mispredict source, 23 M); phrase pairs in their own in-order pass | 207 -> 210, 217 -> 218 | rejected: no effect |
 | First operator fused into the start: two leading lists merged straight into the running set (no copy of the first list, no `tmp` swap) | 189 -> 189, 193 -> 192 | rejected: no effect |
+| `short_key`: the token's 16 bytes read as one `u128` behind one bounds check, both words cut to the token with BMI2 `bzhi` (instead of two checked loads and `checked_shr` masks) | 1 thread: 1,060 -> 1,042 (a first, longer form: 1,097 -> 1,066 and 1,060 -> 1,032); 12 threads: 190 -> 178, 183 -> 183 | kept (+2 lines): less work, which a fixed-clock board should see |
+| `bzhi` masks alone, keeping the two checked loads | 1 thread: 1,091 -> 1,096 | rejected: the gain is the single bounds check |
+| Bucket index from one multiply, `(k0 ^ k1.rotate_left(31)) * M`, instead of two | 1 thread: 1,139 -> 1,112, 1,044 -> 1,058 | rejected: no clear effect |
 
 Cycle counters per part of the chunk worker (lfence-fenced `rdtsc`, summed per chunk in locals; throwaway build),
 Mcycles over all threads: scan ~3,200, counting sort ~190, phrases ~190, BOOL evaluation ~900 (1.65 M evaluations
@@ -219,8 +222,14 @@ histogram of cycles per BOOL evaluation: 1.52 M of the 1.65 M take 150-1,500 cyc
 1,500-6,000 (143), 506 take more (66). So the cost is a fixed overhead per (query, chunk), not a few heavy queries, and
 neither its memory reads (prefetching) nor the merge's mispredicts (branch-free merge) explain it.
 
-Five targeted changes in a row (sorted queries, prefetching, branch-free merge, bookkeeping by kind, fused start) moved
-nothing, although each removed what the profile blamed. Taken together that suggests the 12 threads are limited by
-something they share (the two hardware threads of a core, or the memory system) rather than by any one of these
-costs; the next step should test that directly (for example the chunk worker alone on 6 and 12 threads) before more
-micro-changes.
+Scaling of the whole program (median of 5): 1 thread 1,049 ms, 3 threads 390, 6 threads 247, 12 threads 189. So the
+threads are not starved by something they share (3 threads are 93% efficient, 6 threads 78%, part of it the laptop's
+turbo dropping as more cores work; the board runs at a fixed 2.5 GHz); the program simply does about 1 s of work. One
+thread is also the more sensitive test: of the rejected micro-changes above, bookkeeping by kind is -1.3% on one thread
+(1,048 -> 1,035), the branch-free merge and the fused start are still nothing.
+
+Single-thread ablation of the chunk worker (query evaluation skipped unless stated; minimum ms): tokenising, with the
+query parse and the sample, 151; + keys and table lookups 459; + bookkeeping and the counting sort 777; + evaluation
+1,023. The lookups split into memory and instructions: with every lookup forced into the first 256 buckets (all in L1)
+they cost 363 instead of 457, so about 95 ms of the ~300 is the table's size and about 200 is instructions (some 20
+cycles a token for the key, the hash, the prefetch and the compare).
