@@ -19,7 +19,7 @@ extern "C" {
 
 const THREADS: usize = 12;
 const CHUNK: usize = 4 << 20;
-const BLOCK: usize = 256 << 10; // bytes read at a time; small enough to stay in the core's cache while it is parsed
+const BLOCK: usize = 64 << 10; // bytes read at a time; small enough to stay in the core's cache while it is parsed
 const HOURS: usize = 72;
 const SLOTS: usize = 4096; // dictionary slots; the spec has at most 1,842 endpoints
 const STRIDE: usize = 128; // bytes per stored endpoint; endpoints are 1..=125 bytes

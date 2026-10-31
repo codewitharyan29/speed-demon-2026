@@ -114,6 +114,29 @@ Wall time did not move locally because the VM's wall time is bound by kernel wor
 box spends little time in the kernel (T 26 ms x 12 threads is about the 330 ms of user CPU measured here), so the user-CPU
 reduction is what the board run has to confirm.
 
+## Round 2, step 2: 4-byte records (local, `tools/ab.sh` 20 rounds, `tools/mem.sh` fresh container, tmpfs output)
+
+A record is one `u32`: latency in 20 bits, endpoint id in 11 (the spec allows 1,842 endpoints), 5xx flag in the top bit. A latency of
+`2^20 - 1` or more is stored as that sentinel and the full latency follows in a second word, so a region holds at most 8 bytes per
+line and the scheme is correct for any latency distribution. 1.2% of seed 1's lines take the second word. Both phase-2 loops walk
+the words with one data-dependent stride (`each_record`). Checked byte for byte against the Python reference on shuffled inputs
+(150k lines, 1,800 endpoints) with every latency = 4294967295, = 1048575 (the sentinel), = 1048574, in 1048573..1048577, uniform
+random u32, all 0, and a 50/50 mix of 0 and 4294967295 (`tools/stress_a.py <seed> <lines> shuffled <mode>`, `tools/stress_check.sh`),
+and on the tiny and stress-4 inputs; full seed 1 hash unchanged.
+
+| Variant | wall ms | user ms | sys ms | memory.peak MB |
+|---|---|---|---|---|
+| `sel` (step 1), 256 KB read blocks | 96 | 306 | 306 | 25.5 |
+| 4-byte records, 256 KB blocks | 94 | 298 | 303 | 20.4 |
+| 4-byte records, 128 KB blocks | 91.5 (90) | 299 | 258 | 19.4 |
+| 4-byte records, 64 KB blocks | 92.5 (88) | 290 | 256 | 19.0 |
+| 4-byte records, 32 KB blocks | (89) | (285) | (246) | 18.9 |
+
+(Numbers in parentheses come from the second 20-round session, which also timed 128 KB at 90 ms.) Records shrink the peak by 5 MB and
+cost nothing. Smaller read blocks lower both sys time (less cache pressure, and the 8 buffers shrink from 2 MB to 0.5 MB) and the
+peak; 64 KB is kept, 32 KB is not measurably better. The Docker VM has 512 KB of L2 per core shared by two threads; the board's
+cache sizes differ, so this one needs the board's word.
+
 ## Rejected or inconclusive (local, 8 threads, interleaved hyperfine)
 
 - **Input mmap'd, `MADV_POPULATE_READ` per worker chunk (E2c):** 161 vs 128 ms for `pread` in the same session (1.26x
