@@ -8,7 +8,8 @@
 
 use std::arch::x86_64::*;
 use std::fs::File;
-use std::os::unix::fs::{FileExt, OpenOptionsExt};
+use std::io::Write;
+use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -219,54 +220,6 @@ struct Scratch {
     values: Vec<u32>,
 }
 
-/// The summary file, written with O_DIRECT so that its 10 MB never enter the page cache, which M counts. Direct writes
-/// need a page-aligned buffer and whole pages, so lines gather in an anonymous mapping and go out in blocks of whole pages.
-/// The last block is padded with zeros and the file is cut back to its real size.
-struct Sink {
-    file: File,
-    path: String,
-    stage: usize,
-    fill: usize,
-    pos: u64,
-    size: u64,
-}
-
-impl Sink {
-    const FLUSH: usize = 1 << 20;
-    const STAGE: usize = 2 << 20;
-
-    fn new(path: String) -> Self {
-        let mut options = File::options();
-        options.write(true).create(true).truncate(true).custom_flags(0x4000); // O_DIRECT
-        let file = options.open(&path).or_else(|_| File::create(&path)).unwrap();
-        let stage = unsafe { mmap(std::ptr::null_mut(), Self::STAGE, 3, 0x22, -1, 0) } as usize;
-        Sink { file, path, stage, fill: 0, pos: 0, size: 0 }
-    }
-
-    fn add(&mut self, lines: &[u8], last: bool) {
-        let stage = unsafe { std::slice::from_raw_parts_mut(self.stage as *mut u8, Self::STAGE) };
-        stage[self.fill..self.fill + lines.len()].copy_from_slice(lines);
-        (self.fill, self.size) = (self.fill + lines.len(), self.size + lines.len() as u64);
-        let n = match (last, self.fill >= Self::FLUSH) {
-            (true, _) => self.fill.next_multiple_of(4096),
-            (_, true) => self.fill & !4095,
-            _ => return,
-        };
-        stage[self.fill.min(n)..n].fill(0);
-        if self.file.write_all_at(&stage[..n], self.pos).is_err() {
-            // The file system refuses direct writes: use ordinary ones.
-            self.file = File::options().write(true).open(&self.path).unwrap();
-            self.file.write_all_at(&stage[..n], self.pos).unwrap();
-        }
-        self.pos += n as u64;
-        stage.copy_within(n.min(self.fill)..self.fill, 0);
-        self.fill -= n.min(self.fill);
-        if last {
-            self.file.set_len(self.size).unwrap();
-        }
-    }
-}
-
 /// State shared by all workers.
 struct Job {
     input: File,
@@ -285,7 +238,7 @@ struct Job {
     /// Buffers for `summarise` that are not in use; only a few hours are summarised at a time.
     spare: Mutex<Vec<Scratch>>,
     /// The summary file, the next hour to write to it, and the lines of the hours that wait for earlier ones.
-    out: Mutex<(Sink, usize, Vec<Option<Vec<u8>>>)>,
+    out: Mutex<(File, usize, Vec<Option<Vec<u8>>>)>,
 }
 
 impl Job {
@@ -296,7 +249,7 @@ impl Job {
         std::fs::create_dir_all(out).unwrap();
         // PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE: only the touched parts are backed.
         let arena = unsafe { mmap(std::ptr::null_mut(), chunks * HOURS * REGION, 3, 0x4022, -1, 0) } as usize;
-        let summary = Sink::new(format!("{out}/summary.txt"));
+        let summary = File::create(format!("{out}/summary.txt")).unwrap();
         Job {
             input,
             len,
@@ -448,11 +401,11 @@ impl Job {
     /// Hands over the lines of hour `h` and writes every hour that is now complete, in order. The last write ends the process.
     fn publish(&self, h: usize, lines: Vec<u8>) {
         let mut guard = self.out.lock().unwrap();
-        let (sink, next, pending) = &mut *guard;
+        let (file, next, pending) = &mut *guard;
         pending[h] = Some(lines);
         while *next < HOURS && pending[*next].is_some() {
+            file.write_all(&pending[*next].take().unwrap()).unwrap();
             *next += 1;
-            sink.add(&pending[*next - 1].take().unwrap(), *next == HOURS);
         }
         if *next == HOURS && !self.bad.load(Relaxed) {
             std::process::exit(0);
