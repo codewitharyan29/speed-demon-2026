@@ -63,9 +63,11 @@ struct Names {
 
 impl Names {
     fn new(bits: u32) -> Names {
-        // Zeroed memory from the allocator is not touched until used, so only filled entries cost memory.
-        let layout = std::alloc::Layout::array::<Entry>(1 << bits).unwrap();
-        let table = unsafe { std::slice::from_raw_parts(std::alloc::alloc_zeroed(layout) as *const Entry, 1 << bits) };
+        // Large zeroed allocations are fresh pages that cost memory only once filled in, unless the alignment asked for is
+        // more than the allocator's: then it zeroes them by hand. So allocate with room to spare and align by hand.
+        let layout = std::alloc::Layout::from_size_align((64 << bits) + 64, 16).unwrap();
+        let base = (unsafe { std::alloc::alloc_zeroed(layout) } as usize + 63) & !63;
+        let table = unsafe { std::slice::from_raw_parts(base as *const Entry, 1 << bits) };
         let spill = Box::leak(vec![0u8; 32 << bits].into_boxed_slice());
         Names { table, spill, spilled: AtomicUsize::new(0), filled: AtomicUsize::new(0), full: AtomicBool::new(false) }
     }
@@ -289,8 +291,11 @@ fn record(c: &Ctx, b: &[u8], q: &Quotes, start: usize, sep: &[u32], batch: &mut 
     // SAFETY: both buffers have 32 readable bytes after the name; the hash reads at most 16 around its ends.
     let hash = unsafe { hash(name, len) };
     unsafe {
-        // The entry is probably within four lines of the slot where its search starts.
+        // The entry is probably in the slot where its search starts, or within three lines after it. The first is about to be
+        // written (its country's bit is set), so it is fetched for writing, which saves a second trip to the core that wrote it.
         let slot = c.names.slot(hash) as *const Entry as *const i8;
+        _mm_prefetch::<_MM_HINT_ET0>(slot);
+        (1..4).for_each(|k| _mm_prefetch::<_MM_HINT_T0>(slot.add(64 * k)));
         if let Some(r) = c.region.get(region as usize) {
             _mm_prefetch::<_MM_HINT_T0>(r as *const AtomicU16 as *const i8);
         }
@@ -305,7 +310,8 @@ fn resolve(c: &Ctx, batch: &mut Batch, aggs: &mut [Agg]) {
     for r in batch.recs.drain(..) {
         let country = c.dense[c.region.get(r.region).map_or(0, |x| x.load(Relaxed)) as usize] as usize;
         // SAFETY: the name has 32 readable bytes after it, as `record` ensured.
-        let name = &c.names.table[0]; // DIAGNOSTIC: no name lookups
+        let name = unsafe { c.names.entry(r.name, r.len, r.hash) };
+        name.mask[country / 64].fetch_or(1 << (country % 64), Relaxed);
         let a = &mut aggs[country];
         a.count += 1;
         a.id_sum += r.id;
