@@ -465,30 +465,42 @@ impl Run {
         }
     }
 
-    /// The set's size, the sum of its ids, and its (up to) ten smallest ids.
-    fn summary(&self) -> (u64, u64, Vec<u16>) {
-        if !self.dense {
-            let sum = self.list.iter().map(|&d| d as u64).sum();
-            return (
+    /// The set's size and the sum of its ids.
+    fn size_sum(&self) -> (u64, u64) {
+        if self.dense {
+            let (mut count, mut sum) = (0, 0);
+            for (i, &word) in self.bits.iter().enumerate() {
+                let mut w = word;
+                count += w.count_ones() as u64;
+                while w != 0 {
+                    sum += (i * 64) as u64 + w.trailing_zeros() as u64;
+                    w &= w - 1;
+                }
+            }
+            (count, sum)
+        } else {
+            (
                 self.list.len() as u64,
-                sum,
-                self.list.iter().take(10).copied().collect(),
-            );
+                self.list.iter().map(|&d| d as u64).sum(),
+            )
         }
-        let (mut count, mut sum, mut first) = (0, 0, Vec::new());
+    }
+
+    /// Appends the set's (up to) ten smallest ids, plus `base`.
+    fn smallest(&self, base: u32, out: &mut Vec<u32>) {
+        if !self.dense {
+            return out.extend(self.list.iter().take(10).map(|&d| base + d as u32));
+        }
         for (i, &word) in self.bits.iter().enumerate() {
             let mut w = word;
-            count += w.count_ones() as u64;
-            while w != 0 {
-                let d = (i * 64) as u16 + w.trailing_zeros() as u16;
-                sum += d as u64;
-                if first.len() < 10 {
-                    first.push(d);
-                }
+            if out.len() >= 20 {
+                break;
+            }
+            while w != 0 && out.len() < 20 {
+                out.push(base + (i * 64) as u32 + w.trailing_zeros());
                 w &= w - 1;
             }
         }
-        (count, sum, first)
     }
 }
 
@@ -604,9 +616,13 @@ fn main() {
         },
     );
     let seen: u32 = sampled.iter().map(|s| s.1).sum();
+    let df: Vec<u32> = (0..nterms)
+        .map(|t| sampled.iter().map(|s| s.0[t]).sum())
+        .collect();
+    drop(sampled);
     let (mut dense_of, mut ndense) = (vec![u32::MAX; nterms], 0);
     for t in 0..nterms {
-        if used[t] & 1 != 0 && sampled.iter().map(|s| s.0[t]).sum::<u32>() * 32 >= seen {
+        if used[t] & 1 != 0 && df[t] * 32 >= seen {
             (dense_of[t], ndense) = (ndense, ndense + 1);
         }
     }
@@ -615,7 +631,7 @@ fn main() {
     // documents) needs just one: that term with its rarer neighbour, as its few candidates are verified anyway. A
     // phrase of common words keeps all its pairs, as only their intersection is short. The terms of those pairs are
     // the ones the scan tracks pairs for, so most common words never get looked at as half of a pair.
-    let df = |t: u32| sampled.iter().map(|s| s.0[t as usize]).sum::<u32>();
+    let df = |t: u32| df[t as usize];
     for query in queries.iter_mut().filter(|q| q.phrase) {
         let t = &query.terms;
         let rare = (0..t.len()).min_by_key(|&i| df(t[i])).unwrap();
@@ -658,7 +674,8 @@ fn main() {
     // the sum of ids and the ten smallest ids seen so far.
     let count: Vec<AtomicU32> = (0..queries.len()).map(|_| AtomicU32::new(0)).collect();
     let sum: Vec<AtomicU64> = (0..queries.len()).map(|_| AtomicU64::new(0)).collect();
-    let first: Vec<Mutex<Vec<u32>>> = (0..queries.len()).map(|_| Mutex::new(Vec::new())).collect();
+    // The ten smallest ids of each query so far, and in the eleventh slot how many of the ten there are.
+    let first: Vec<Mutex<[u32; 11]>> = (0..queries.len()).map(|_| Mutex::new([0; 11])).collect();
     par(CHUNKS, Chunk::default, |w, c| {
         let range = (cut(c, CHUNKS), cut(c + 1, CHUNKS));
         let base = first_doc(range.0);
@@ -765,6 +782,9 @@ fn main() {
                     order.extend(query.pairs.iter().map(|&g| nterms as u32 + g)),
                 );
                 order.sort_by_key(|&t| list(t).len());
+                if list(order[0]).is_empty() {
+                    continue;
+                }
                 run.start(&Operand::List(list(order[0])));
                 for &t in &order[1..] {
                     run.apply(b'A', &Operand::List(list(t)));
@@ -786,19 +806,28 @@ fn main() {
                     });
                 }
             } else {
-                run.start(&operand(query.terms[0]));
+                let start = operand(query.terms[0]);
+                if matches!(start, Operand::List(l) if l.is_empty()) && !query.ops.contains(&b'O') {
+                    continue;
+                }
+                run.start(&start);
                 for (k, &op) in query.ops.iter().enumerate() {
                     run.apply(op, &operand(query.terms[k + 1]));
                 }
             }
-            let (n, s, ids) = run.summary();
+            let (n, s) = run.size_sum();
             if n > 0 {
                 count[q].fetch_add(n as u32, Relaxed);
                 sum[q].fetch_add(s + n * base as u64, Relaxed);
                 let mut f = first[q].lock().unwrap();
-                f.extend(ids.iter().map(|&d| base + d as u32));
-                f.sort_unstable();
-                f.truncate(10);
+                if f[10] < 10 || f[9] > base {
+                    (order.clear(), order.extend_from_slice(&f[..f[10] as usize]));
+                    run.smallest(base, order);
+                    order.sort_unstable();
+                    order.truncate(10);
+                    f[..order.len()].copy_from_slice(order);
+                    f[10] = order.len() as u32;
+                }
             }
         }
     });
@@ -808,7 +837,8 @@ fn main() {
         put(&mut out, count[q].load(Relaxed) as u64);
         out.push(b' ');
         put(&mut out, sum[q].load(Relaxed));
-        for &d in first[q].lock().unwrap().iter() {
+        let f = first[q].lock().unwrap();
+        for &d in &f[..f[10] as usize] {
             out.push(b' ');
             put(&mut out, d as u64);
         }
