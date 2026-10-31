@@ -4,12 +4,19 @@ The task, the input files and the exact output format are in the [spec](https://
 
 ## Approach
 
-The input is mapped with `mmap` and cut into 48 newline-aligned chunks that 12 threads parse by hand (no UTF-8
-validation, no allocation per line). The hour is the first 13 bytes of the timestamp, so no date arithmetic is needed,
-and it sorts chronologically as bytes. Each chunk groups its latencies and 5xx counts by (hour, endpoint) in a hash
-table, split into 12 shards by hour of day. A second parallel pass takes one shard at a time, merges the chunks'
-groups, sorts each group's latencies and reads the nearest-rank percentiles. The formatted lines are put in global
-(hour, endpoint) byte order and written with a single `write`.
+The input is cut into 4 MiB newline-aligned chunks that 12 threads take from one counter. A worker reads its chunk
+with `pread` into a 256 KiB buffer (no mapping of the 239 MB file, so no page faults on it and no teardown of it) and
+parses each line without validation: AVX2 compares find the spaces after the timestamp, the status class is one
+byte, and the latency is turned into a number with an 8-digit SWAR multiply chain. The endpoint is looked up in one
+lock-free dictionary shared by all workers (open addressing, slots claimed with compare-and-swap, the whole key
+compared on every hit), which gives dense ids. Each line becomes a 6-byte record (latency, endpoint id, 5xx flag)
+appended to a region private to its chunk and hour; the regions live in one sparse anonymous mapping, so only the
+touched pages cost memory.
+
+When all chunks are parsed the endpoint ids are sorted by their bytes once. Then workers take whole hours: they
+counting-sort the hour's records by endpoint, read the nearest-rank percentiles (insertion sort for small groups,
+`select_nth_unstable` for large ones), and format the lines. A finished hour is written to the output file as soon as
+every earlier hour is, so the write overlaps the remaining work.
 
 ## Dependencies
 
@@ -17,4 +24,5 @@ None: standard library only. `mmap` is declared by hand with `extern "C"`.
 
 ## With another 24 hours
 
-A radix pass instead of comparison sorts, and a measurement of the 12-CPU case on the board.
+Format the output directly into a shared mapping of the file, interleave two lines per loop to hide the dictionary
+loads, and release each hour's records as soon as it is summarised to lower the memory peak.
