@@ -192,6 +192,10 @@ What the board says about this program, in order of what each experiment taught:
   barrier phases, no streaming and no fallback: T 43.2 ms, M 25.2 MB, S 304, K 32.84 (run-19997323681c, b19bc7a). In the VM
   the stages are parse 35 ms, a serial merge of 8 ms, and phase 2 35 ms (id remapping, in-order writes); the hash map costs
   +13% single-thread CPU. The lines it saved (x1.076 on K) are worth far less than the time and memory it lost.
+- **mmap with each worker populating its own chunk (`MADV_POPULATE_READ`), parsed in place with prefetch:** T 30.33 ms, K 38.83
+  (e271777); 76% slower in the VM. Reverted: `pread` stays.
+- **PGO** (profile generated in the pinned LLVM-tools image on the full public data, accepted by the board-style build): T 26.50 ms,
+  K 41.30 (081c800) against 26.11 ms and K 41.96 without. Reverted.
 - **What does not help (local, single thread unless stated):** a plain `memcmp` for the key compare (+7% time), a batch of 16
   lookups with prefetched slots (+3.5%), `sort_unstable` for the percentiles, PGO with the pinned compiler (no change, as in
   Tracks B and D), 128 vs 64 KB blocks vs 32 KB (equal time, 32 KB lowers M by 0.4 MB), 512 KB or 256 KB chunks and a lag of
