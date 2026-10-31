@@ -448,9 +448,10 @@ fn percentiles(v: &mut [u32]) -> (u32, u32, u32) {
         }
         return (v[at(50)], v[at(95)], v[at(99)]);
     }
-    let (rest, p99, _) = v.select_nth_unstable(at(99));
-    let (rest, p95, _) = rest.select_nth_unstable(at(95));
-    (*rest.select_nth_unstable(at(50)).1, *p95, *p99)
+    // The median first: p95 and p99 are then found among the larger half only, which shrinks quickly.
+    let (_, p50, upper) = v.select_nth_unstable(at(50));
+    let (_, p95, upper) = upper.select_nth_unstable(at(95) - at(50) - 1);
+    (*p50, *p95, *upper.select_nth_unstable(at(99) - at(95) - 1).1)
 }
 
 /// Appends `v` in decimal.
