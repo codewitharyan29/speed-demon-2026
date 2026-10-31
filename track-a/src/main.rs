@@ -9,7 +9,6 @@
 use std::arch::x86_64::*;
 use std::fs::File;
 use std::io::Write;
-use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
 use std::sync::Mutex;
@@ -20,8 +19,6 @@ extern "C" {
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
     fn prctl(option: i32, ...) -> i32;
     fn mallopt(param: i32, value: i32) -> i32;
-    fn sync_file_range(fd: i32, offset: i64, bytes: i64, flags: u32) -> i32;
-    fn posix_fadvise(fd: i32, offset: i64, len: i64, advice: i32) -> i32;
 }
 
 const CHUNK: usize = 1 << 20;
@@ -238,9 +235,8 @@ struct Job {
     bad: AtomicBool,
     /// Endpoints that occur in an hour summarised so far, and the same ones in the byte order of their names.
     seen: Mutex<(Vec<bool>, Vec<u16>)>,
-    /// The summary file, the next hour to write to it, the lines of the hours that wait for earlier ones, and the file's
-    /// size with the offsets up to which it has been dropped from the page cache and started on its way to disk.
-    out: Mutex<(File, usize, Vec<Option<Vec<u8>>>, [u64; 3])>,
+    /// The summary file, the next hour to write to it, and the lines of the hours that wait for earlier ones.
+    out: Mutex<(File, usize, Vec<Option<Vec<u8>>>)>,
 }
 
 impl Job {
@@ -265,7 +261,7 @@ impl Job {
             next_hour: AtomicUsize::new(0),
             bad: AtomicBool::new(false),
             seen: Mutex::new((vec![false; SLOTS], Vec::new())),
-            out: Mutex::new((summary, 0, vec![None; HOURS], [0; 3])),
+            out: Mutex::new((summary, 0, vec![None; HOURS])),
         }
     }
 
@@ -402,23 +398,11 @@ impl Job {
     /// Hands over the lines of hour `h` and writes every hour that is now complete, in order. The last write ends the process.
     fn publish(&self, h: usize, lines: Vec<u8>) {
         let mut guard = self.out.lock().unwrap();
-        let (file, next, pending, marks) = &mut *guard;
+        let (file, next, pending) = &mut *guard;
         pending[h] = Some(lines);
         while *next < HOURS && pending[*next].is_some() {
-            let lines = pending[*next].take().unwrap();
-            file.write_all(&lines).unwrap();
+            file.write_all(&pending[*next].take().unwrap()).unwrap();
             *next += 1;
-            // Every MiB: start writing out what is new, and drop what was written out before from the page cache, so
-            // that the summary does not sit in memory.
-            marks[0] += lines.len() as u64;
-            if marks[0] - marks[2] >= 1 << 20 {
-                let fd = file.as_raw_fd();
-                unsafe {
-                    sync_file_range(fd, marks[2] as i64, (marks[0] - marks[2]) as i64, 2); // SYNC_FILE_RANGE_WRITE
-                    posix_fadvise(fd, marks[1] as i64, (marks[2] - marks[1]) as i64, 4); // POSIX_FADV_DONTNEED
-                }
-                *marks = [marks[0], marks[2], marks[0]];
-            }
         }
         if *next == HOURS && !self.bad.load(Relaxed) {
             std::process::exit(0);
