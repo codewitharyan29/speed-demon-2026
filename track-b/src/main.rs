@@ -211,11 +211,14 @@ fn hash(k: &[u64; 4]) -> u64 {
 /// A token's first sixteen bytes, lower-cased, as two words, with no branch on its length: bytes past the token are
 /// masked off.
 fn short_key(b: &[u8], at: usize, len: usize) -> (u64, u64) {
-    let word = |i: usize| {
-        let n = len.saturating_sub(8 * i).min(8) as u32;
-        (load(b, at + 8 * i) | ONES * 0x20) & u64::MAX.checked_shr(64 - 8 * n).unwrap_or(0)
+    let both = match b.get(at..at + 16) {
+        Some(s) => u128::from_le_bytes(s.try_into().unwrap()),
+        None => load(b, at) as u128 | (load(b, at + 8) as u128) << 64,
     };
-    (word(0), word(1))
+    let bits = 8 * len.min(31) as u32;
+    // SAFETY: BMI2 is enabled for this build (target-cpu=native). `bzhi` keeps the low `n` bits, all of them if n >= 64.
+    let cut = |w: u128, n: u32| unsafe { _bzhi_u64(w as u64 | ONES * 0x20, n) };
+    (cut(both, bits), cut(both >> 64, bits.saturating_sub(64)))
 }
 
 /// One cache line of the scan's table: the two key words and the metadata of three terms, so a lookup reads one line.
