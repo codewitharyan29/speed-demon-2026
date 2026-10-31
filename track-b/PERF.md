@@ -14,7 +14,8 @@ They are only used to compare variants, never reported as results.
 | 3 | Terms in over 1/32 of the documents as shared bitsets (chosen from a 2% sample), (term, document) pairs packed into 4 bytes | f2ef5ee | 0.484 | 221 | 56.098 (K 13.24, 496 lines) |
 | 4 | `-C target-cpu=native` | 5f206c6 | 0.474 | 223 | 56.310 (K 13.37, 496 lines) |
 | 4b | (unchanged code, re-run with a Track D push) | ac9a033 | 0.469 | 222 | 56.436 (K 13.45, 496 lines) |
-| 5 | AVX2 block tokeniser, right-sized hash tables, batched probe with the key in the slot, bitset-native BOOL evaluation, pairs tracked only where a phrase needs them | pending | | | |
+| 5 | AVX2 block tokeniser, right-sized hash tables, batched probe with the key in the slot, bitset-native BOOL evaluation, pairs tracked only where a phrase needs them | 175c722 | 0.342 | 171 | 59.748 (K 15.67, 731 lines) |
+| 6 | Per-chunk indexing and evaluation: no global postings at all | pending | | | |
 
 ## Local measurements behind step 2 (in-process ms, median)
 
@@ -93,3 +94,24 @@ probe and the term bookkeeping were about 65 ms each.
 
 Correctness after each kept step: the spec's worked example, tiny and sample seed 1 against the Python reference, and
 the full seed-1 hash. Before committing: tiny seeds 2-6 and sample seeds 2-3 also match the reference.
+
+## Step 6: index and answer one chunk at a time (memory)
+
+The board after step 5 (rank 20 of 54) showed every team above us except two at 35-68 MB, and most of the top ten
+at 35-45 MB, the 50x cap being 44 MB; we were at 171 MB. Most of that was the global posting arrays plus the
+intermediate pair arrays they were built from. Chunks hold consecutive documents, so each chunk can be indexed on its
+own and answer every query for its own documents:
+
+- a thread scans a chunk; sparse terms and tracked pairs go into a chunk-local posting array of `u16` local ids
+  (counting sort placing from the back keeps them ascending), dense terms into chunk-local bitset rows (no atomics);
+- every query is then evaluated on that chunk; counts and id sums are added to per-query atomics, and the ten
+  smallest ids are merged under a per-query lock;
+- all buffers are per thread and reused from chunk to chunk.
+
+| Version | Median | `memory.peak` (local) |
+|---|---|---|
+| Step 5 code | 253 ms | 147 MB |
+| Per-chunk indexing and evaluation | 249 ms | 57 MB |
+
+Same time (the extra cost of running every query once per chunk is paid back by dropping the global posting build),
+61% less memory. Verified on full seeds 1 and 2, sample seeds 1-3, tiny seeds 1-6 and the worked example.
