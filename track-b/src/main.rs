@@ -547,14 +547,23 @@ impl Run {
     /// The set's size and the sum of its ids.
     fn size_sum(&self) -> (u64, u64) {
         if self.dense {
+            // The positions of a word's set bits add up to the sum, over each bit k of a position, of 2^k times the
+            // number of set bits whose position has bit k set: six popcounts instead of one step per set bit.
+            const HAS: [u64; 6] = [
+                0xAAAA_AAAA_AAAA_AAAA,
+                0xCCCC_CCCC_CCCC_CCCC,
+                0xF0F0_F0F0_F0F0_F0F0,
+                0xFF00_FF00_FF00_FF00,
+                0xFFFF_0000_FFFF_0000,
+                0xFFFF_FFFF_0000_0000,
+            ];
             let (mut count, mut sum) = (0, 0);
-            for (i, &word) in self.bits.iter().enumerate() {
-                let mut w = word;
-                count += w.count_ones() as u64;
-                while w != 0 {
-                    sum += (i * 64) as u64 + w.trailing_zeros() as u64;
-                    w &= w - 1;
-                }
+            for (i, &w) in self.bits.iter().enumerate() {
+                let n = w.count_ones() as u64;
+                let within: u64 = (0..6)
+                    .map(|k| ((w & HAS[k]).count_ones() as u64) << k)
+                    .sum();
+                (count, sum) = (count + n, sum + (i * 64) as u64 * n + within);
             }
             (count, sum)
         } else {
@@ -832,10 +841,15 @@ fn main() {
                     pairs.push((id as u32) << DOC_BITS | local);
                 }
                 // Two phrase terms in a row: their pair, once per document, if the filter does not rule it out.
-                let (phrase, pk) = (flags & 2 != 0, pair(prev, id as u32));
-                let h = (pk.wrapping_mul(M) >> (64 - BLOOM_BITS)) as usize;
-                if phrase && prev_phrase && prev_doc == doc && bloom[h >> 6] >> (h & 63) & 1 == 1 {
-                    if let Ok(g) = grams.find(pk.wrapping_mul(M), &pk) {
+                let phrase = flags & 2 != 0;
+                let (pk, h) = (pair(prev, id as u32), pair(prev, id as u32).wrapping_mul(M));
+                let bit = (h >> (64 - BLOOM_BITS)) as usize;
+                if phrase
+                    && prev_phrase
+                    && prev_doc == doc
+                    && bloom[bit >> 6] >> (bit & 63) & 1 == 1
+                {
+                    if let Ok(g) = grams.find(h, &pk) {
                         let g = nterms + g as usize;
                         if last[g] != doc + 1 {
                             last[g] = doc + 1;
