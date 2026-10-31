@@ -229,16 +229,38 @@ fn main() {
             }
         },
     );
-    let order: Vec<u32> = regions.into_iter().flatten().flatten().collect();
-    let mut new_id = vec![0; n];
-    for (i, &u) in order.iter().enumerate() {
-        new_id[u as usize] = i as u32;
+    // Regions are numbered one after another, each region's nodes consecutively. Once the regions' offsets are known,
+    // every region writes its own new ids, slots and degrees, all in parallel.
+    let regions: Vec<Vec<u32>> = regions.into_iter().flatten().collect();
+    let mut offset = vec![0; regions.len() + 1];
+    for (r, region) in regions.iter().enumerate() {
+        offset[r + 1] = offset[r] + region.len();
     }
+    let atomics = || (0..n + 1).map(|_| AtomicU32::new(0)).collect::<Vec<_>>();
+    let (order, new_id, degree) = (atomics(), atomics(), atomics());
+    par(
+        regions.len(),
+        || (),
+        |_, r| {
+            for (k, &u) in regions[r].iter().enumerate() {
+                let i = offset[r] + k;
+                (
+                    order[i].store(u, Relaxed),
+                    new_id[u as usize].store(i as u32, Relaxed),
+                );
+                degree[i + 1].store(start[u as usize + 1] - start[u as usize], Relaxed);
+            }
+        },
+    );
+    let plain = |a: Vec<AtomicU32>| {
+        a.into_iter()
+            .map(AtomicU32::into_inner)
+            .collect::<Vec<u32>>()
+    };
+    let (order, new_id, mut first) = (plain(order), plain(new_id), plain(degree));
     // Rebuild the CSR in the new numbering, a block of nodes per job.
-    let mut first = vec![0u32; n + 1];
     for i in 0..n {
-        let u = order[i] as usize;
-        first[i + 1] = first[i] + start[u + 1] - start[u];
+        first[i + 1] += first[i];
     }
     let adj: Vec<AtomicU64> = (0..first[n]).map(|_| AtomicU64::new(0)).collect();
     let block = n.div_ceil(CHUNKS);
