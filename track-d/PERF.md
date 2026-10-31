@@ -14,7 +14,7 @@ They are noisy in absolute terms (a Windows laptop VM, not the scoring box) and 
 | 3 | Drop `MAP_POPULATE`; `-C target-cpu=native` | 5f206c6 | 0.389 | 275 | 55.695 (K 13.00, 289 lines) |
 | 4 | The degree array is reused as the write cursor and dropped after the scatter | eb8a2d1 | 0.391 | 258 | 55.925 (K 13.14, 288 lines) |
 | 5 | 4-byte distances with an 8-byte fallback, locality-ordered scheduling, pre-sized and SWAR-parsed edge lines | 90838c8 | 0.347 | 188 | 58.168 (K 14.57, 327 lines) |
-| 6 | Region numbering, new ids and new offsets written in parallel | pending | | | |
+| 6 | Region numbering, new ids and new offsets written in parallel; Dial's buckets instead of the radix heap | pending | | | |
 
 ## Local measurements behind step 2 (full data, in-process ms, 12 CPUs)
 
@@ -111,3 +111,16 @@ all on one thread. With a prefix sum over region sizes, every region knows where
 order slots and degrees in parallel; only the prefix sum of degrees stays sequential. Numbering 27 -> 14 ms
 (end-to-end medians too noisy to resolve while the other session benchmarks). Verified on tiny seeds 1-6, sample
 seeds 1-3, full seeds 1-2 and the worked example.
+
+## Step 6 continued: Dial's buckets (research item "faster monotone priority queue", study guide "Dial's buckets")
+
+The cachegrind profile put the radix heap's pushes and bucket redistribution at about 30% of the search's
+instructions. Main-body weights are at most a few thousand, so the keys in a search's queue lie within a small window
+above the key last popped.
+
+| Change | Result | Verdict |
+|---|---|---|
+| Dial's buckets: a ring of 2^14 buckets, key k in bucket k % 2^14, popped exactly in order by scanning forward; keys beyond the window (edges of near-maximal weight) in the radix heap | 324 -> 294 ms | kept |
+| The far keys in std's `BinaryHeap` instead of the radix heap, which is then removed (-43 lines) | 297 -> 305, then 307 vs 307 on a re-run | kept: same speed, 364 instead of 399 lines |
+| Window of 2^16 buckets | 307 -> 328 ms | rejected: clearing a larger ring per query costs more |
+| Per-thread busy time in the search phase (instrumented) | 175-186 ms of 189 | the threads are balanced; the cost is the kernel itself |

@@ -20,8 +20,10 @@ cache on every neighbour. Each thread repeatedly takes an unclaimed node and gro
 ids, slots and degrees in parallel. The CSR is then rebuilt in the new numbering, so a search walks memory that is
 mostly contiguous.
 
-**Queries.** Each query is a forward Dijkstra from `s` that stops when `t` is popped, with a radix heap (valid
-because Dijkstra's keys never decrease). A thread's distance array holds distance + 1 as `u32` (0 means unseen): it is
+**Queries.** Each query is a forward Dijkstra from `s` that stops when `t` is popped, with Dial's buckets: a
+ring of 2^14 buckets, key k in bucket k % 2^14, popped exactly in key order by scanning forward. Main-body weights
+are at most a few thousand, so every key in the queue lies within the window; the rare keys beyond it (edges of
+near-maximal weight) wait in a binary heap. A thread's distance array holds distance + 1 as `u32` (0 means unseen): it is
 zero-filled lazily by the kernel and restored through a list of touched nodes, so a query costs only its own search.
 Four bytes per node halve the memory 12 threads keep resident; the few searches whose distances pass 2^32 (they cross
 edges of near-maximal weight) run again with `u64`, through the same generic search. `s == t` and targets without
