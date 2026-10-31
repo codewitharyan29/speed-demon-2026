@@ -23,11 +23,13 @@ const BLOCK: usize = 256 << 10; // bytes read at a time; small enough to stay in
 const HOURS: usize = 72;
 const SLOTS: usize = 4096; // dictionary slots; the spec has at most 1,842 endpoints
 const STRIDE: usize = 128; // bytes per stored endpoint; endpoints are 1..=125 bytes
-const REC: usize = 6; // latency (u32), then endpoint id with the 5xx flag in bit 15 (u16)
+/// A record is one `u32` word: latency in bits 0..20, endpoint id in bits 20..31, 5xx flag in bit 31. A latency that does not
+/// fit (`SENT` or more) is stored as `SENT` and followed by a second word holding the whole latency.
+const SENT: u32 = (1 << 20) - 1;
 const SLACK: usize = 192; // bytes the parser may read past the start of a line
 const MIN_LINE: usize = 40; // shortest possible line, bounds the records of one chunk
-/// Bytes reserved for the records of one (chunk, hour): the whole chunk could fall in a single hour.
-const REGION: usize = (((CHUNK + 256) / MIN_LINE + 4) * REC + 8 + 4095) & !4095;
+/// Bytes reserved for the records of one (chunk, hour): the whole chunk could fall in a single hour, with two words per line.
+const REGION: usize = (((CHUNK + 256) / MIN_LINE + 4) * 8 + 8 + 4095) & !4095;
 const DAYS: [&str; 4] = ["2026-10-30", "2026-10-31", "2026-11-01", "2026-11-02"];
 
 /// Endpoint dictionary shared by all workers: open addressing, slots are claimed with compare-and-swap.
@@ -194,10 +196,11 @@ unsafe fn scan(
             more => more.trailing_zeros() as usize,
         };
         let id = dict.lookup(w.add(start), end - start);
-        let failed = (*w.add(end + 1) == b'5') as u64;
+        let failed = *w.add(end + 1) == b'5';
         let (lat, digits) = latency(w.add(end + 5));
-        (cur[hour] as *mut u64).write_unaligned(lat as u64 | (id as u64 | failed << 15) << 32);
-        cur[hour] += REC;
+        let word = lat.min(SENT) | (id | (failed as u32) << 11) << 20;
+        (cur[hour] as *mut u64).write_unaligned(word as u64 | (lat as u64) << 32);
+        cur[hour] += if lat < SENT { 4 } else { 8 };
         p = w.add(end + 5 + digits + 1);
     }
     p
@@ -270,7 +273,7 @@ impl Job {
         }
         for (h, at) in cur.iter().enumerate() {
             self.counts[h * self.chunks + c]
-                .store(((at - self.region(h, c)) / REC) as u32, Relaxed);
+                .store(((at - self.region(h, c)) / 4) as u32, Relaxed);
         }
     }
 
@@ -295,8 +298,6 @@ impl Job {
                 (n > 0).then(|| (self.region(h, c), n))
             })
         };
-        let record =
-            |at: usize, i: usize| unsafe { ((at + i * REC) as *const u64).read_unaligned() };
         let total: usize = regions().map(|r| r.1).sum();
         let (counts, starts, values) = (
             &mut scratch.counts,
@@ -306,25 +307,17 @@ impl Job {
         if values.len() < total {
             values.resize(total, 0);
         }
-        for (at, n) in regions() {
-            for i in 0..n {
-                let v = record(at, i) >> 32 & 0xFFFF; // the u64 also holds 2 bytes of the next record
-                counts[(v & 0x7FFF) as usize] += 1 + (v >> 15 << 32);
-            }
-        }
+        each_record(regions(), |key, _| counts[(key & 0x7FF) as usize] += 1 + ((key as u64 >> 11) << 32));
         let mut sum = 0;
         for &id in order {
             starts[id as usize] = sum;
             sum += (counts[id as usize] as u32) as usize;
         }
-        for (at, n) in regions() {
-            for i in 0..n {
-                let v = record(at, i);
-                let slot = &mut starts[((v >> 32) & 0x7FFF) as usize];
-                values[*slot] = v as u32;
-                *slot += 1;
-            }
-        }
+        each_record(regions(), |key, lat| {
+            let slot = &mut starts[(key & 0x7FF) as usize];
+            values[*slot] = lat;
+            *slot += 1;
+        });
         let mut out = Vec::with_capacity(1 << 17);
         let abs = h + 18;
         let prefix = format!("{}T{:02}:00:00Z ", DAYS[abs / 24], abs % 24);
@@ -432,6 +425,20 @@ struct Scratch {
     counts: Vec<u64>,
     starts: Vec<usize>,
     values: Vec<u32>,
+}
+
+/// Calls `f(key, latency)` for each record in `regions` (address and word count of each); `key` is the endpoint id with the 5xx flag in bit 11.
+fn each_record(regions: impl Iterator<Item = (usize, usize)>, mut f: impl FnMut(u32, u32)) {
+    for (at, n) in regions {
+        let word = |i: usize| unsafe { ((at + i * 4) as *const u32).read_unaligned() };
+        let mut i = 0;
+        while i < n {
+            let w = word(i);
+            let wide = w & SENT == SENT;
+            f(w >> 20, if wide { word(i + 1) } else { w & SENT });
+            i += 1 + wide as usize;
+        }
+    }
 }
 
 /// Nearest-rank p50, p95 and p99 of `v`, which it reorders.
