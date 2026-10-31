@@ -3,8 +3,10 @@
 # (valgrind cachegrind on data/<t>-<scale>-1, default sample; optimised build with debug info; caches modelled as an
 # i5-13500 P-core: 48 KB L1d and 2 MB "last level" so L2 misses show up)
 cd "$(dirname "$0")/.."
+CG=${CG_OUT:-cg}  # output folder under .out (set CG_OUT per concurrent session)
+mkdir -p .out/$CG
 t=$1; sc=${2:-sample}
-MSYS_NO_PATHCONV=1 docker run --rm -e TRACK=$t -v "$PWD/track-$t:/w:ro" -v "$PWD/data/$t-$sc-1:/data:ro" -v "$PWD/.out/cg:/out" \
+MSYS_NO_PATHCONV=1 docker run --rm -e TRACK=$t -v "$PWD/track-$t:/w:ro" -v "$PWD/data/$t-$sc-1:/data:ro" -v "$PWD/.out/$CG:/out" \
   rust:1-slim-trixie@sha256:1a939748a7cbab172de91a014e3804a97af1394a8c844faa67fce9401c4e40fb sh -c '
     set -e
     apt-get update >/dev/null 2>&1 && apt-get install -y valgrind >/dev/null 2>&1
