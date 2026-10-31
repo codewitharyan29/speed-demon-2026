@@ -20,6 +20,7 @@ They are only used to compare variants, never reported as results.
 | 8 | Batched, prefetched table lookups; bucketised SIMD probe; inline query storage; batched term numbering | fd3e211 | 0.260 | 57 | 67.089 (K 21.97, 815 lines) |
 | 9 | Popcount-based id sums for bitset results | cce528e | 0.250 | 58 | 67.417 (K 22.30, 827 lines) |
 | 10 | One cache line per scan lookup; one buffer for the scan's stamps and the posting starts; 64 chunks | cd013f9 | 0.260 | 46 | 68.031 (K 22.94, 820 lines) |
+| 11 | One bounds check per token key (`u128` + `bzhi`) | 4e0a5a9 | 0.260 | 45 | 68.068 (K 22.98, 822 lines) |
 
 ## Local measurements behind step 2 (in-process ms, median)
 
@@ -233,3 +234,21 @@ query parse and the sample, 151; + keys and table lookups 459; + bookkeeping and
 1,023. The lookups split into memory and instructions: with every lookup forced into the first 256 buckets (all in L1)
 they cost 363 instead of 457, so about 95 ms of the ~300 is the table's size and about 200 is instructions (some 20
 cycles a token for the key, the hash, the prefetch and the compare).
+
+## Step 12: lines that no longer pay (local, in-process ms, median)
+
+The board did not see step 11 (0.260 s both times): it shows time to 3 digits, so a 2% gain is invisible there.
+Since 10% fewer lines is worth about as much as 3% less time, code added for the global-postings design was rechecked.
+
+Single-thread ablation of the scan's bookkeeping (query evaluation skipped): lookups only 417, full bookkeeping and
+counting sort 709. Each piece alone: phrase-pair tracking 27, list-term pairs 44, dense bits 28; the rest of the ~290
+is the loop and its mispredicted branches.
+
+| Change | Before -> after | Verdict |
+|---|---|---|
+| No bloom filter in front of the phrase-pair table | 1 thread: 963 -> 1,019 | rejected: the filter pays for its ~11 lines |
+| No binary-search probing in `combine` (added when lists were global and long; a chunk's lists are now at most a few hundred ids) | 1 thread: 963 -> 959; 12 threads: 178 -> 182, 182 -> 183 | kept: -15 lines at the same time |
+| `par` no longer restores job order (the sample sums its results, the chunks return nothing) | same work | kept: -2 lines |
+| No `Table::shrink` (the term and pair tables keep their parse-time size) | 1 thread: 990 -> 1,000; 12 threads: 177 -> 176; `memory.peak` 42 -> 44 MB | rejected: 10 lines are worth less than 2 MB |
+
+Verified on full seeds 1 and 2, sample seeds 1-3, tiny seeds 1-6 and the worked example; `memory.peak` 42 MB local.
