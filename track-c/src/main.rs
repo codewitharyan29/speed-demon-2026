@@ -424,7 +424,7 @@ fn run(regions: &[u8], file: &File, len: usize, bits: u32, chunk: usize) -> Opti
         let lo = if j == 0 { body } else { record_start(&ctx, j * chunk) };
         let hi = if j + 1 == chunks { len } else { record_start(&ctx, (j + 1) * chunk) };
         let mut aggs = vec![NONE; countries];
-        (lo >= hi || parse_chunk(&ctx, lo, hi, &mut aggs)).then_some(aggs)
+        Some(aggs) // DIAGNOSTIC: no record parsing
     });
     if names.full.load(Relaxed) || results.iter().any(|r| r.is_none()) {
         return None;
