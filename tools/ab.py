@@ -3,6 +3,7 @@ usage: python tools/ab.py <track-dir-A> <track-dir-B> [...] [-n 9] [-t d|b]
 Each dir is a cargo project like track-d/. A timer is injected before the output write, and runs alternate between
 variants so machine noise hits all of them equally. Prints min / median of the in-process time in ms."""
 import os, re, shutil, statistics, subprocess, sys, tempfile, time
+TAG = os.environ.get("SD_TAG", "ab")  # set a different SD_TAG per concurrent session
 env = {**os.environ, "MSYS_NO_PATHCONV": "1"}
 args = sys.argv[1:]; n = 9; T = "d"
 if "-t" in args: i = args.index("-t"); T = args[i + 1]; del args[i:i + 2]
@@ -10,7 +11,7 @@ OUT = {"d": "distances.txt", "b": "results.txt"}[T]
 if "-n" in args: i = args.index("-n"); n = int(args[i + 1]); del args[i:i + 2]
 tags = []
 for k, d in enumerate(args):
-    tmp = os.path.join(tempfile.gettempdir(), f"sdab{k}"); shutil.rmtree(tmp, ignore_errors=True)
+    tmp = os.path.join(tempfile.gettempdir(), f"sd{TAG}{k}"); shutil.rmtree(tmp, ignore_errors=True)
     shutil.copytree(d, tmp, ignore=shutil.ignore_patterns("target"))
     p = os.path.join(tmp, "src", "main.rs"); s = open(p).read().replace("\r\n", "\n")
     s = s.replace("fn main() {\n", "fn main() {\n    let t0 = std::time::Instant::now();\n", 1)
@@ -19,8 +20,8 @@ for k, d in enumerate(args):
     open(p, "w", newline="\n").write(s)
     if os.path.exists(os.path.join(tmp, ".cargo", "config.toml")) and "profile-use" in open(os.path.join(tmp, ".cargo", "config.toml")).read():
         subprocess.run(["sh", os.path.join(os.path.dirname(os.path.abspath(__file__)), "pgo.sh"), T, tmp], check=True)  # profile must match the injected source
-    subprocess.run(["docker", "build", "-q", "--network=none", "-t", f"sd-ab{k}", tmp], check=True, stdout=subprocess.DEVNULL)
-    tags.append(f"sd-ab{k}")
+    subprocess.run(["docker", "build", "-q", "--network=none", "-t", f"sd-{TAG}{k}", tmp], check=True, stdout=subprocess.DEVNULL)
+    tags.append(f"sd-{TAG}{k}")
 res = {t: [] for t in tags}
 for _ in range(n):
     for t in tags:

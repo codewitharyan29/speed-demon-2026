@@ -12,7 +12,8 @@ They are noisy in absolute terms (a Windows laptop VM, not the scoring box) and 
 | 1 | Baseline: sequential parse, CSR, early-exit Dijkstra with a binary heap, 12 threads over queries | fdc4472 | 1.310 | 289 | 44.275 (K 7.68, 158 lines) |
 | 2 | Parallel parse and CSR, parallel region-growing renumbering, radix heap, lazy `dist`, `MAP_POPULATE` | bdfba23 | 0.399 | 272 | 55.446 (K 12.85, 292 lines) |
 | 3 | Drop `MAP_POPULATE`; `-C target-cpu=native` | 5f206c6 | 0.389 | 275 | 55.695 (K 13.00, 289 lines) |
-| 4 | The degree array is reused as the write cursor and dropped after the scatter | pending | | | |
+| 4 | The degree array is reused as the write cursor and dropped after the scatter | eb8a2d1 | 0.391 | 258 | 55.925 (K 13.14, 288 lines) |
+| 5 | 4-byte distances with an 8-byte fallback, locality-ordered scheduling, pre-sized and SWAR-parsed edge lines | pending | | | |
 
 ## Local measurements behind step 2 (full data, in-process ms, 12 CPUs)
 
@@ -65,3 +66,25 @@ parse + counting sort ~98, region growing ~38, new ids ~13, CSR rebuild ~46, sea
   dropping it after the scatter took local `memory.peak` 258 -> 245 MB and one line off the source.
 - Bidirectional search, costed not built: it would roughly halve settled nodes (search ~330 of ~600 local ms) but needs a
   reverse CSR (+40 MB, ~45 ms) and a second `dist` per thread; the estimated net is about break-even on the score.
+
+## Step 5: memory first, then the build (local, in-process ms, median of 11-15, another session benchmarking on the same CPUs)
+
+The board after step 4 put us 34th on this track: the top ten run in 0.12-0.20 s with 46-112 MB, we were at 0.391 s and
+258 MB. Where the memory was: resident memory per phase showed ~85 MB of heap after the searches, but that was after the
+per-thread `dist` arrays were freed. During the searches each of the 12 threads holds a 14 MB array that, over ~170
+queries, ends up fully resident (167 MB). The build phase alone peaks at 134 MB (parsed edge list + first CSR).
+
+| Change | Result | Verdict |
+|---|---|---|
+| `dist` from its own anonymous mapping, handed back with `madvise(MADV_DONTNEED)` after every search (it reads as zero again, which also replaces the reset loop) | `memory.peak` 245 -> 115 MB, but 377 -> 575 ms | reverted: page faults and TLB shootdowns across 12 threads cost far too much |
+| The same only after searches touching over 2^14 / 2^16 nodes | 117 / 149 MB at 576 / 504 ms | reverted |
+| `dist` as `u32` (distance + 1), the search generic over the entry type; a search whose distances pass 2^32 (those crossing near-maximal-weight edges) runs again with `u64`; parse buffers sized from the chunk length so they never double | `memory.peak` 245 -> 170 MB; 423 -> 370 ms (noisy) | kept |
+| 8 / 6 threads instead of 12 | 355 / 460 ms vs 336; 139 / 124 MB vs 170 | rejected: on the score about even at 8 and worse at 6 |
+| Queries sorted by their source's new id; each thread first works through its own contiguous share, then helps the others | 315 -> 298 ms; memory unchanged (a thread's large searches still cover most of its array) | kept: better cache reuse of the graph |
+| Transparent huge pages (`MADV_HUGEPAGE`) for the CSR and `dist` | 296 -> 298 ms; 108 MB were in huge pages | reverted: TLB misses are not the cost |
+| SWAR parsing of edge lines: eight bytes at a time, the first byte below '0' ends a number, three multiplications convert it (fast_float's method); longer numbers take the old loop | 303 -> 300 (min 280 -> 269) | kept |
+| Bidirectional Dijkstra (reverse CSR built in parallel; the side with the smaller top key grows; stop when the tops add up to the best meeting) | 295 -> 446 ms; searches 154 -> 278 ms; 357 MB | reverted: on this road-like graph each relaxation also reads the other side's distance, an extra random miss per edge, which costs more than halving the settled nodes saves |
+
+Profile of step 5 on the sample (cachegrind): number parsing was 26% of all instructions before the SWAR change; in the
+searches the relax test (`seen == 0 || nd + 1 < seen`) is the main mispredicted branch and the `dist` loads the main
+L1 misses.
