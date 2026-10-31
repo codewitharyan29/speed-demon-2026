@@ -11,7 +11,8 @@ They are noisy in absolute terms (a Windows laptop VM, not the scoring box) and 
 | 0 | The reference, unchanged | | 72.69 | 893 | 0 |
 | 1 | Baseline: sequential parse, CSR, early-exit Dijkstra with a binary heap, 12 threads over queries | fdc4472 | 1.310 | 289 | 44.275 (K 7.68, 158 lines) |
 | 2 | Parallel parse and CSR, parallel region-growing renumbering, radix heap, lazy `dist`, `MAP_POPULATE` | bdfba23 | 0.399 | 272 | 55.446 (K 12.85, 292 lines) |
-| 3 | Drop `MAP_POPULATE` (to see whether the board charges the pre-faulted input pages to M) | pending | | | |
+| 3 | Drop `MAP_POPULATE`; `-C target-cpu=native` | 5f206c6 | 0.389 | 275 | 55.695 (K 13.00, 289 lines) |
+| 4 | The degree array is reused as the write cursor and dropped after the scatter | pending | | | |
 
 ## Local measurements behind step 2 (full data, in-process ms, 12 CPUs)
 
@@ -50,3 +51,17 @@ parse + counting sort ~98, region growing ~38, new ids ~13, CSR rebuild ~46, sea
 |---|---|---|
 | PGO: instrumented build and run on the full seed-1 data in the pinned rustc 1.99.1 image, `-Cprofile-use`, profile regenerated for the exact source measured | 639 -> 728 (+14%) | rejected: slower, with no profile-mismatch warning. Not investigated further; `tools/pgo.sh` reproduces it |
 | `-C target-cpu=native` through `.cargo/config.toml` (the scoring box builds the track itself) | 659 -> 642 | adopted: small but consistent in both minimum and median, two lines |
+
+## Notes from board run 5f206c6 and later local work
+
+- Dropping `MAP_POPULATE` did not change M (272 -> 275 MB, inside noise of the other change), so the board does not
+  charge the pre-faulted input pages; that guess from run bdfba23 was wrong. T 0.399 -> 0.389 s is about what the
+  local test of `target-cpu=native` predicted (-2.6%).
+- Sorting the queries by the new id of their source (so the 12 threads search neighbouring areas at once): 598 vs 597 ms
+  median, no effect on this machine; reverted.
+- Resident memory by phase (local, includes the ~92 MB mapped input): 156 MB after parsing, 208 after the scatter,
+  219 after the CSR rebuild (peak), 194 after the searches. The peak is the rebuild, where both `adj0` and `adj` are
+  live; the per-thread `dist` arrays are smaller than estimated. Reusing the degree array as the write cursor and
+  dropping it after the scatter took local `memory.peak` 258 -> 245 MB and one line off the source.
+- Bidirectional search, costed not built: it would roughly halve settled nodes (search ~330 of ~600 local ms) but needs a
+  reverse CSR (+40 MB, ~45 ms) and a second `dist` per thread; the estimated net is about break-even on the score.

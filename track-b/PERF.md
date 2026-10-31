@@ -12,6 +12,7 @@ They are only used to compare variants, never reported as results.
 | 1 | Baseline: query terms interned in a hash table, parallel corpus scan keeping postings only for query terms, sorted-list merges for BOOL, candidate intersection plus re-tokenising for PHRASE | 6ee4e92 | 0.772 | 328 | 50.613 (K 10.29, 334 lines) |
 | 2 | Binary-search probing for lopsided intersections, SWAR tokeniser, bigram postings for phrases | 08b7a67 | 0.469 | 375 | 54.788 (K 12.47, 409 lines) |
 | 3 | Terms in over 1/32 of the documents as shared bitsets (chosen from a 2% sample), (term, document) pairs packed into 4 bytes | f2ef5ee | 0.484 | 221 | 56.098 (K 13.24, 496 lines) |
+| 4 | `-C target-cpu=native` | 5f206c6 | 0.474 | 223 | 56.310 (K 13.37, 496 lines) |
 
 ## Local measurements behind step 2 (in-process ms, median)
 
