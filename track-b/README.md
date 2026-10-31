@@ -4,15 +4,20 @@ The task, the input files and the exact output format are in the [spec](https://
 
 ## Approach
 
-The queries are read first and every distinct term goes into one open-addressing hash table. The corpus is then
-scanned once, in 48 newline-aligned chunks on 12 threads. Bytes are tokenised with a 256-entry table (lower-cased
-letters and digits, everything else a separator) and each token is looked up in the table while it is hashed; only
-terms the queries use are recorded, once per document. Per chunk and term the counts are known, so every chunk
-scatters its (term, document) pairs into its own slots of one posting array and each list comes out sorted.
+The queries are read first and every distinct term is numbered. A 2% sample of the corpus estimates each term's
+document frequency: terms in over 1/32 of the documents become bitsets, the rest sorted lists. Each phrase gets the
+adjacent term pairs it needs postings for (one pair next to its rarest term, or every pair if all its terms are common).
 
-BOOL queries are evaluated strictly left to right with sorted-list merges. PHRASE queries intersect the term lists
-to get candidate documents, then re-tokenise each candidate from the mapped file and look for the exact sequence.
-Results are formatted by hand into per-job buffers and written once.
+The corpus is then scanned in 64 newline-aligned chunks on 12 threads, each chunk indexed and answered on its own, so
+nothing that grows with the corpus is kept. An AVX2 tokeniser finds token edges 64 bytes at a time; tokens are looked
+up 48 at a time with their table buckets prefetched, one 64-byte bucket holding the key words and metadata of three
+terms, compared in one SIMD instruction. Dense terms set bits in the chunk's bitsets; other terms and tracked pairs
+become `u16` chunk-local postings through a counting sort.
+
+Every query is then evaluated on the chunk: BOOL strictly left to right on lists and bitsets, PHRASE by intersecting
+its pair lists and re-tokenising the few remaining candidates from the mapped file. Counts and id sums go into
+per-query atomics and the ten smallest ids into a per-query slot under a lock. Results are formatted by hand and
+written once.
 
 ## Dependencies
 
@@ -20,4 +25,4 @@ None: standard library only. `mmap` is declared by hand with `extern "C"`.
 
 ## With another 24 hours
 
-Galloping intersections, bitsets for dense terms, and a smaller memory footprint.
+SIMD intersection of `u16` lists, and fewer mispredicted branches in the per-token bookkeeping.

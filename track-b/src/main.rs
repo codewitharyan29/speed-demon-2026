@@ -9,7 +9,7 @@ extern "C" {
 }
 
 const THREADS: usize = 12;
-const CHUNKS: usize = 48;
+const CHUNKS: usize = 64;
 const ONES: u64 = 0x0101010101010101;
 const DOC_BITS: u32 = 14;
 const BLOOM_BITS: u32 = 20;
@@ -218,12 +218,13 @@ fn short_key(b: &[u8], at: usize, len: usize) -> (u64, u64) {
     (word(0), word(1))
 }
 
-/// One cache line of the scan's table: the two key words of four terms.
+/// One cache line of the scan's table: the two key words and the metadata of three terms, so a lookup reads one line.
 #[repr(C, align(64))]
 #[derive(Clone, Copy, Default)]
 struct Bucket {
-    k0: [u64; 4],
-    k1: [u64; 4],
+    k0: [u64; 3],
+    k1: [u64; 3],
+    meta: [u32; 4],
 }
 
 /// The table the scan probes for every term of up to 16 bytes, which is all of them in practice (the longest token
@@ -231,18 +232,16 @@ struct Bucket {
 /// and only then, as `spilled` records, does a lookup go on to the next bucket.
 struct Probe {
     buckets: Vec<Bucket>,
-    meta: Vec<u32>,
     spilled: Vec<u64>,
     shift: u32,
 }
 
 impl Probe {
-    fn new(keys: &[[u64; 4]], meta: impl Fn(usize) -> u32, miss: u32) -> Probe {
+    fn new(keys: &[[u64; 4]], meta: impl Fn(usize) -> u32) -> Probe {
         let bits = (keys.len() / 2).next_power_of_two().trailing_zeros().max(1);
         let n = (1 << bits) + 64;
         let mut p = Probe {
             buckets: vec![Bucket::default(); n],
-            meta: vec![miss; 4 * n],
             spilled: vec![0; n / 64 + 1],
             shift: 64 - bits,
         };
@@ -252,9 +251,9 @@ impl Probe {
                 p.spilled[i / 64] |= 1 << (i % 64);
                 i += 1;
             }
-            let lane = p.buckets[i].k0.iter().position(|&x| x == 0).unwrap();
-            (p.buckets[i].k0[lane], p.buckets[i].k1[lane]) = (k[0], k[1]);
-            p.meta[4 * i + lane] = meta(id);
+            let b = &mut p.buckets[i];
+            let lane = b.k0.iter().position(|&x| x == 0).unwrap();
+            (b.k0[lane], b.k1[lane], b.meta[lane]) = (k[0], k[1], meta(id));
         }
         p
     }
@@ -268,19 +267,17 @@ impl Probe {
         let mut i = self.bucket(k);
         loop {
             let b = &self.buckets[i];
-            // SAFETY: AVX2 is enabled for this build, and each aligned load reads one 32-byte array of the bucket.
+            // SAFETY: AVX2 is enabled for this build. Each load reads 32 bytes inside the 64-byte bucket: three key
+            // words and one word after them, whose lane the mask drops.
             let hit = unsafe {
-                let k0 = _mm256_cmpeq_epi64(
-                    _mm256_load_si256(b.k0.as_ptr() as *const __m256i),
-                    _mm256_set1_epi64x(k.0 as i64),
-                );
-                let k1 = _mm256_cmpeq_epi64(
-                    _mm256_load_si256(b.k1.as_ptr() as *const __m256i),
-                    _mm256_set1_epi64x(k.1 as i64),
-                );
-                _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_and_si256(k0, k1))) as usize
+                let words = |p: *const u64, w: u64| {
+                    let v = _mm256_loadu_si256(p as *const __m256i);
+                    _mm256_cmpeq_epi64(v, _mm256_set1_epi64x(w as i64))
+                };
+                let both = _mm256_and_si256(words(b.k0.as_ptr(), k.0), words(b.k1.as_ptr(), k.1));
+                _mm256_movemask_pd(_mm256_castsi256_pd(both)) as usize & 7
             };
-            let found = self.meta[4 * i + (hit.trailing_zeros() as usize & 3)];
+            let found = b.meta[hit.trailing_zeros() as usize & 3];
             if hit != 0 || self.spilled[i / 64] >> (i % 64) & 1 == 0 {
                 return if hit != 0 { found } else { miss };
             }
@@ -595,7 +592,6 @@ impl Run {
 /// One thread's buffers for a chunk, reused from chunk to chunk.
 #[derive(Default)]
 struct Chunk {
-    last: Vec<u32>,
     pairs: Vec<u32>,
     offs: Vec<u32>,
     start: Vec<u32>,
@@ -767,7 +763,7 @@ fn main() {
     assert!(ndense < NO_BITS && nkeys + 1 < 1 << 18);
     let meta = |t: usize| t as u32 | (used[t] as u32 & 3) << 18 | dense_of[t].min(NO_BITS) << 20;
     let miss = nkeys as u32 | NO_BITS << 20;
-    let probe = Probe::new(&terms.keys, meta, miss);
+    let probe = Probe::new(&terms.keys, meta);
     let mut bloom = vec![0u64; 1 << (BLOOM_BITS - 6)];
     for k in &grams.keys {
         let h = (k.wrapping_mul(M) >> (64 - BLOOM_BITS)) as usize;
@@ -792,7 +788,6 @@ fn main() {
         assert!(end - base <= 1 << DOC_BITS);
         let wl = ((end - base) as usize).div_ceil(64);
         let Chunk {
-            last,
             pairs,
             offs,
             start,
@@ -801,7 +796,9 @@ fn main() {
             order,
             run,
         } = w;
-        last.resize(nkeys + 1, 0);
+        // `start` holds, per key, the last document it was recorded for during the scan (as id + 1), then where its
+        // postings begin.
+        (start.clear(), start.resize(nkeys + 1, 0));
         (pairs.clear(), offs.clear(), rows.clear());
         rows.resize(ndense as usize * wl, 0);
         let (mut prev, mut prev_doc, mut prev_phrase) = (0, 0, false);
@@ -816,7 +813,6 @@ fn main() {
                 unsafe {
                     let i = probe.bucket(*k);
                     _mm_prefetch(probe.buckets.as_ptr().add(i) as *const i8, _MM_HINT_T0);
-                    _mm_prefetch(probe.meta.as_ptr().add(4 * i) as *const i8, _MM_HINT_T0);
                 }
             }
             for ((m, t), &k) in found.iter_mut().zip(batch).zip(&keys) {
@@ -835,9 +831,9 @@ fn main() {
                 if flags & 1 != 0 && d != NO_BITS {
                     // A term with a bitset: set the document's bit.
                     rows[d as usize * wl + local as usize / 64] |= 1 << (local % 64);
-                } else if flags & 1 != 0 && last[id] != doc + 1 {
+                } else if flags & 1 != 0 && start[id] != doc + 1 {
                     // Any other BOOL term: a pair, once per document.
-                    last[id] = doc + 1;
+                    start[id] = doc + 1;
                     pairs.push((id as u32) << DOC_BITS | local);
                 }
                 // Two phrase terms in a row: their pair, once per document, if the filter does not rule it out.
@@ -851,8 +847,8 @@ fn main() {
                 {
                     if let Ok(g) = grams.find(h, &pk) {
                         let g = nterms + g as usize;
-                        if last[g] != doc + 1 {
-                            last[g] = doc + 1;
+                        if start[g] != doc + 1 {
+                            start[g] = doc + 1;
                             pairs.push((g as u32) << DOC_BITS | local);
                         }
                     }
