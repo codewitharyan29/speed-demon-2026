@@ -2,6 +2,7 @@ use std::arch::x86_64::*;
 use std::fs::File;
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::Mutex;
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
@@ -312,8 +313,8 @@ struct Query {
 /// Merges sorted `a` with sorted `b` under `op`: AND keeps ids in both, OR in either, NOT in `a` only.
 /// When one side is far shorter than the other and the result can only be as long as the short side, it is cheaper
 /// to look each short id up in the long list by binary search than to walk the long list.
-fn combine(op: u8, a: &[u32], b: &[u32], out: &mut Vec<u32>) {
-    let probe = |short: &[u32], long: &[u32], keep: bool, out: &mut Vec<u32>| {
+fn combine<T: Copy + Ord>(op: u8, a: &[T], b: &[T], out: &mut Vec<T>) {
+    let probe = |short: &[T], long: &[T], keep: bool, out: &mut Vec<T>| {
         let mut from = 0;
         for &x in short {
             from += long[from..].partition_point(|&y| y < x);
@@ -382,103 +383,126 @@ fn has_phrase(b: &[u8], range: (usize, usize), words: &[[u64; 4]]) -> bool {
     found
 }
 
-/// A set of document ids: a sorted list, or a bitset (bit d is document d) once a dense term has joined in.
-enum Set {
-    List(Vec<u32>),
-    Bits(Vec<u64>),
-}
-
-/// What a BOOL operator combines the running set with: a term's list, or its bitset.
+/// What a query operator combines the running set with, within one chunk: a term's list of chunk-local ids, or its
+/// bitset over the chunk's documents.
 enum Operand<'a> {
-    List(&'a [u32]),
+    List(&'a [u16]),
     Bits(&'a [u64]),
 }
 
-fn has(bits: &[u64], d: u32) -> bool {
+fn has(bits: &[u64], d: u16) -> bool {
     bits[d as usize / 64] >> (d % 64) & 1 == 1
 }
 
-impl Set {
-    fn of(operand: &Operand) -> Set {
-        match operand {
-            Operand::List(l) => Set::List(l.to_vec()),
-            Operand::Bits(b) => Set::Bits(b.to_vec()),
+/// The running set of a query within one chunk: a sorted list of chunk-local ids, or a bitset over the chunk's
+/// documents once an OR has brought in a dense term. The buffers are reused from query to query.
+#[derive(Default)]
+struct Run {
+    dense: bool,
+    list: Vec<u16>,
+    tmp: Vec<u16>,
+    bits: Vec<u64>,
+}
+
+impl Run {
+    fn start(&mut self, x: &Operand) {
+        (self.list.clear(), self.bits.clear());
+        self.dense = matches!(x, Operand::Bits(_));
+        match x {
+            Operand::List(l) => self.list.extend_from_slice(l),
+            Operand::Bits(b) => self.bits.extend_from_slice(b),
         }
     }
 
-    /// `self op operand`, where `op` is b'A' (AND), b'O' (OR) or b'N' (NOT).
-    fn apply(self, op: u8, operand: &Operand, tmp: &mut Vec<u32>) -> Set {
-        match (self, operand) {
-            (Set::List(mut a), Operand::List(b)) => {
+    /// `self op x`, where `op` is b'A' (AND), b'O' (OR) or b'N' (NOT).
+    fn apply(&mut self, op: u8, x: &Operand) {
+        let Run {
+            dense,
+            list,
+            tmp,
+            bits,
+        } = self;
+        match (*dense, x) {
+            (false, _) if list.is_empty() && op != b'O' => {}
+            (false, Operand::List(b)) => {
                 tmp.clear();
-                combine(op, &a, b, tmp);
-                std::mem::swap(&mut a, tmp);
-                Set::List(a)
+                combine(op, list, b, tmp);
+                std::mem::swap(list, tmp);
             }
             // A list against a bitset: test each id, unless the union needs the bitset anyway.
-            (Set::List(mut a), Operand::Bits(b)) if op != b'O' => {
-                a.retain(|&d| has(b, d) == (op == b'A'));
-                Set::List(a)
-            }
-            (Set::List(a), Operand::Bits(b)) => {
-                let mut bits = b.to_vec();
-                a.iter()
+            (false, Operand::Bits(b)) if op != b'O' => list.retain(|&d| has(b, d) == (op == b'A')),
+            (false, Operand::Bits(b)) => {
+                (bits.clear(), bits.extend_from_slice(b));
+                list.iter()
                     .for_each(|&d| bits[d as usize / 64] |= 1 << (d % 64));
-                Set::Bits(bits)
+                *dense = true;
             }
             // A bitset against a list: the intersection is as small as the list.
-            (Set::Bits(a), Operand::List(b)) if op == b'A' => {
-                Set::List(b.iter().copied().filter(|&d| has(&a, d)).collect())
+            (true, Operand::List(b)) if op == b'A' => {
+                list.clear();
+                list.extend(b.iter().filter(|&&d| has(bits, d)));
+                *dense = false;
             }
-            (Set::Bits(mut a), Operand::List(b)) => {
+            (true, Operand::List(b)) => {
                 for &d in *b {
-                    let (word, bit) = (d as usize / 64, 1 << (d % 64));
-                    a[word] = if op == b'O' {
-                        a[word] | bit
+                    let (w, bit) = (d as usize / 64, 1u64 << (d % 64));
+                    bits[w] = if op == b'O' {
+                        bits[w] | bit
                     } else {
-                        a[word] & !bit
+                        bits[w] & !bit
                     };
                 }
-                Set::Bits(a)
             }
-            (Set::Bits(mut a), Operand::Bits(b)) => {
-                for (x, y) in a.iter_mut().zip(*b) {
+            (true, Operand::Bits(b)) => {
+                for (x, y) in bits.iter_mut().zip(*b) {
                     *x = match op {
                         b'A' => *x & y,
                         b'O' => *x | y,
                         _ => *x & !y,
                     };
                 }
-                Set::Bits(a)
             }
         }
     }
 
-    /// The set's size, the sum of its ids, and its ten smallest ids.
-    fn summary(&self) -> (u64, u64, Vec<u32>) {
-        match self {
-            Set::List(l) => (
-                l.len() as u64,
-                l.iter().map(|&d| d as u64).sum(),
-                l.iter().take(10).copied().collect(),
-            ),
-            Set::Bits(b) => {
-                let (mut count, mut sum, mut first) = (0, 0, Vec::new());
-                for (i, &word) in b.iter().enumerate() {
-                    let mut w = word;
-                    while w != 0 {
-                        let d = (i * 64) as u32 + w.trailing_zeros();
-                        (count, sum) = (count + 1, sum + d as u64);
-                        if first.len() < 10 {
-                            first.push(d);
-                        }
-                        w &= w - 1;
-                    }
+    /// The set's size, the sum of its ids, and its (up to) ten smallest ids.
+    fn summary(&self) -> (u64, u64, Vec<u16>) {
+        if !self.dense {
+            let sum = self.list.iter().map(|&d| d as u64).sum();
+            return (
+                self.list.len() as u64,
+                sum,
+                self.list.iter().take(10).copied().collect(),
+            );
+        }
+        let (mut count, mut sum, mut first) = (0, 0, Vec::new());
+        for (i, &word) in self.bits.iter().enumerate() {
+            let mut w = word;
+            count += w.count_ones() as u64;
+            while w != 0 {
+                let d = (i * 64) as u16 + w.trailing_zeros() as u16;
+                sum += d as u64;
+                if first.len() < 10 {
+                    first.push(d);
                 }
-                (count, sum, first)
+                w &= w - 1;
             }
         }
+        (count, sum, first)
     }
+}
+
+/// One thread's buffers for a chunk, reused from chunk to chunk.
+#[derive(Default)]
+struct Chunk {
+    last: Vec<u32>,
+    pairs: Vec<u32>,
+    offs: Vec<u32>,
+    start: Vec<u32>,
+    post: Vec<u16>,
+    rows: Vec<u64>,
+    order: Vec<u32>,
+    run: Run,
 }
 
 fn put(out: &mut Vec<u8>, mut x: u64) {
@@ -617,11 +641,6 @@ fn main() {
     let nkeys = nterms + grams.keys.len();
     assert!(nkeys < 1 << (32 - DOC_BITS));
 
-    let wp = n_docs.div_ceil(64);
-    let bits: Vec<AtomicU64> = (0..ndense as usize * wp)
-        .map(|_| AtomicU64::new(0))
-        .collect();
-
     // What the scan probes. Per term: its id, whether BOOL and phrase queries use it, and its bitset if it has one.
     // A bloom filter over the phrase pairs lets the scan skip most pair lookups.
     assert!(ndense < NO_BITS && nkeys + 1 < 1 << 18);
@@ -634,197 +653,166 @@ fn main() {
         bloom[h >> 6] |= 1 << (h & 63);
     }
 
-    let scanned = par(
-        CHUNKS,
-        || vec![0u32; nkeys + 1],
-        |last, c| {
-            let range = (cut(c, CHUNKS), cut(c + 1, CHUNKS));
-            let (base, junk) = (first_doc(range.0), AtomicU64::new(0));
-            // Chunks cover disjoint documents, so only the two bitset words at the ends of a chunk's range can be
-            // written by another thread too; every other word has one writer and needs no atomic update.
-            let end = if range.1 == docs.len() {
-                n_docs as u32
-            } else {
-                first_doc(range.1)
-            };
-            let shared = [base as usize / 64, (end as usize).saturating_sub(1) / 64];
-            let (mut prev, mut prev_doc, mut prev_phrase) = (0, 0, false);
-            let (mut pairs, mut offs) = (Vec::new(), Vec::new());
-            scan(docs, range, base, true, &mut offs, |batch| {
-                // Look every token of the batch up first: the loads are independent, so their cache misses overlap.
-                let mut found = [miss; 40];
-                for (m, t) in found.iter_mut().zip(batch) {
-                    let (at, len) = (t.at as usize, t.len as usize);
-                    let tk = token_key(docs, at, len);
-                    let (mut i, tail) = (slot_of(tk, shift), (tk.1 as u64) << 32);
-                    *m = loop {
-                        let s = probe[i];
-                        if s[0] == tk.0 && s[1] >> 32 << 32 == tail {
-                            break s[1] as u32;
-                        } else if s[0] == 0 {
-                            break miss;
-                        }
-                        i += 1;
-                    };
-                    // A long token matched on a hash of its tail: make sure.
-                    if len > 8
-                        && *m != miss
-                        && terms.keys[(*m & 0x3FFFF) as usize] != key(docs, at, len)
-                    {
-                        *m = miss;
+    // Each chunk is scanned, indexed on its own, and then answers every query for its own documents. Chunks hold
+    // consecutive documents, so nothing that grows with the corpus is ever kept: per query only the running count,
+    // the sum of ids and the ten smallest ids seen so far.
+    let count: Vec<AtomicU32> = (0..queries.len()).map(|_| AtomicU32::new(0)).collect();
+    let sum: Vec<AtomicU64> = (0..queries.len()).map(|_| AtomicU64::new(0)).collect();
+    let first: Vec<Mutex<Vec<u32>>> = (0..queries.len()).map(|_| Mutex::new(Vec::new())).collect();
+    par(CHUNKS, Chunk::default, |w, c| {
+        let range = (cut(c, CHUNKS), cut(c + 1, CHUNKS));
+        let base = first_doc(range.0);
+        let end = if range.1 == docs.len() {
+            n_docs as u32
+        } else {
+            first_doc(range.1)
+        };
+        assert!(end - base <= 1 << DOC_BITS);
+        let wl = ((end - base) as usize).div_ceil(64);
+        let Chunk {
+            last,
+            pairs,
+            offs,
+            start,
+            post,
+            rows,
+            order,
+            run,
+        } = w;
+        last.resize(nkeys + 1, 0);
+        (pairs.clear(), offs.clear(), rows.clear());
+        rows.resize(ndense as usize * wl, 0);
+        let (mut prev, mut prev_doc, mut prev_phrase) = (0, 0, false);
+        scan(docs, range, base, true, offs, |batch| {
+            // Look every token of the batch up first: the loads are independent, so their cache misses overlap.
+            let mut found = [miss; 40];
+            for (m, t) in found.iter_mut().zip(batch) {
+                let (at, len) = (t.at as usize, t.len as usize);
+                let tk = token_key(docs, at, len);
+                let (mut i, tail) = (slot_of(tk, shift), (tk.1 as u64) << 32);
+                *m = loop {
+                    let s = probe[i];
+                    if s[0] == tk.0 && s[1] >> 32 << 32 == tail {
+                        break s[1] as u32;
+                    } else if s[0] == 0 {
+                        break miss;
                     }
+                    i += 1;
+                };
+                // A long token matched on a hash of its tail: make sure.
+                if len > 8
+                    && *m != miss
+                    && terms.keys[(*m & 0x3FFFF) as usize] != key(docs, at, len)
+                {
+                    *m = miss;
                 }
-                // Then act on them, with as few branches as possible.
-                let (mut staged, mut n) = ([0u32; 80], 0);
-                for (m, t) in found.iter().zip(batch) {
-                    let (id, flags, d, doc) = ((m & 0x3FFFF) as usize, m >> 18 & 3, m >> 20, t.doc);
-                    let in_bool = flags & 1 != 0;
-                    // A term with a bitset: set the document's bit (in a throwaway word for any other token).
-                    let (w, dense) = (doc as usize / 64, in_bool && d != NO_BITS);
-                    let word = if dense {
-                        &bits[d as usize * wp + w]
-                    } else {
-                        &junk
-                    };
-                    let bit = (dense as u64) << (doc % 64);
-                    if shared.contains(&w) {
-                        word.fetch_or(bit, Relaxed);
-                    } else {
-                        word.store(word.load(Relaxed) | bit, Relaxed);
-                    }
+            }
+            // Then act on them.
+            for (m, t) in found.iter().zip(batch) {
+                let (id, flags, d) = ((m & 0x3FFFF) as usize, m >> 18 & 3, m >> 20);
+                let (doc, local) = (t.doc, t.doc - base);
+                if flags & 1 != 0 && d != NO_BITS {
+                    // A term with a bitset: set the document's bit.
+                    rows[d as usize * wl + local as usize / 64] |= 1 << (local % 64);
+                } else if flags & 1 != 0 && last[id] != doc + 1 {
                     // Any other BOOL term: a pair, once per document.
-                    let fresh = in_bool && !dense && last[id] != doc + 1;
-                    last[id] = if fresh { doc + 1 } else { last[id] };
-                    staged[n] = (id as u32) << DOC_BITS | (doc - base) & ((1 << DOC_BITS) - 1);
-                    n += fresh as usize;
-                    // Two phrase terms in a row: their pair, once per document, if the filter does not rule it out.
-                    let (phrase, pk) = (flags & 2 != 0, pair(prev, id as u32));
-                    let h = (pk.wrapping_mul(M) >> (64 - BLOOM_BITS)) as usize;
-                    if phrase
-                        && prev_phrase
-                        && prev_doc == doc
-                        && bloom[h >> 6] >> (h & 63) & 1 == 1
-                    {
-                        if let Ok(g) = grams.find(pk.wrapping_mul(M), &pk) {
-                            let g = nterms + g as usize;
-                            if last[g] != doc + 1 {
-                                last[g] = doc + 1;
-                                staged[n] =
-                                    (g as u32) << DOC_BITS | (doc - base) & ((1 << DOC_BITS) - 1);
-                                n += 1;
-                            }
+                    last[id] = doc + 1;
+                    pairs.push((id as u32) << DOC_BITS | local);
+                }
+                // Two phrase terms in a row: their pair, once per document, if the filter does not rule it out.
+                let (phrase, pk) = (flags & 2 != 0, pair(prev, id as u32));
+                let h = (pk.wrapping_mul(M) >> (64 - BLOOM_BITS)) as usize;
+                if phrase && prev_phrase && prev_doc == doc && bloom[h >> 6] >> (h & 63) & 1 == 1 {
+                    if let Ok(g) = grams.find(pk.wrapping_mul(M), &pk) {
+                        let g = nterms + g as usize;
+                        if last[g] != doc + 1 {
+                            last[g] = doc + 1;
+                            pairs.push((g as u32) << DOC_BITS | local);
                         }
                     }
-                    (prev, prev_doc, prev_phrase) = (id as u32, doc, phrase);
                 }
-                pairs.extend_from_slice(&staged[..n]);
-                true
-            });
-            assert!(end - base <= 1 << DOC_BITS);
-            (pairs, offs, base)
-        },
-    );
-
-    // Posting lists in one array. Per chunk and term we know the count, so each chunk scatters into its own
-    // disjoint slots and every list comes out sorted without a sort.
-    let mut place = par(
-        CHUNKS,
-        || (),
-        |_, c| {
-            let mut row = vec![0u32; nkeys];
-            for &p in &scanned[c].0 {
-                row[(p >> DOC_BITS) as usize] += 1;
+                (prev, prev_doc, prev_phrase) = (id as u32, doc, phrase);
             }
-            row
-        },
-    );
-    let mut start = vec![0u32; nkeys + 1];
-    for t in 0..nkeys {
-        let mut at = start[t];
-        for row in place.iter_mut() {
-            (row[t], at) = (at, at + row[t]);
+            true
+        });
+
+        // The chunk's postings, by key, ascending: a counting sort placing pairs from the back.
+        (start.clear(), start.resize(nkeys + 1, 0));
+        pairs
+            .iter()
+            .for_each(|&p| start[(p >> DOC_BITS) as usize] += 1);
+        for i in 1..=nkeys {
+            start[i] += start[i - 1];
         }
-        start[t + 1] = at;
-    }
-    let post: Vec<AtomicU32> = (0..start[nkeys]).map(|_| AtomicU32::new(0)).collect();
-    par(
-        CHUNKS,
-        || (),
-        |_, c| {
-            let mut at = place[c].clone();
-            for &p in &scanned[c].0 {
-                let t = (p >> DOC_BITS) as usize;
-                post[at[t] as usize].store(scanned[c].2 + (p & (1 << DOC_BITS) - 1), Relaxed);
-                at[t] += 1;
-            }
-        },
-    );
-    // SAFETY: AtomicU32 has the layout of u32, and the threads that wrote it have all been joined.
-    let post: &[u32] =
-        unsafe { std::slice::from_raw_parts(post.as_ptr() as *const u32, post.len()) };
-    let doc_off: Vec<u32> = scanned.iter().flat_map(|s| s.1.iter().copied()).collect();
-    let list = |t: u32| &post[start[t as usize] as usize..start[t as usize + 1] as usize];
+        post.resize(pairs.len(), 0);
+        for &p in pairs.iter().rev() {
+            let t = (p >> DOC_BITS) as usize;
+            start[t] -= 1;
+            post[start[t] as usize] = (p & ((1 << DOC_BITS) - 1)) as u16;
+        }
+        let list = |t: u32| &post[start[t as usize] as usize..start[t as usize + 1] as usize];
+        let operand = |t: u32| match dense_of[t as usize] {
+            u32::MAX => Operand::List(list(t)),
+            d => Operand::Bits(&rows[d as usize * wl..][..wl]),
+        };
 
-    // Answer the queries, 64 per job.
-    let bits: Vec<u64> = bits.into_iter().map(AtomicU64::into_inner).collect();
-    let operand = |t: u32| match dense_of[t as usize] {
-        u32::MAX => Operand::List(list(t)),
-        d => Operand::Bits(&bits[d as usize * wp..][..wp]),
-    };
-    let lines = par(
-        queries.len().div_ceil(64),
-        || (Vec::new(), Vec::new()),
-        |(cur, tmp), j| {
-            let mut out = Vec::new();
-            for query in &queries[j * 64..((j + 1) * 64).min(queries.len())] {
-                let set = if query.phrase {
-                    // Documents holding every adjacent pair of the phrase; two terms need no more than that.
-                    let mut order: Vec<_> =
-                        query.pairs.iter().map(|&g| nterms as u32 + g).collect();
-                    order.sort_by_key(|&t| list(t).len());
-                    cur.clear();
-                    cur.extend_from_slice(list(order[0]));
-                    for &t in &order[1..] {
-                        tmp.clear();
-                        combine(b'A', cur, list(t), tmp);
-                        std::mem::swap(cur, tmp);
-                    }
+        // Every query, on this chunk's documents.
+        for (q, query) in queries.iter().enumerate() {
+            if query.phrase {
+                // Documents holding every tracked pair of the phrase; two terms need no more than that.
+                (
+                    order.clear(),
+                    order.extend(query.pairs.iter().map(|&g| nterms as u32 + g)),
+                );
+                order.sort_by_key(|&t| list(t).len());
+                run.start(&Operand::List(list(order[0])));
+                for &t in &order[1..] {
+                    run.apply(b'A', &Operand::List(list(t)));
+                }
+                if query.terms.len() > 2 && !run.list.is_empty() {
                     let words: Vec<_> = query
                         .terms
                         .iter()
                         .map(|&t| terms.keys[t as usize])
                         .collect();
-                    if words.len() > 2 {
-                        cur.retain(|&d| {
-                            let from = doc_off[d as usize] as usize;
-                            let end = doc_off
-                                .get(d as usize + 1)
-                                .map_or(docs.len(), |&next| next as usize)
-                                - 1;
-                            let tab = docs[from..].iter().position(|&c| c == b'\t').unwrap();
-                            has_phrase(docs, (from + tab + 1, end), &words)
-                        });
-                    }
-                    Set::List(cur.clone())
-                } else {
-                    let mut set = Set::of(&operand(query.terms[0]));
-                    for (k, &op) in query.ops.iter().enumerate() {
-                        set = set.apply(op, &operand(query.terms[k + 1]), tmp);
-                    }
-                    set
-                };
-                let (count, sum, first) = set.summary();
-                put(&mut out, count);
-                out.push(b' ');
-                put(&mut out, sum);
-                for d in first {
-                    out.push(b' ');
-                    put(&mut out, d as u64);
+                    run.list.retain(|&d| {
+                        let from = offs[d as usize] as usize;
+                        let end = offs
+                            .get(d as usize + 1)
+                            .map_or(range.1, |&next| next as usize)
+                            - 1;
+                        let tab = docs[from..].iter().position(|&c| c == b'\t').unwrap();
+                        has_phrase(docs, (from + tab + 1, end), &words)
+                    });
                 }
-                out.push(b'\n');
+            } else {
+                run.start(&operand(query.terms[0]));
+                for (k, &op) in query.ops.iter().enumerate() {
+                    run.apply(op, &operand(query.terms[k + 1]));
+                }
             }
-            out
-        },
-    );
-    std::fs::write("/out/results.txt", lines.concat()).expect("write output");
+            let (n, s, ids) = run.summary();
+            if n > 0 {
+                count[q].fetch_add(n as u32, Relaxed);
+                sum[q].fetch_add(s + n * base as u64, Relaxed);
+                let mut f = first[q].lock().unwrap();
+                f.extend(ids.iter().map(|&d| base + d as u32));
+                f.sort_unstable();
+                f.truncate(10);
+            }
+        }
+    });
+
+    let mut out = Vec::new();
+    for q in 0..queries.len() {
+        put(&mut out, count[q].load(Relaxed) as u64);
+        out.push(b' ');
+        put(&mut out, sum[q].load(Relaxed));
+        for &d in first[q].lock().unwrap().iter() {
+            out.push(b' ');
+            put(&mut out, d as u64);
+        }
+        out.push(b'\n');
+    }
+    std::fs::write("/out/results.txt", out).expect("write output");
 }
