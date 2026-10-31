@@ -6,3 +6,4 @@ COPY hyperfine /usr/local/bin/hyperfine
 COPY strace_6.13+ds-1_amd64.deb /tmp/strace.deb
 COPY libunwind8_1.3.2-2_amd64.deb /tmp/libunwind.deb
 RUN dpkg -i /tmp/libunwind.deb /tmp/strace.deb && rm /tmp/*.deb
+RUN rustup component add rustfmt

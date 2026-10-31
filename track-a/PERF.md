@@ -12,7 +12,8 @@ Noise is about +-10 ms, so A/B pairs are timed in one hyperfine session (`BIN=<o
 |---|---|---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 32050 | 228 | | 1.0 | 0 |
 | 1 | Rust: mmap, per-chunk `HashMap<(hour, endpoint), Vec<u32>>`, merge and sort per hour-of-day shard | run-659d7a9038a2 | 132.2 | 100.1 | 170 | 15.54 | 59.57 |
-| 2 | Rewrite: shared lock-free endpoint dictionary, 6-byte records per (chunk, hour), per-hour counting sort, `pread` input | (pending) | | | | | |
+| 2 | Rewrite: shared lock-free endpoint dictionary, 6-byte records per (chunk, hour), per-hour counting sort, `pread` input | run-ac6fd7774fa8 (9360f49) | 33.9 | 195.3 | 454 | 23.17 | 68.25 |
+| 3 | Step 2 plus `MADV_NOHUGEPAGE` on the arena, hour-major arena layout, `MADV_DONTNEED` of each hour's records once summarised | (pending) | | | | | |
 
 Leader when step 2 was prepared (`tools/board_watch.py`): Cause Of Death, Rust, T 16.9 ms, M 18.6 MB, S 353, K 54.5.
 At M 19.5 MB and S 353, K = 56 needs T <= 15.7 ms.
@@ -37,6 +38,18 @@ Phase table of the first rewrite (mmap input, µs since process start, 8 threads
 | `munmap` of the 2.6 GB sparse arena | +4 500 | |
 
 The 24 ms teardown of the mapped input is what made `pread` win (E2d): it also removes the file page faults.
+
+## Lessons from the board
+
+- **Step 2 measured 195 MB where the same binary measured 37 MB locally.** The board kernel has transparent huge pages
+  on (`always`), this VM has `madvise`. The arena is one sparse mapping with a 630 KB region per (chunk, hour), so
+  every touched 2 MiB became a huge page. Reproduced locally by adding `madvise(arena, MADV_HUGEPAGE)` to the build:
+  `memory.peak` 25 MB -> 197 MB. Fixed with `MADV_NOHUGEPAGE` on the arena (step 3). Local M is only trustworthy when
+  the kernel's THP setting matches the board's.
+- Time did transfer: 132 ms -> 33.9 ms on the board for a local 360 -> ~95 ms (about 3.5x both ways).
+- Releasing each hour's records right after it is summarised (hour-major layout, one `madvise(MADV_DONTNEED)` per hour)
+  lowered the local `memory.peak` from 37 MB to 27 MB: the 10 MB output file's page cache counts, and now grows into
+  the memory the records give back. Time was unchanged within noise (best of 40: 83.5 vs 82.3 ms).
 
 ## Rejected or not yet measured
 
