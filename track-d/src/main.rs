@@ -1,3 +1,5 @@
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::fs::File;
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
@@ -17,6 +19,71 @@ fn map(path: &str) -> &'static [u8] {
     // SAFETY: PROT_READ (1), MAP_PRIVATE (2) on a file we just opened; the length is the file's.
     unsafe {
         std::slice::from_raw_parts(mmap(std::ptr::null_mut(), len, 1, 2, f.as_raw_fd(), 0), len)
+    }
+}
+
+/// Keys of a search's queue are always within WINDOW of the key last popped (WINDOW is above every main-body edge
+/// weight), with rare exceptions for edges of near-maximal weight.
+const WINDOW: u64 = 1 << 14;
+
+/// Dial's buckets: a ring of WINDOW buckets in which key k lives in bucket k % WINDOW, popped exactly in key order by
+/// scanning forward from the key last popped. Push and pop are O(1), with none of the radix heap's redistribution.
+/// The rare keys beyond the window wait in a binary heap and are taken when the scan reaches them.
+struct Dial {
+    ring: Vec<Vec<u32>>,
+    at: u64,
+    len: usize,
+    far: BinaryHeap<Reverse<(u64, u32)>>,
+    far_min: u64,
+}
+
+impl Dial {
+    fn new() -> Self {
+        Dial {
+            ring: vec![Vec::new(); WINDOW as usize],
+            at: 0,
+            len: 0,
+            far: BinaryHeap::new(),
+            far_min: u64::MAX,
+        }
+    }
+
+    fn push(&mut self, key: u64, node: u32) {
+        if key < self.at + WINDOW {
+            self.ring[(key % WINDOW) as usize].push(node);
+            self.len += 1;
+        } else {
+            self.far.push(Reverse((key, node)));
+            self.far_min = self.far_min.min(key);
+        }
+    }
+
+    fn pop(&mut self) -> Option<(u64, u32)> {
+        loop {
+            if let Some(node) = self.ring[(self.at % WINDOW) as usize].pop() {
+                self.len -= 1;
+                return Some((self.at, node));
+            }
+            if self.far_min == self.at {
+                let popped = self.far.pop().map(|r| r.0);
+                self.far_min = self.far.peek().map_or(u64::MAX, |r| r.0 .0);
+                return popped;
+            }
+            // An empty ring jumps straight to the far heap's smallest key.
+            self.at = if self.len > 0 {
+                self.at + 1
+            } else {
+                Some(self.far_min).filter(|&k| k < u64::MAX)?
+            };
+        }
+    }
+
+    fn clear(&mut self) {
+        if self.len > 0 {
+            self.ring.iter_mut().for_each(Vec::clear);
+        }
+        (self.at, self.len, self.far_min) = (0, 0, u64::MAX);
+        self.far.clear();
     }
 }
 
@@ -93,45 +160,6 @@ fn par<S, R: Send>(
     });
     all.sort_unstable_by_key(|r| r.0);
     all.into_iter().map(|r| r.1).collect()
-}
-
-/// Monotone priority queue (keys popped never decrease, as in Dijkstra). An entry lives in the bucket given by the
-/// highest bit in which its key differs from the last popped key; popping re-spreads one bucket into lower ones.
-/// Each entry moves down at most 64 times and usually only a few, so this beats a binary heap's log-n sift.
-struct Radix {
-    bucket: Vec<Vec<(u64, u32)>>,
-    last: u64,
-}
-
-impl Radix {
-    fn new() -> Self {
-        Radix {
-            bucket: vec![Vec::new(); 65],
-            last: 0,
-        }
-    }
-
-    fn push(&mut self, key: u64, node: u32) {
-        self.bucket[(64 - (key ^ self.last).leading_zeros()) as usize].push((key, node));
-    }
-
-    fn pop(&mut self) -> Option<(u64, u32)> {
-        if self.bucket[0].is_empty() {
-            let i = (1..65).find(|&i| !self.bucket[i].is_empty())?;
-            let mut moved = std::mem::take(&mut self.bucket[i]);
-            self.last = moved.iter().map(|e| e.0).min().unwrap();
-            for (k, v) in moved.drain(..) {
-                self.push(k, v);
-            }
-            self.bucket[i] = moved;
-        }
-        self.bucket[0].pop()
-    }
-
-    fn clear(&mut self) {
-        self.bucket.iter_mut().for_each(Vec::clear);
-        self.last = 0;
-    }
 }
 
 fn main() {
@@ -296,7 +324,7 @@ fn main() {
     order.sort_unstable_by_key(|&i| new_id[queries[i].0]);
     let sorted = par(
         queries.len(),
-        || (vec![0u32; n], Vec::new(), Vec::new(), Radix::new()),
+        || (vec![0u32; n], Vec::new(), Vec::new(), Dial::new()),
         |(dist, wide, touched, heap), j| {
             let (s, t) = queries[order[j]];
             if s == t {
@@ -350,7 +378,7 @@ fn search<D: Copy + Default + Into<u64> + TryFrom<u64>>(
     t: u32,
     dist: &mut [D],
     touched: &mut Vec<u32>,
-    heap: &mut Radix,
+    heap: &mut Dial,
 ) -> Option<i64> {
     dist[s as usize] = D::try_from(1).ok()?;
     touched.push(s);
