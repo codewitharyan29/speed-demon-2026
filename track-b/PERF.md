@@ -19,7 +19,7 @@ They are only used to compare variants, never reported as results.
 | 7 | Allocation-free per-chunk evaluation with early exits; smaller per-query and sampling state | 55179ca | 0.306 | 59 | 65.464 (K 20.38, 743 lines) |
 | 8 | Batched, prefetched table lookups; bucketised SIMD probe; inline query storage; batched term numbering | fd3e211 | 0.260 | 57 | 67.089 (K 21.97, 815 lines) |
 | 9 | Popcount-based id sums for bitset results | cce528e | 0.250 | 58 | 67.417 (K 22.30, 827 lines) |
-| 10 | One cache line per scan lookup; one buffer for the scan's stamps and the posting starts; 64 chunks | pending | | | |
+| 10 | One cache line per scan lookup; one buffer for the scan's stamps and the posting starts; 64 chunks | cd013f9 | 0.260 | 46 | 68.031 (K 22.94, 820 lines) |
 
 ## Local measurements behind step 2 (in-process ms, median)
 
@@ -192,3 +192,35 @@ the probe's hit-or-spilled test (10 M), list merges in BOOL evaluation (7 M). La
 filter (13 M), the scan stamps (10 M), the counting sort (16 M), the dense rows (6 M).
 
 Verified on full seeds 1 and 2, sample seeds 1-3, tiny seeds 1-6 and the worked example; `memory.peak` 41 MB local.
+
+## Notes from board run cd013f9
+
+- M 58 -> 46 MB as the local `memory.peak` predicted (53 -> 41, the board adds about 5). T 0.250 -> 0.260 s although
+  the local A/B showed the step about even: the board seems to pay more than this laptop for running every query on
+  64 chunks instead of 48. Net +0.61 points; rank 7 of the board, 0.19 points behind sixth.
+- With M at 46 MB the 44 MB cap is worth only about 0.2 points more; time is the lever again (10% faster is about
+  +1 point).
+
+## Step 11 (in progress): the per-chunk evaluation (local, in-process ms, median of 11, on mains power)
+
+| Change | Before -> after | Verdict |
+|---|---|---|
+| Queries answered in the order of their first operand's key (postings are laid out by key) | 217 -> 224, 206 -> 209 | rejected |
+| Operands prefetched ahead across queries: `start[t]` of the query FAR places on, `post[start[t]]` of the one NEAR places on (8/4, 16/8, 32/16) | 195 -> 198 / 200 / 197 | rejected: the evaluation is not waiting on these reads |
+| Branch-free merge in `combine` (always write the smaller head, advance the output by whether `op` keeps it); `combine` made `u16`-only | 188 -> 188, 191 -> 196 | rejected: the merge's 7 M mispredicts are not what the evaluation waits on |
+| Bookkeeping by kind: each batch's tokens listed by kind (bitset term, list term) without a branch, then one loop per kind with no kind branch (the profile's largest mispredict source, 23 M); phrase pairs in their own in-order pass | 207 -> 210, 217 -> 218 | rejected: no effect |
+| First operator fused into the start: two leading lists merged straight into the running set (no copy of the first list, no `tmp` swap) | 189 -> 189, 193 -> 192 | rejected: no effect |
+
+Cycle counters per part of the chunk worker (lfence-fenced `rdtsc`, summed per chunk in locals; throwaway build),
+Mcycles over all threads: scan ~3,200, counting sort ~190, phrases ~190, BOOL evaluation ~900 (1.65 M evaluations
+pass the early exits, ~540 cycles each), size and sum ~210, accumulation ~240. The evaluation is about 30% of the chunk
+worker's cycles but about 10% of its instructions (cachegrind: `apply` 625 M of 9.6 G), so it runs at low IPC. A
+histogram of cycles per BOOL evaluation: 1.52 M of the 1.65 M take 150-1,500 cycles (685 Mcycles in all), 66 k take
+1,500-6,000 (143), 506 take more (66). So the cost is a fixed overhead per (query, chunk), not a few heavy queries, and
+neither its memory reads (prefetching) nor the merge's mispredicts (branch-free merge) explain it.
+
+Five targeted changes in a row (sorted queries, prefetching, branch-free merge, bookkeeping by kind, fused start) moved
+nothing, although each removed what the profile blamed. Taken together that suggests the 12 threads are limited by
+something they share (the two hardware threads of a core, or the memory system) rather than by any one of these
+costs; the next step should test that directly (for example the chunk worker alone on 6 and 12 threads) before more
+micro-changes.

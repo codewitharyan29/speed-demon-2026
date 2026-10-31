@@ -13,7 +13,8 @@ They are noisy in absolute terms (a Windows laptop VM, not the scoring box) and 
 | 2 | Parallel parse and CSR, parallel region-growing renumbering, radix heap, lazy `dist`, `MAP_POPULATE` | bdfba23 | 0.399 | 272 | 55.446 (K 12.85, 292 lines) |
 | 3 | Drop `MAP_POPULATE`; `-C target-cpu=native` | 5f206c6 | 0.389 | 275 | 55.695 (K 13.00, 289 lines) |
 | 4 | The degree array is reused as the write cursor and dropped after the scatter | eb8a2d1 | 0.391 | 258 | 55.925 (K 13.14, 288 lines) |
-| 5 | 4-byte distances with an 8-byte fallback, locality-ordered scheduling, pre-sized and SWAR-parsed edge lines | pending | | | |
+| 5 | 4-byte distances with an 8-byte fallback, locality-ordered scheduling, pre-sized and SWAR-parsed edge lines | 90838c8 | 0.347 | 188 | 58.168 (K 14.57, 327 lines) |
+| 6 | Region numbering, new ids and new offsets written in parallel | pending | | | |
 
 ## Local measurements behind step 2 (full data, in-process ms, 12 CPUs)
 
@@ -88,3 +89,25 @@ queries, ends up fully resident (167 MB). The build phase alone peaks at 134 MB 
 Profile of step 5 on the sample (cachegrind): number parsing was 26% of all instructions before the SWAR change; in the
 searches the relax test (`seen == 0 || nd + 1 < seen`) is the main mispredicted branch and the `dist` loads the main
 L1 misses.
+
+## After step 5: bidirectional search, second try (research suggestion: interleaved distances)
+
+| Change | Result | Verdict |
+|---|---|---|
+| Bidirectional Dijkstra with the forward and backward distance of a node side by side (`[u32; 2]`), so meeting the other side costs no extra cache miss | 320 -> 526 ms, `memory.peak` 315 MB | reverted |
+
+Counting the work explains it: bidirectional search pops 15.4 M nodes and relaxes 41.6 M edges, against 24.9 M and
+67.5 M for the forward search (38% less work), yet each relaxation costs ~98 ns against ~27 ns. The forward search
+on the renumbered graph stays inside one 40 MB, cache-friendly adjacency; the backward half walks a second 40 MB
+reverse graph, and the per-node state doubles, which together go far past the 24 MB L3. Other research suggestions
+not taken: a partition overlay (CRP/MLD) needs a Dijkstra from every boundary node of every cell, 10^8-10^9 settled
+nodes of preprocessing against ~24 M for all queries; a timestamped distance array shared by all threads is not
+correct when 12 threads run different queries at once.
+
+## Step 6: the sequential part of the renumbering
+
+Phase times (warm, local): flattening the nested region lists 9-10 ms, writing new ids 5 ms, the new offsets 13-15 ms,
+all on one thread. With a prefix sum over region sizes, every region knows where its nodes go and writes its new ids,
+order slots and degrees in parallel; only the prefix sum of degrees stays sequential. Numbering 27 -> 14 ms
+(end-to-end medians too noisy to resolve while the other session benchmarks). Verified on tiny seeds 1-6, sample
+seeds 1-3, full seeds 1-2 and the worked example.
