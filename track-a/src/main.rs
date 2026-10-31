@@ -480,7 +480,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let arg = |name: &str, default: &str| args.iter().position(|a| a == name).map_or(default, |i| &args[i + 1]).to_string();
     let (data, out) = (arg("--data", "/data"), arg("--out", "/out"));
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get() * 3 / 2);
     // The first pass ends the process unless a chunk found the guess wrong.
     for guess in [true, false] {
         let job = Job::new(&data, &out, guess);
