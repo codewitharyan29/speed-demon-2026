@@ -17,7 +17,8 @@ They are only used to compare variants, never reported as results.
 | 5 | AVX2 block tokeniser, right-sized hash tables, batched probe with the key in the slot, bitset-native BOOL evaluation, pairs tracked only where a phrase needs them | 175c722 | 0.342 | 171 | 59.748 (K 15.67, 731 lines) |
 | 6 | Per-chunk indexing and evaluation: no global postings at all | a21a357 | 0.329 | 62 | 64.605 (K 19.59, 716 lines) |
 | 7 | Allocation-free per-chunk evaluation with early exits; smaller per-query and sampling state | 55179ca | 0.306 | 59 | 65.464 (K 20.38, 743 lines) |
-| 8 | Batched, prefetched table lookups; bucketised SIMD probe; inline query storage; batched term numbering | pending | | | |
+| 8 | Batched, prefetched table lookups; bucketised SIMD probe; inline query storage; batched term numbering | fd3e211 | 0.260 | 57 | 67.089 (K 21.97, 815 lines) |
+| 9 | Popcount-based id sums for bitset results | pending | | | |
 
 ## Local measurements behind step 2 (in-process ms, median)
 
@@ -156,3 +157,14 @@ chunk index ~130, + per-chunk evaluation ~170.
 | Query terms numbered in batches of 16 with their table slots prefetched (interning was 12-15 of the 22 ms parse) | 211 -> 203; parse 22 -> 15 ms | kept |
 
 Verified on full seeds 1 and 2, sample seeds 1-3, tiny seeds 1-6 and the worked example.
+
+## Step 9: where the per-chunk evaluation spends its time
+
+Counters in a throwaway build: of 31,000 BOOL x 48 chunks = 1.49 M (query, chunk) evaluations, 1.27 M pass the early
+exits; BOOL evaluation takes ~620 CPU-ms against ~70 for phrases; 650 k evaluations are non-empty.
+
+| Change | Before -> after | Verdict |
+|---|---|---|
+| Early exit for a no-OR BOOL query when any ANDed term (not only the first) is absent from the chunk | 191 -> 194 | reverted: no effect |
+| Id sum of a bitset result by popcounts: the positions of a word's set bits sum to the sum over k of 2^k times the popcount of the bits whose position has bit k set, six popcounts per word instead of a step per set bit (a broad query has thousands of set bits per chunk) | 202 -> 189 | kept |
+| Pair key hashed once for both the bloom filter and the table | 200 -> 191 (noisy run, minimums equal) | kept: one multiply fewer |
