@@ -182,7 +182,7 @@ unsafe fn scan(mut p: *const u8, lim: *const u8, dict: &Dict, cur: &mut [usize; 
         let spaces = find(w) | find(w.add(32)) << 32;
         let start = spaces.trailing_zeros() as usize + 1;
         let end = match spaces & spaces.wrapping_sub(1) {
-            0 => (64..).find(|&i| *w.add(i) == b' ').unwrap(),
+            0 => (64..).step_by(32).map(|o| (o, find(w.add(o)))).find(|&(_, m)| m != 0).map(|(o, m)| o + m.trailing_zeros() as usize).unwrap(),
             more => more.trailing_zeros() as usize,
         };
         let id = dict.lookup(w.add(start), end - start, hash(w.add(start), end - start));
