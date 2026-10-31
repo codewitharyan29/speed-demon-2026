@@ -13,6 +13,8 @@ They are only used to compare variants, never reported as results.
 | 2 | Binary-search probing for lopsided intersections, SWAR tokeniser, bigram postings for phrases | 08b7a67 | 0.469 | 375 | 54.788 (K 12.47, 409 lines) |
 | 3 | Terms in over 1/32 of the documents as shared bitsets (chosen from a 2% sample), (term, document) pairs packed into 4 bytes | f2ef5ee | 0.484 | 221 | 56.098 (K 13.24, 496 lines) |
 | 4 | `-C target-cpu=native` | 5f206c6 | 0.474 | 223 | 56.310 (K 13.37, 496 lines) |
+| 4b | (unchanged code, re-run with a Track D push) | ac9a033 | 0.469 | 222 | 56.436 (K 13.45, 496 lines) |
+| 5 | AVX2 block tokeniser, right-sized hash tables, batched probe with the key in the slot, bitset-native BOOL evaluation, pairs tracked only where a phrase needs them | pending | | | |
 
 ## Local measurements behind step 2 (in-process ms, median)
 
@@ -65,3 +67,29 @@ A touch-only pass over the whole mapped corpus takes 3 ms, so page faults are no
 |---|---|---|
 | PGO: instrumented build and run on the full seed-1 data in the pinned rustc 1.99.1 image, `-Cprofile-use`, profile regenerated for the exact source measured | 726 -> 888 (+22%) | rejected: slower, with no profile-mismatch warning. Not investigated further; `tools/pgo.sh` reproduces it |
 | `-C target-cpu=native` through `.cargo/config.toml` (the scoring box builds the track itself) | 732 -> 706 | adopted: small but consistent in both minimum and median, two lines |
+
+## Step 5: profiling-driven rework of the scan and the BOOL evaluator (local, in-process ms, median of 9)
+
+Tools: `tools/cachegrind.sh` (valgrind cachegrind with branch simulation, per source line via `tools/cgtop.py`),
+`tools/ablate.py` (the scan with progressively more of its work enabled), `tools/phases.py` (time and RSS per phase).
+
+What the first profile said (sample data, 3.6 M tokens): about 166 instructions, 2 branch mispredicts and 1.8 L1 misses
+per token. The SWAR word loop alone gave 2.3 M mispredicts (one loop exit per 8 bytes), the table probe 4.0 M L1 misses.
+Ablation of the scan on the full data: tokenising 25-50 ms, + key and hash ~55, + probe ~95, everything ~215; the bigram
+probe and the term bookkeeping were about 65 ms each.
+
+| Change | Before -> after | Verdict |
+|---|---|---|
+| AVX2 tokeniser: 64-byte blocks, letter/digit and newline masks with `movemask`, token edges by `tzcnt`, the document number from a popcount of newlines (no id parsing, no per-token "first token of the line" test), tokens handed over in batches | 361 -> 338 | kept |
+| Hash tables rebuilt at 3x their key count after parsing (they had been sized from an upper bound, 8-15% full, 2 MB each) | 337 -> 323 | kept |
+| One `info` word per term instead of two arrays; plain stores instead of `lock or` for bitset words a chunk owns alone | 338 -> 340 | reverted: no effect |
+| Batch lookup: the scan table holds each term's first key word, a tail hash and its metadata in one 16-byte slot, so a lookup is one cache line; all lookups of a batch run before any bookkeeping | 337 -> 317 | kept |
+| First try of that table with a fixed 2-slot probe | 675, memory 388 MB | bug found: about 2% of keys do not fit two slots at a sane load, and the build doubled the table until they did; replaced by linear probing at load 1/6-1/3 |
+| BOOL sets as a sorted list or a bitset: dense operands are combined word by word or bit-tested, never decoded into 250k-id lists | 330 -> 294; memory 214 -> 182 MB | kept |
+| Fully branch-free bookkeeping (all four key words always computed, predicated writes into a per-chunk junk word, non-short-circuit conditions) | 294 -> 331 | reverted: the extra work costs more than the mispredicts it saves |
+| Same without the key change | 278 -> 286 | reverted |
+| Queries parsed in parallel (12 line-aligned pieces), only numbering sequential | 276 -> 288 | reverted: numbering (~19 ms) is the sequential part; splitting was only ~6 ms |
+| Pairs tracked only where needed: a phrase with a rare term (from the 2% sample) gets one pair, that term and its rarer neighbour; only phrases of common words keep every pair. Only terms of tracked pairs take part in the scan's pair logic | 274 -> 250; memory 182 -> 147 MB | kept |
+
+Correctness after each kept step: the spec's worked example, tiny and sample seed 1 against the Python reference, and
+the full seed-1 hash. Before committing: tiny seeds 2-6 and sample seeds 2-3 also match the reference.
