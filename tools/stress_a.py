@@ -1,10 +1,14 @@
-"""Write a hostile-but-valid Track A input: python tools/stress_a.py <seed> [lines] [sorted|shuffled] -> data/a-stress-<seed>/requests.log
+"""Write a hostile-but-valid Track A input: python tools/stress_a.py <seed> [lines] [sorted|shuffled] [latency mode] -> data/a-stress-<seed>/requests.log
 Covers what the generated data may not: endpoints of every length 1..125 bytes (sharing prefixes and suffixes), latencies of 1..10
-digits up to 4294967295, every status class, all four days, 1,800 endpoints, one huge group, and shuffled or sorted timestamps."""
+digits up to 4294967295, every status class, all four days, 1,800 endpoints, one huge group, and shuffled or sorted timestamps.
+Latency modes (the default `mixed` is the digit-count mix above; the others go to data/a-stress-<seed>-<mode>): max (all 4294967295),
+sent (all 1048575, the value that marks a two-word record), sentm1 (all 1048574), edge (1048573..1048577), uniform (random u32),
+zero (all 0), half (0 or 4294967295)."""
 import os, random, sys
 
 seed, lines = int(sys.argv[1]), int(sys.argv[2]) if len(sys.argv) > 2 else 400_000
 order = sys.argv[3] if len(sys.argv) > 3 else "shuffled"
+mode = sys.argv[4] if len(sys.argv) > 4 else "mixed"
 rnd = random.Random(seed)
 alphabet = "abcdefghij/_-{}0123456789"
 endpoints = set()
@@ -32,11 +36,14 @@ for _ in range(lines):
     lat = rnd.randint(10 ** (d - 1) if d > 1 else 0, min(10 ** d - 1, 4294967295))
     if rnd.random() < 0.0005:
         lat = 4294967295
+    lat = {"mixed": lat, "max": 4294967295, "sent": 1048575, "sentm1": 1048574, "edge": rnd.randint(1048573, 1048577),
+           "uniform": rnd.randint(0, 4294967295), "zero": 0, "half": rnd.choice([0, 4294967295])}[mode]
     ep = endpoints[0] if rnd.random() < 0.05 else rnd.choices(endpoints, weights)[0]
     rows.append((ts, f"{ts} {rnd.choice(methods)} {ep} {rnd.randint(100, 599)} {lat}"))
 if order == "sorted":
     rows.sort()
-os.makedirs(f"data/a-stress-{seed}", exist_ok=True)
-with open(f"data/a-stress-{seed}/requests.log", "w", newline="\n") as f:
+name = f"data/a-stress-{seed}" + ("" if mode == "mixed" else f"-{mode}")
+os.makedirs(name, exist_ok=True)
+with open(f"{name}/requests.log", "w", newline="\n") as f:
     f.write("\n".join(r[1] for r in rows) + "\n")
-print(f"data/a-stress-{seed}: {lines} lines, {len(endpoints)} endpoints, {order}")
+print(f"{name}: {lines} lines, {len(endpoints)} endpoints, {order}")
