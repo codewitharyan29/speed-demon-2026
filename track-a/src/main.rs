@@ -394,7 +394,7 @@ impl Job {
             self.parse_chunk(c, &mut buf);
         }
         if self.parsed.fetch_add(1, SeqCst) == THREADS - 1 {
-            self.order.set(self.endpoint_order()).unwrap();
+            std::process::exit(0); // DIAGNOSTIC: stop after the parse phase
         }
         let order = loop {
             match self.order.get() {
