@@ -14,6 +14,8 @@ const ONES: u64 = 0x0101010101010101;
 const DOC_BITS: u32 = 14;
 const BLOOM_BITS: u32 = 20;
 const NO_BITS: u32 = 0xFFF;
+/// Tokens handed over at a time: enough independent table lookups to keep many cache misses in flight.
+const BATCH: usize = 48;
 
 /// Maps a file read-only. The mapping is never unmapped, so the slice is 'static.
 fn map(path: &str) -> &'static [u8] {
@@ -126,7 +128,7 @@ fn scan(
     lines: &mut Vec<u32>,
     mut f: impl FnMut(&[Tok]) -> bool,
 ) {
-    let mut batch = [Tok::default(); 40];
+    let (mut batch, mut n) = ([Tok::default(); BATCH + 33], 0);
     let (mut doc, mut prev_alnum, mut prev_nl) = (first_doc, 0u64, line_start as u64);
     let (mut start, mut start_doc, mut skip, mut open) = (0, 0, false, false);
     if line_start && from < to {
@@ -137,7 +139,6 @@ fn scan(
         let after_nl = nl << 1 | prev_nl;
         let mut edges = m ^ (m << 1 | prev_alnum);
         (prev_alnum, prev_nl) = (m >> 63, nl >> 63);
-        let mut n = 0;
         while edges != 0 {
             let p = edges.trailing_zeros();
             edges &= edges - 1;
@@ -165,16 +166,23 @@ fn scan(
             }
         }
         doc += nl.count_ones();
-        if n > 0 && !f(&batch[..n]) {
-            return;
+        if n >= BATCH {
+            if !f(&batch[..n]) {
+                return;
+            }
+            n = 0;
         }
     }
     if open && !skip {
-        f(&[Tok {
+        batch[n] = Tok {
             doc: start_doc,
             at: start as u32,
             len: (to - start) as u32,
-        }]);
+        };
+        n += 1;
+    }
+    if n > 0 {
+        f(&batch[..n]);
     }
 }
 
@@ -200,51 +208,85 @@ fn hash(k: &[u64; 4]) -> u64 {
     h
 }
 
-/// A token as the scan table sees it: its first eight bytes, and for a longer token a hash of the rest (never 0).
-/// A token longer than any legal term gets a first word no term can have.
-fn token_key(b: &[u8], at: usize, len: usize) -> (u64, u32) {
-    if len <= 8 {
-        return (
-            (load(b, at) | ONES * 0x20) & (u64::MAX >> (64 - 8 * len)),
-            0,
-        );
-    }
-    if len > 32 {
-        return (u64::MAX, 0);
-    }
-    let k = key(b, at, len);
-    (k[0], tail_hash(&k))
+/// A token's first sixteen bytes, lower-cased, as two words, with no branch on its length: bytes past the token are
+/// masked off.
+fn short_key(b: &[u8], at: usize, len: usize) -> (u64, u64) {
+    let word = |i: usize| {
+        let n = len.saturating_sub(8 * i).min(8) as u32;
+        (load(b, at + 8 * i) | ONES * 0x20) & u64::MAX.checked_shr(64 - 8 * n).unwrap_or(0)
+    };
+    (word(0), word(1))
 }
 
-fn tail_hash(k: &[u64; 4]) -> u32 {
-    let h = k[1].wrapping_mul(M)
-        ^ k[2].rotate_left(21).wrapping_mul(M)
-        ^ k[3].rotate_left(42).wrapping_mul(M);
-    (h >> 32) as u32 | 1
+/// One cache line of the scan's table: the two key words of four terms.
+#[repr(C, align(64))]
+#[derive(Clone, Copy, Default)]
+struct Bucket {
+    k0: [u64; 4],
+    k1: [u64; 4],
 }
 
-fn slot_of((k0, tail): (u64, u32), shift: u32) -> usize {
-    ((k0.wrapping_mul(M) ^ (tail as u64).wrapping_mul(0xC2B2AE3D27D4EB4F)) >> shift) as usize
+/// The table the scan probes for every term of up to 16 bytes, which is all of them in practice (the longest token
+/// in a generated corpus has 17). A lookup compares a whole bucket at once; a full bucket spills into the next one,
+/// and only then, as `spilled` records, does a lookup go on to the next bucket.
+struct Probe {
+    buckets: Vec<Bucket>,
+    meta: Vec<u32>,
+    spilled: Vec<u64>,
+    shift: u32,
 }
 
-/// The table the scan probes: every term once, as [first word, tail hash << 32 | meta], by linear probing at a load
-/// of 1/6 to 1/3. The array has slack at its end so that probing never wraps.
-fn build_probe(keys: &[[u64; 4]], meta: impl Fn(usize) -> u32) -> (Vec<[u64; 2]>, u32) {
-    let bits = (keys.len() * 3).next_power_of_two().trailing_zeros();
-    let (shift, mut slots) = (64 - bits, vec![[0u64; 2]; (1 << bits) + 256]);
-    for (id, k) in keys.iter().enumerate() {
-        let tail = if k[1] | k[2] | k[3] == 0 {
-            0
-        } else {
-            tail_hash(k)
+impl Probe {
+    fn new(keys: &[[u64; 4]], meta: impl Fn(usize) -> u32, miss: u32) -> Probe {
+        let bits = (keys.len() / 2).next_power_of_two().trailing_zeros().max(1);
+        let n = (1 << bits) + 64;
+        let mut p = Probe {
+            buckets: vec![Bucket::default(); n],
+            meta: vec![miss; 4 * n],
+            spilled: vec![0; n / 64 + 1],
+            shift: 64 - bits,
         };
-        let mut i = slot_of((k[0], tail), shift);
-        while slots[i][0] != 0 {
+        for (id, k) in keys.iter().enumerate().filter(|(_, k)| k[2] == 0) {
+            let mut i = p.bucket((k[0], k[1]));
+            while let None = p.buckets[i].k0.iter().position(|&x| x == 0) {
+                p.spilled[i / 64] |= 1 << (i % 64);
+                i += 1;
+            }
+            let lane = p.buckets[i].k0.iter().position(|&x| x == 0).unwrap();
+            (p.buckets[i].k0[lane], p.buckets[i].k1[lane]) = (k[0], k[1]);
+            p.meta[4 * i + lane] = meta(id);
+        }
+        p
+    }
+
+    fn bucket(&self, (k0, k1): (u64, u64)) -> usize {
+        ((k0.wrapping_mul(M) ^ k1.wrapping_mul(0xC2B2AE3D27D4EB4F)) >> self.shift) as usize
+    }
+
+    /// The metadata of the term whose key words are `k`, or `miss`.
+    fn find(&self, k: (u64, u64), miss: u32) -> u32 {
+        let mut i = self.bucket(k);
+        loop {
+            let b = &self.buckets[i];
+            // SAFETY: AVX2 is enabled for this build, and each aligned load reads one 32-byte array of the bucket.
+            let hit = unsafe {
+                let k0 = _mm256_cmpeq_epi64(
+                    _mm256_load_si256(b.k0.as_ptr() as *const __m256i),
+                    _mm256_set1_epi64x(k.0 as i64),
+                );
+                let k1 = _mm256_cmpeq_epi64(
+                    _mm256_load_si256(b.k1.as_ptr() as *const __m256i),
+                    _mm256_set1_epi64x(k.1 as i64),
+                );
+                _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_and_si256(k0, k1))) as usize
+            };
+            let found = self.meta[4 * i + (hit.trailing_zeros() as usize & 3)];
+            if hit != 0 || self.spilled[i / 64] >> (i % 64) & 1 == 0 {
+                return if hit != 0 { found } else { miss };
+            }
             i += 1;
         }
-        slots[i] = [k[0], (tail as u64) << 32 | meta(id) as u64];
     }
-    (slots, shift)
 }
 
 /// An open-addressing hash table that numbers distinct keys in order of first appearance (slot = id + 1, 0 = empty).
@@ -287,6 +329,16 @@ impl<K: PartialEq + Copy> Table<K> {
         }
     }
 
+    /// Asks for the cache line of the slot where a key with hash `h` would be looked for.
+    fn prefetch(&self, h: u64) {
+        let slot = self
+            .slots
+            .as_ptr()
+            .wrapping_add((h >> (64 - self.bits)) as usize);
+        // SAFETY: a prefetch is only a hint and never faults; the address is inside `slots`.
+        unsafe { _mm_prefetch(slot as *const i8, _MM_HINT_T0) };
+    }
+
     fn intern(&mut self, h: u64, k: K) -> u32 {
         self.find(h, &k).unwrap_or_else(|slot| {
             self.keys.push(k);
@@ -303,11 +355,38 @@ fn pair(a: u32, b: u32) -> u64 {
 
 /// A parsed query: term ids, and the operator byte (b'A', b'O' or b'N') between each neighbouring pair. A phrase has
 /// no operators but the id of each adjacent pair of its terms.
+/// Everything is stored inline (a query has at most 8 terms), so the per-chunk pass over all queries reads memory in
+/// order instead of chasing a pointer per query.
 struct Query {
     phrase: bool,
-    terms: Vec<u32>,
-    ops: Vec<u8>,
-    pairs: Vec<u32>,
+    terms: Few<u32, 8>,
+    ops: Few<u8, 8>,
+    pairs: Few<u32, 7>,
+}
+
+/// A list of at most N items, stored inline.
+#[derive(Clone, Copy)]
+struct Few<T, const N: usize> {
+    len: u8,
+    items: [T; N],
+}
+
+impl<T: Copy + Default, const N: usize> Few<T, N> {
+    fn new(s: &[T]) -> Self {
+        let mut items = [T::default(); N];
+        items[..s.len()].copy_from_slice(s);
+        Few {
+            len: s.len() as u8,
+            items,
+        }
+    }
+}
+
+impl<T, const N: usize> std::ops::Deref for Few<T, N> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        &self.items[..self.len as usize]
+    }
 }
 
 /// Merges sorted `a` with sorted `b` under `op`: AND keeps ids in both, OR in either, NOT in `a` only.
@@ -532,39 +611,55 @@ fn put(out: &mut Vec<u8>, mut x: u64) {
 }
 
 fn main() {
-    // Intern every term of every query. `used` says how a term is used: bit 0 in a BOOL query (needs a posting list),
-    // bit 2 in a phrase; bit 1, set later, if the scan tracks pairs it starts or ends.
+    // Parse every query; the keys of all terms go into one list. They are read from the whole mapped file, so that
+    // the eight-byte loads never run off the end of a short slice.
     let q = map("/data/queries.txt");
-    let words = q.iter().filter(|&&c| c == b' ' || c == b'\n').count();
-    let (mut terms, mut grams, mut used) = (Table::new(words), Table::new(words), Vec::new());
-    let mut queries: Vec<Query> = q
+    let mut keys: Vec<[u64; 4]> = Vec::new();
+    let shapes: Vec<(bool, usize, Few<u8, 8>)> = q
         .split(|&c| c == b'\n')
         .filter(|l| !l.is_empty())
         .map(|line| {
             let mut parts = line.split(|&c| c == b' ');
             let phrase = parts.next().unwrap() == b"PHRASE";
-            let (mut ids, mut ops) = (Vec::new(), Vec::new());
+            let (mut ops, before) = (Vec::new(), keys.len());
             for (k, w) in parts.enumerate() {
                 if !phrase && k % 2 == 1 {
                     ops.push(w[0]);
                 } else {
                     let w = w.strip_prefix(b"\"").unwrap_or(w);
                     let w = w.strip_suffix(b"\"").unwrap_or(w);
-                    let k = key(w, 0, w.len());
-                    let id = terms.intern(hash(&k), k);
-                    used.resize(terms.keys.len(), 0u8);
-                    used[id as usize] |= if phrase { 4 } else { 1 };
-                    ids.push(id);
+                    keys.push(key(q, w.as_ptr() as usize - q.as_ptr() as usize, w.len()));
                 }
             }
+            (phrase, keys.len() - before, Few::new(&ops))
+        })
+        .collect();
+
+    // Number the terms, sixteen at a time: the table slots of a batch are fetched together, so their cache misses
+    // overlap. `used` says how a term is used: bit 0 in a BOOL query (needs a posting list), bit 2 in a phrase; bit 1,
+    // set later, if the scan tracks pairs it starts or ends.
+    let (mut terms, mut grams, mut ids) =
+        (Table::new(keys.len()), Table::new(keys.len()), Vec::new());
+    for batch in keys.chunks(16) {
+        batch.iter().for_each(|k| terms.prefetch(hash(k)));
+        ids.extend(batch.iter().map(|&k| terms.intern(hash(&k), k)));
+    }
+    let (mut used, mut at) = (vec![0u8; terms.keys.len()], 0);
+    let mut queries: Vec<Query> = (shapes.into_iter())
+        .map(|(phrase, n, ops)| {
+            let t = &ids[at..at + n];
+            at += n;
+            t.iter()
+                .for_each(|&id| used[id as usize] |= if phrase { 4 } else { 1 });
             Query {
                 phrase,
-                terms: ids,
+                terms: Few::new(t),
                 ops,
-                pairs: Vec::new(),
+                pairs: Few::new(&[]),
             }
         })
         .collect();
+    drop((keys, ids));
     terms.shrink(hash);
     let nterms = terms.keys.len();
 
@@ -648,10 +743,11 @@ fn main() {
             used[t[i + 1] as usize] |= 2;
         }
         let key_of = |i: usize| pair(t[i], t[i + 1]);
-        query.pairs = chosen
+        let pairs: Vec<u32> = chosen
             .iter()
             .map(|&i| grams.intern(key_of(i).wrapping_mul(M), key_of(i)))
             .collect();
+        query.pairs = Few::new(&pairs);
     }
     grams.shrink(|k| k.wrapping_mul(M));
     let nkeys = nterms + grams.keys.len();
@@ -661,8 +757,8 @@ fn main() {
     // A bloom filter over the phrase pairs lets the scan skip most pair lookups.
     assert!(ndense < NO_BITS && nkeys + 1 < 1 << 18);
     let meta = |t: usize| t as u32 | (used[t] as u32 & 3) << 18 | dense_of[t].min(NO_BITS) << 20;
-    let (probe, shift) = build_probe(&terms.keys, meta);
     let miss = nkeys as u32 | NO_BITS << 20;
+    let probe = Probe::new(&terms.keys, meta, miss);
     let mut bloom = vec![0u64; 1 << (BLOOM_BITS - 6)];
     for k in &grams.keys {
         let h = (k.wrapping_mul(M) >> (64 - BLOOM_BITS)) as usize;
@@ -702,26 +798,25 @@ fn main() {
         let (mut prev, mut prev_doc, mut prev_phrase) = (0, 0, false);
         scan(docs, range, base, true, offs, |batch| {
             // Look every token of the batch up first: the loads are independent, so their cache misses overlap.
-            let mut found = [miss; 40];
-            for (m, t) in found.iter_mut().zip(batch) {
-                let (at, len) = (t.at as usize, t.len as usize);
-                let tk = token_key(docs, at, len);
-                let (mut i, tail) = (slot_of(tk, shift), (tk.1 as u64) << 32);
-                *m = loop {
-                    let s = probe[i];
-                    if s[0] == tk.0 && s[1] >> 32 << 32 == tail {
-                        break s[1] as u32;
-                    } else if s[0] == 0 {
-                        break miss;
-                    }
-                    i += 1;
-                };
-                // A long token matched on a hash of its tail: make sure.
-                if len > 8
-                    && *m != miss
-                    && terms.keys[(*m & 0x3FFFF) as usize] != key(docs, at, len)
-                {
-                    *m = miss;
+            // First every token's key and home slot, asking for the slot's cache line straight away, so the misses
+            // of the whole batch overlap instead of being waited for one at a time.
+            let (mut found, mut keys) = ([miss; BATCH + 33], [(0, 0); BATCH + 33]);
+            for (k, t) in keys.iter_mut().zip(batch) {
+                *k = short_key(docs, t.at as usize, t.len as usize);
+                // SAFETY: a prefetch is only a hint and never faults; the addresses are inside the table.
+                unsafe {
+                    let i = probe.bucket(*k);
+                    _mm_prefetch(probe.buckets.as_ptr().add(i) as *const i8, _MM_HINT_T0);
+                    _mm_prefetch(probe.meta.as_ptr().add(4 * i) as *const i8, _MM_HINT_T0);
+                }
+            }
+            for ((m, t), &k) in found.iter_mut().zip(batch).zip(&keys) {
+                *m = probe.find(k, miss);
+                // A token over 16 bytes (none in the generated data) is looked up in full.
+                if t.len > 16 {
+                    let k = key(docs, t.at as usize, (t.len as usize).min(32));
+                    let id = terms.find(hash(&k), &k).ok().filter(|_| t.len <= 32);
+                    *m = id.map_or(miss, |id| meta(id as usize));
                 }
             }
             // Then act on them.
