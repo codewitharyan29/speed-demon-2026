@@ -13,7 +13,7 @@ Noise is about +-10 ms, so A/B pairs are timed in one hyperfine session (`BIN=<o
 | 0 | The reference, unchanged | | 32050 | 228 | | 1.0 | 0 |
 | 1 | Rust: mmap, per-chunk `HashMap<(hour, endpoint), Vec<u32>>`, merge and sort per hour-of-day shard | run-659d7a9038a2 | 132.2 | 100.1 | 170 | 15.54 | 59.57 |
 | 2 | Rewrite: shared lock-free endpoint dictionary, 6-byte records per (chunk, hour), per-hour counting sort, `pread` input | run-ac6fd7774fa8 (9360f49) | 33.9 | 195.3 | 454 | 23.17 | 68.25 |
-| 3 | Step 2 plus `MADV_NOHUGEPAGE` on the arena, hour-major arena layout, `MADV_DONTNEED` of each hour's records once summarised | (pending) | | | | | |
+| 3 | Step 2 plus `MADV_NOHUGEPAGE` on the arena, hour-major arena layout, `MADV_DONTNEED` of each hour's records once summarised | run-a243658265aa (9c5ca97) | 26.4 | 30.3 | 461 | 38.05 | 79.02 |
 
 Leader when step 2 was prepared (`tools/board_watch.py`): Cause Of Death, Rust, T 16.9 ms, M 18.6 MB, S 353, K 54.5.
 At M 19.5 MB and S 353, K = 56 needs T <= 15.7 ms.
@@ -51,7 +51,23 @@ The 24 ms teardown of the mapped input is what made `pread` win (E2d): it also r
   lowered the local `memory.peak` from 37 MB to 27 MB: the 10 MB output file's page cache counts, and now grows into
   the memory the records give back. Time was unchanged within noise (best of 40: 83.5 vs 82.3 ms).
 
-## Rejected or not yet measured
+- Step 3 also ran faster than step 2 (26.4 vs 33.9 ms): with huge pages off the kernel no longer zeroes a 2 MiB page
+  for every touched region.
+
+## Rejected or inconclusive (local, 8 threads, interleaved hyperfine)
+
+- **Input mmap'd, `MADV_POPULATE_READ` per worker chunk (E2c):** 161 vs 128 ms for `pread` in the same session (1.26x
+  slower); plain mmap was 1.19x slower earlier. The 239 MB mapping costs ~24 ms to tear down in this VM. Not tried on
+  the board, so on the real box the ranking is an assumption.
+- **Chunk size 1 / 2 MiB instead of 4 MiB:** three paired sessions disagreed with each other (best-of-30 81-83 ms for
+  all three in the quiet ones); no signal above the noise. With 12 workers 57 chunks quantise badly (4.75 per worker),
+  so 2 MiB may still help on the board; not pushed.
+- **Ablation of the parse (`pread` build, phase-1 wall):** replacing the dictionary probe with a bare hash saved ~4 ms
+  of ~38, dropping the hash too saved ~2 ms more, and a build that only reads (no scan at all) still took 38-42 ms.
+  Locally phase 1 is bound by the `pread` copy, so the dictionary is not where the time goes. (The runs drifted by up
+  to 20% between sessions.)
+
+## Not yet measured
 
 - Parallel `pread`/`pwrite` of the output: not tried, buffered writes take the inode lock on ext4 and tmpfs.
 - `MAP_POPULATE` / `MADV_POPULATE_READ` on the input (E2 b, c): moot, the input is no longer mapped.
