@@ -16,7 +16,8 @@ They are only used to compare variants, never reported as results.
 | 4b | (unchanged code, re-run with a Track D push) | ac9a033 | 0.469 | 222 | 56.436 (K 13.45, 496 lines) |
 | 5 | AVX2 block tokeniser, right-sized hash tables, batched probe with the key in the slot, bitset-native BOOL evaluation, pairs tracked only where a phrase needs them | 175c722 | 0.342 | 171 | 59.748 (K 15.67, 731 lines) |
 | 6 | Per-chunk indexing and evaluation: no global postings at all | a21a357 | 0.329 | 62 | 64.605 (K 19.59, 716 lines) |
-| 7 | Allocation-free per-chunk evaluation with early exits; smaller per-query and sampling state | pending | | | |
+| 7 | Allocation-free per-chunk evaluation with early exits; smaller per-query and sampling state | 55179ca | 0.306 | 59 | 65.464 (K 20.38, 743 lines) |
+| 8 | Batched, prefetched table lookups; bucketised SIMD probe; inline query storage; batched term numbering | pending | | | |
 
 ## Local measurements behind step 2 (in-process ms, median)
 
@@ -130,3 +131,28 @@ about 190 ns per (query, chunk), most of them trivially empty.
 | 96 chunks instead of 48 | 245 -> 264; `memory.peak` 58 -> 47 MB | reverted: on the score an even trade, at 8% more time |
 | 6 threads instead of 12 (the scan alone did not gain from hyper-threading) | 237 -> 329; `memory.peak` 55 -> 40 MB | reverted: the whole program does gain from the second hardware thread |
 | Sampling counts freed once document frequencies are summed; the ten smallest ids per query in a fixed array | `memory.peak` 58 -> 55 MB | kept |
+
+## Step 8: memory-level parallelism in the lookups (local, in-process ms, median of 9-11)
+
+Research for this step: the vectorised and batched hash table literature (Polychroniou, Raman and Ross, "Rethinking
+SIMD Vectorization for In-Memory Databases", SIGMOD 2015; Shahrokhi and Shaikhha, "An Efficient Vectorized Hash Table
+for Batch Computations", ECOOP 2023; Boether et al., "Analyzing Vectorized Hash Tables Across CPU Architectures",
+VLDB 2023; the AMAC and group-prefetching work on hash joins). The common lesson: when the table is larger than the
+cache, the win is software prefetching across a batch of independent lookups so their misses overlap, and comparing
+a whole bucket with one SIMD instruction instead of a probe loop. Our scan table is 4 MB, above the 2 MB L2, and the
+profile showed about half the tokens missing L2 on the probe, each miss exposed by the probe loop's branch.
+
+A fresh ablation of the scan (wall ms): tokenising 19, + key and slot index ~38, + probe ~77, + bookkeeping and the
+chunk index ~130, + per-chunk evaluation ~170.
+
+| Change | Before -> after | Verdict |
+|---|---|---|
+| Tokens handed over 48 at a time (not one 64-byte block's worth); the home slot of every token in the batch prefetched before any is compared | 248 -> 222 | kept |
+| Batch of 24 / 48 / 96 | 224 / 213 / 216 | 48 |
+| Dense-bit setting without a branch (junk word for other tokens) | 216 -> 222 | reverted |
+| Query terms, operators and pairs stored inline (at most 8) so the per-chunk pass over queries reads memory in order; query keys read from the whole file (fast load path) | 223 -> 217; memory 56 -> 53 MB | kept |
+| Bucketised probe: one 64-byte bucket holds four terms' two key words (exact for every term up to 16 bytes, the longest generated token has 17), compared with one AVX2 instruction; a full bucket spills to the next, marked in an 8 KB bitset; key words computed without a branch on the length | 216 -> 213 (min 202 -> 193) | kept: also drops the tail-hash verification |
+| Per-chunk query order rotated (less false sharing on the accumulators) and a per-query cutoff to skip the lock | 209 -> 211 | reverted |
+| Query terms numbered in batches of 16 with their table slots prefetched (interning was 12-15 of the 22 ms parse) | 211 -> 203; parse 22 -> 15 ms | kept |
+
+Verified on full seeds 1 and 2, sample seeds 1-3, tiny seeds 1-6 and the worked example.
