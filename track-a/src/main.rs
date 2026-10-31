@@ -22,7 +22,7 @@ extern "C" {
 }
 
 const CHUNK: usize = 1 << 20;
-const BLOCK: usize = 64 << 10; // bytes read at a time; small enough to stay in the core's cache while it is parsed
+const BLOCK: usize = 32 << 10; // bytes read at a time; small enough to stay in the core's cache while it is parsed
 const HOURS: usize = 72;
 const LAG: usize = 2; // hours a line may trail the first line of its chunk without breaking the guess
 const DONE: u32 = 1 << 8; // in a chunk's state; below it is 1 + the hour of the chunk's first line, or 0 before it starts
@@ -235,6 +235,8 @@ struct Job {
     bad: AtomicBool,
     /// Endpoints that occur in an hour summarised so far, and the same ones in the byte order of their names.
     seen: Mutex<(Vec<bool>, Vec<u16>)>,
+    /// Buffers for `summarise` that are not in use; only a few hours are summarised at a time.
+    spare: Mutex<Vec<Scratch>>,
     /// The summary file, the next hour to write to it, and the lines of the hours that wait for earlier ones.
     out: Mutex<(File, usize, Vec<Option<Vec<u8>>>)>,
 }
@@ -261,6 +263,7 @@ impl Job {
             next_hour: AtomicUsize::new(0),
             bad: AtomicBool::new(false),
             seen: Mutex::new((vec![false; SLOTS], Vec::new())),
+            spare: Mutex::new(Vec::new()),
             out: Mutex::new((summary, 0, vec![None; HOURS])),
         }
     }
@@ -411,14 +414,19 @@ impl Job {
 
     fn work(&self) {
         let mut buf = vec![0u8; BLOCK + SLACK];
-        let mut scratch = Scratch { counts: vec![0; SLOTS], starts: vec![0; SLOTS], ..Default::default() };
         while self.next_hour.load(SeqCst) < HOURS {
             let c = self.next_chunk.fetch_add(1, Relaxed);
             if c < self.chunks {
                 self.parse_chunk(c, &mut buf);
             }
             while let Some(h) = self.claim_hour() {
+                let mut scratch = self.spare.lock().unwrap().pop().unwrap_or_else(|| Scratch {
+                    counts: vec![0; SLOTS],
+                    starts: vec![0; SLOTS],
+                    ..Default::default()
+                });
                 let lines = self.summarise(h, &mut scratch);
+                self.spare.lock().unwrap().push(scratch);
                 self.publish(h, lines);
             }
             if c >= self.chunks {
