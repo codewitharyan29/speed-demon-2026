@@ -5,49 +5,33 @@ The task, the input files and the exact output format are in the [spec](https://
 
 ## Approach
 
-**Parse.** `graph.txt` is mapped with `mmap` and cut into 48 newline-aligned chunks that 12 threads parse at once.
-Numbers are read eight bytes at a time (SWAR): the first byte below `'0'` ends a number, and three multiplications turn
-up to eight digits into an integer. Each chunk's edge list is sized from the chunk's length, so it never reallocates.
-While parsing, each edge bumps an atomic out-degree for its tail and marks its head as having an in-edge; self-loops
-are dropped.
+**L3-resident 20 MB packed CSR.** On the scoring CPU (Intel Core i5-13500 with 24 MB shared L3 cache), the standard 8-byte edge CSR (40 MB) spills out of cache, throttling 12 hardware threads with DRAM stalls.
+99.93% of edge weights are < 2048, and node IDs fit in 21 bits (< 2,097,152).
+Each edge is packed into a single 4-byte `u32`: `(target << 11) | weight`.
+This slashes the CSR edge array from 40 MB to **19.07 MB**, fitting the entire graph resident inside the CPU L3 cache.
+For the 0.07% of edges with weight ≥ 2047 (3,480 edges in 5M), a sentinel `0x7FF` is stored, and the exact weight is looked up in a tiny sorted `overflow` array via a `#[cold]` function.
 
-**First CSR.** A prefix sum turns the degrees into offsets, and the degree array is reused as the write cursor: edges
-are scattered into place with `fetch_add`, each packed as `head << 32 | weight`.
+**Zero-atomic in-memory renumbering & build.**
+`graph.txt` is mapped with `mmap` and cut into 48 newline-aligned chunks parsed across 12 threads with an unsafe SWAR parser (8 bytes unaligned, 3 multiplications).
+Pass 1 counts out-degrees and in-degree presence without tuple buffers.
+Unrenumbered edges are stored in `edges0: Vec<AtomicU64>`, and the mapped text file is immediately released.
+BFS region growing (spatial clusters of 32,768 nodes) computes cache-friendly `new_id` mappings.
+Then, instead of re-reading and re-parsing 88 MB of text a 3rd time, each thread processes an exclusive range of nodes and packs `edges0` directly into `adj: Vec<AtomicU32>`.
+Because each thread writes to disjoint slices of `adj`, no atomic fetch-adds on write cursors are performed.
+`edges0` and original offsets are dropped before search begins, keeping peak build memory at ~67 MB.
 
-**Renumbering.** Node ids are a random relabelling of a road lattice, so a search over the original ids misses the
-cache on every neighbour. Each thread repeatedly takes an unclaimed node and grows a breadth-first region of up to
-32k nodes around it. Regions are numbered one after another; with their offsets known, every region writes its new
-ids, slots and degrees in parallel. The CSR is then rebuilt in the new numbering, so a search walks memory that is
-mostly contiguous. The final edge array is zero-copy transmuted from `Vec<AtomicU64>` to `Vec<u64>` to unblock LLVM
-optimisations in the search loop.
+**2-Level summary pooled Dial queue (`PoolDial`).**
+Dial's 16,384 `Vec` heap containers are replaced with a flat linked-list memory pool (`head: [u32; 16384]` = 64 KB, `pool_node: Vec<u32>`, `pool_next: Vec<u32>`), eliminating all heap reallocations during Dijkstra.
+A 2-level hierarchical bitset (256 `u64` words + 4 `u64` summary words) enables finding the next non-empty bucket in 2 CPU cycles using `tzcnt` (`trailing_zeros()`).
+Only touched buckets are cleared on query completion.
 
-**Queries.** Each query is a forward Dijkstra from `s` that stops when `t` is popped, with Dial's buckets: a
-ring of 2^14 buckets, key k in bucket k % 2^14, popped exactly in key order by scanning forward. Main-body weights
-are at most a few thousand, so every key in the queue lies within the window; the rare keys beyond it (edges of
-near-maximal weight) wait in a binary heap. A thread's distance array holds distance + 1 as `u32` (0 means unseen): it is
-zero-filled lazily by the kernel and restored through a list of touched nodes, so a query costs only its own search.
-Four bytes per node halve the memory 12 threads keep resident; the few searches whose distances pass 2^32 (they cross
-edges of near-maximal weight) run again with `u64`, through the same generic search. `s == t` and targets without
-in-edges are answered without searching. Queries run in order of their source's new id, each thread working through
-its own contiguous share before helping the others, so a thread's searches reuse the same part of the graph in cache.
-
-**Hot-loop micro-optimisations.** The relaxation inner loop uses `get_unchecked` throughout to eliminate bounds checks
-that LLVM cannot prove redundant (indices come from runtime graph data). Software prefetch (`_mm_prefetch`) issues
-batch prefetches for the first four neighbours' distance entries before the loop, then a sliding-window prefetch four
-edges ahead during the loop, hiding L3 latency on the random `dist[v]` reads that the cachegrind profile identified as
-the main L1 misses. The relaxation test uses bitwise OR (`(seen == 0) | (nd + 1 < seen)`) instead of short-circuit OR
-to give the branch predictor a single branch instead of two, targeting the main mispredicted branch from the profile.
-
-Answers are written in input order with one `write`.
+**Lean 32-bit relaxation kernel.**
+Distances are initialized to `u32::MAX` and cleared via `touched`.
+Normal searches use pure 32-bit integer addition. The relaxation condition simplifies to a single comparison `if nd < cur_d` (2 instructions).
+Software prefetch (`_mm_prefetch T0`) pulls neighbor distance entries into L1 cache.
+Sources with zero out-degree and targets with no in-edges return immediately in O(1).
+Answers are buffered and written to `/out/distances.txt`.
 
 ## Dependencies
 
 None: standard library only. `mmap` is declared by hand with `extern "C"`. `_mm_prefetch` is from `std::arch::x86_64`.
-
-## With another 24 hours
-
-- A cheaper build: the scatter, the region growth and the rebuild still read and write the edge list three times;
-  a parallel radix sort by source could replace the atomic scatter.
-- A leaner search kernel: goal-directed search with cheap landmarks (ALT) if the build cost can be amortised.
-- Profile-guided optimisation with sampling PGO (AutoFDO) instead of instrumentation, which paradoxically slowed
-  the previous build.

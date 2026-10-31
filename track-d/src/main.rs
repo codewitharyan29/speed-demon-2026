@@ -1,25 +1,32 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
-use std::fs::File;
-use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
 
-extern "C" {
-    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
-}
-
 const THREADS: usize = 12;
 const CHUNKS: usize = 48;
 const REGION: usize = 1 << 15;
-const WINDOW: u64 = 1 << 14;
+const WINDOW: usize = 1 << 14;
 
+#[cfg(unix)]
 fn map(path: &str) -> &'static [u8] {
-    let f = File::open(path).expect("open input");
+    use std::os::unix::io::AsRawFd;
+    extern "C" {
+        fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+    }
+    let f = std::fs::File::open(path).expect("open input");
     let len = f.metadata().unwrap().len() as usize;
-    unsafe { std::slice::from_raw_parts(mmap(std::ptr::null_mut(), len, 1, 2, f.as_raw_fd(), 0), len) }
+    unsafe {
+        std::slice::from_raw_parts(mmap(std::ptr::null_mut(), len, 1, 2, f.as_raw_fd(), 0), len)
+    }
+}
+
+#[cfg(not(unix))]
+fn map(path: &str) -> &'static [u8] {
+    let bytes = std::fs::read(path).expect("read file");
+    Box::leak(bytes.into_boxed_slice())
 }
 
 #[inline(always)]
@@ -28,77 +35,42 @@ unsafe fn prefetch<T>(p: *const T) {
     _mm_prefetch(p as *const i8, _MM_HINT_T0);
 }
 
-struct Dial {
-    ring: Vec<Vec<u32>>,
-    at: u64,
-    len: usize,
-    far: BinaryHeap<Reverse<(u64, u32)>>,
-    far_min: u64,
-}
-
-impl Dial {
-    fn new() -> Self {
-        Dial { ring: vec![Vec::new(); WINDOW as usize], at: 0, len: 0, far: BinaryHeap::new(), far_min: u64::MAX }
-    }
-    #[inline(always)]
-    fn push(&mut self, key: u64, node: u32) {
-        if key < self.at + WINDOW {
-            unsafe { self.ring.get_unchecked_mut((key % WINDOW) as usize) }.push(node);
-            self.len += 1;
-        } else {
-            self.far.push(Reverse((key, node)));
-            self.far_min = self.far_min.min(key);
-        }
-    }
-    #[inline(always)]
-    fn pop(&mut self) -> Option<(u64, u32)> {
-        loop {
-            if let Some(node) = unsafe { self.ring.get_unchecked_mut((self.at % WINDOW) as usize) }.pop() {
-                self.len -= 1;
-                return Some((self.at, node));
-            }
-            if self.far_min == self.at {
-                let popped = self.far.pop().map(|r| r.0);
-                self.far_min = self.far.peek().map_or(u64::MAX, |r| r.0 .0);
-                return popped;
-            }
-            self.at = if self.len > 0 { self.at + 1 } else { Some(self.far_min).filter(|&k| k < u64::MAX)? };
-        }
-    }
-    fn clear(&mut self) {
-        if self.len > 0 { self.ring.iter_mut().for_each(Vec::clear); }
-        (self.at, self.len, self.far_min) = (0, 0, u64::MAX);
-        self.far.clear();
-    }
-}
-
-#[inline(always)]
-fn fast_num(b: &[u8], p: &mut usize) -> u64 {
-    let raw = b.get(*p..*p + 8).map(|w| u64::from_le_bytes(w.try_into().unwrap()));
-    let len = raw.map_or(8, |r| (r.wrapping_sub(0x3030303030303030) & 0x8080808080808080).trailing_zeros() / 8);
-    let Some(raw) = raw.filter(|_| len < 8) else {
-        let x = num(b, p);
-        *p += 1;
-        return x;
-    };
-    let x = raw << (8 * (8 - len));
-    let x = ((x & 0x0F0F0F0F0F0F0F0F).wrapping_mul(2561) >> 8) & 0x00FF00FF00FF00FF;
-    let x = (x.wrapping_mul(6553601) >> 16) & 0x0000FFFF0000FFFF;
-    *p += len as usize + 1;
-    x.wrapping_mul(42949672960001) >> 32
-}
-
 fn num(b: &[u8], p: &mut usize) -> u64 {
-    while b[*p] < b'0' { *p += 1; }
+    while *p < b.len() && unsafe { *b.get_unchecked(*p) } < b'0' {
+        *p += 1;
+    }
     let mut x = 0u64;
-    while *p < b.len() && b[*p] >= b'0' {
-        x = x * 10 + (b[*p] - b'0') as u64;
+    while *p < b.len() && unsafe { *b.get_unchecked(*p) } >= b'0' {
+        x = x * 10 + (unsafe { *b.get_unchecked(*p) } - b'0') as u64;
         *p += 1;
     }
     x
 }
 
-fn par<S, R: Send>(jobs: usize, init: impl Fn() -> S + Sync, f: impl Fn(&mut S, usize) -> R + Sync) -> Vec<R> {
+#[inline(always)]
+unsafe fn parse_fast_u32(b: &[u8], p: &mut usize) -> u32 {
+    if *p + 8 <= b.len() {
+        let raw = (b.as_ptr().add(*p) as *const u64).read_unaligned();
+        let len = ((raw.wrapping_sub(0x3030303030303030) & 0x8080808080808080).trailing_zeros() / 8)
+            as usize;
+        if len < 8 {
+            let x = raw << (8 * (8 - len));
+            let x = ((x & 0x0F0F0F0F0F0F0F0F).wrapping_mul(2561) >> 8) & 0x00FF00FF00FF00FF;
+            let x = (x.wrapping_mul(6553601) >> 16) & 0x0000FFFF0000FFFF;
+            *p += len + 1;
+            return (x.wrapping_mul(42949672960001) >> 32) as u32;
+        }
+    }
+    let x = num(b, p) as u32;
+    *p += 1;
+    x
+}
+
+fn par<S, R: Send>(
+    jobs: usize,
+    init: impl Fn() -> S + Sync,
+    f: impl Fn(&mut S, usize) -> R + Sync,
+) -> Vec<R> {
     let share = |t: usize| t * jobs / THREADS;
     let next: Vec<AtomicUsize> = (0..THREADS).map(|t| AtomicUsize::new(share(t))).collect();
     let mut all: Vec<(usize, R)> = std::thread::scope(|sc| {
@@ -110,7 +82,9 @@ fn par<S, R: Send>(jobs: usize, init: impl Fn() -> S + Sync, f: impl Fn(&mut S, 
                     for t in (me..THREADS).chain(0..me) {
                         loop {
                             let j = next[t].fetch_add(1, Relaxed);
-                            if j >= share(t + 1) { break; }
+                            if j >= share(t + 1) {
+                                break;
+                            }
                             got.push((j, f(&mut state, j)));
                         }
                     }
@@ -118,17 +92,343 @@ fn par<S, R: Send>(jobs: usize, init: impl Fn() -> S + Sync, f: impl Fn(&mut S, 
                 })
             })
             .collect();
-        workers.into_iter().flat_map(|w| w.join().unwrap()).collect()
+        workers
+            .into_iter()
+            .flat_map(|w| w.join().unwrap())
+            .collect()
     });
     all.sort_unstable_by_key(|r| r.0);
     all.into_iter().map(|r| r.1).collect()
 }
 
-/// Zero-copy transmute of Vec<AtomicU64> to Vec<u64>. Safe because AtomicU64 has the same size/alignment as u64 and
-/// the caller guarantees exclusive ownership (all threads have joined).
-unsafe fn vec_from_atomic(v: Vec<AtomicU64>) -> Vec<u64> {
-    let mut v = std::mem::ManuallyDrop::new(v);
-    Vec::from_raw_parts(v.as_mut_ptr() as *mut u64, v.len(), v.capacity())
+struct PoolDial {
+    head: [u32; WINDOW],
+    bitmap: [u64; WINDOW / 64],
+    summary: [u64; 4],
+    pool_node: Vec<u32>,
+    pool_next: Vec<u32>,
+    free_head: u32,
+    at: u32,
+    len: usize,
+    far: BinaryHeap<Reverse<(u32, u32)>>,
+    far_min: u32,
+    touched_buckets: Vec<u16>,
+}
+
+impl PoolDial {
+    fn new() -> Self {
+        PoolDial {
+            head: [u32::MAX; WINDOW],
+            bitmap: [0u64; WINDOW / 64],
+            summary: [0u64; 4],
+            pool_node: Vec::with_capacity(16384),
+            pool_next: Vec::with_capacity(16384),
+            free_head: u32::MAX,
+            at: 0,
+            len: 0,
+            far: BinaryHeap::new(),
+            far_min: u32::MAX,
+            touched_buckets: Vec::with_capacity(2048),
+        }
+    }
+
+    #[inline(always)]
+    fn alloc_slot(&mut self, node: u32, next: u32) -> u32 {
+        if self.free_head != u32::MAX {
+            let slot = self.free_head as usize;
+            unsafe {
+                self.free_head = *self.pool_next.get_unchecked(slot);
+                *self.pool_node.get_unchecked_mut(slot) = node;
+                *self.pool_next.get_unchecked_mut(slot) = next;
+            }
+            slot as u32
+        } else {
+            let slot = self.pool_node.len() as u32;
+            self.pool_node.push(node);
+            self.pool_next.push(next);
+            slot
+        }
+    }
+
+    #[inline(always)]
+    fn push(&mut self, key: u32, node: u32) {
+        if key < self.at + WINDOW as u32 {
+            let b = (key as usize) & (WINDOW - 1);
+            let old_h = unsafe { *self.head.get_unchecked(b) };
+            if old_h == u32::MAX {
+                let w = b >> 6;
+                unsafe {
+                    *self.bitmap.get_unchecked_mut(w) |= 1 << (b & 63);
+                    *self.summary.get_unchecked_mut(w >> 6) |= 1 << (w & 63);
+                }
+                self.touched_buckets.push(b as u16);
+            }
+            let new_h = self.alloc_slot(node, old_h);
+            unsafe {
+                *self.head.get_unchecked_mut(b) = new_h;
+            }
+            self.len += 1;
+        } else {
+            self.far.push(Reverse((key, node)));
+            self.far_min = self.far_min.min(key);
+        }
+    }
+
+    #[inline(always)]
+    fn pop(&mut self) -> Option<(u32, u32)> {
+        loop {
+            let b = (self.at as usize) & (WINDOW - 1);
+            let h = unsafe { *self.head.get_unchecked(b) };
+            if h != u32::MAX {
+                self.len -= 1;
+                let (node, nxt) = unsafe {
+                    (
+                        *self.pool_node.get_unchecked(h as usize),
+                        *self.pool_next.get_unchecked(h as usize),
+                    )
+                };
+                unsafe {
+                    *self.head.get_unchecked_mut(b) = nxt;
+                    *self.pool_next.get_unchecked_mut(h as usize) = self.free_head;
+                }
+                self.free_head = h;
+                if nxt == u32::MAX {
+                    let w = b >> 6;
+                    unsafe {
+                        let bit = *self.bitmap.get_unchecked(w) & !(1 << (b & 63));
+                        *self.bitmap.get_unchecked_mut(w) = bit;
+                        if bit == 0 {
+                            *self.summary.get_unchecked_mut(w >> 6) &= !(1 << (w & 63));
+                        }
+                    }
+                }
+                return Some((self.at, node));
+            }
+
+            if self.far_min == self.at {
+                let popped = self.far.pop().map(|r| r.0);
+                self.far_min = self.far.peek().map_or(u32::MAX, |r| r.0 .0);
+                return popped;
+            }
+
+            if self.len == 0 {
+                return if self.far_min < u32::MAX {
+                    self.at = self.far_min;
+                    let popped = self.far.pop().map(|r| r.0);
+                    self.far_min = self.far.peek().map_or(u32::MAX, |r| r.0 .0);
+                    popped
+                } else {
+                    None
+                };
+            }
+
+            let start_b = (self.at as usize) & (WINDOW - 1);
+            let word_idx = start_b >> 6;
+            let cur_word = unsafe { *self.bitmap.get_unchecked(word_idx) } >> (start_b & 63);
+            if cur_word != 0 {
+                self.at += cur_word.trailing_zeros();
+                continue;
+            }
+
+            let sum_idx = word_idx >> 6;
+            let sum_bit = ((word_idx + 1) & 63) as u32;
+            let cur_sum = (unsafe { *self.summary.get_unchecked(sum_idx) } >> sum_bit) << sum_bit;
+
+            let next_word = if cur_sum != 0 {
+                (sum_idx << 6) | (cur_sum.trailing_zeros() as usize)
+            } else {
+                let mut found = None;
+                for step in 1..4 {
+                    let s_idx = (sum_idx + step) & 3;
+                    let s_val = unsafe { *self.summary.get_unchecked(s_idx) };
+                    if s_val != 0 {
+                        found = Some((s_idx << 6) | (s_val.trailing_zeros() as usize));
+                        break;
+                    }
+                }
+                match found {
+                    Some(w) => w,
+                    None => {
+                        if self.far_min < u32::MAX {
+                            self.at = self.far_min;
+                            let popped = self.far.pop().map(|r| r.0);
+                            self.far_min = self.far.peek().map_or(u32::MAX, |r| r.0 .0);
+                            return popped;
+                        }
+                        return None;
+                    }
+                }
+            };
+
+            let next_b = (next_word << 6)
+                | (unsafe { *self.bitmap.get_unchecked(next_word) }.trailing_zeros() as usize);
+            self.at += if next_b >= start_b {
+                next_b - start_b
+            } else {
+                WINDOW - start_b + next_b
+            } as u32;
+        }
+    }
+
+    #[inline(always)]
+    fn clear(&mut self) {
+        for &b in &self.touched_buckets {
+            let idx = b as usize;
+            unsafe {
+                *self.head.get_unchecked_mut(idx) = u32::MAX;
+                *self.bitmap.get_unchecked_mut(idx >> 6) = 0;
+                *self.summary.get_unchecked_mut(idx >> 12) = 0;
+            }
+        }
+        self.touched_buckets.clear();
+        (self.at, self.len, self.far_min, self.free_head) = (0, 0, u32::MAX, u32::MAX);
+        self.pool_node.clear();
+        self.pool_next.clear();
+        self.far.clear();
+    }
+}
+
+#[inline(never)]
+#[cold]
+fn lookup_overflow(overflow: &[(u32, u64)], edge_idx: u32) -> u64 {
+    overflow
+        .binary_search_by_key(&edge_idx, |&(idx, _)| idx)
+        .map_or(2047, |p| overflow[p].1)
+}
+
+fn search_fast(
+    start: &[u32],
+    adj: &[u32],
+    overflow: &[(u32, u64)],
+    s: u32,
+    t: u32,
+    dist: &mut [u32],
+    wide: &mut Vec<u64>,
+    touched: &mut Vec<u32>,
+    heap: &mut PoolDial,
+) -> i64 {
+    unsafe {
+        *dist.get_unchecked_mut(s as usize) = 0;
+    }
+    touched.push(s);
+    heap.push(0, s);
+    let mut ans = -1i64;
+    let mut needs_wide = false;
+
+    'search: while let Some((d, u)) = heap.pop() {
+        unsafe {
+            if d > *dist.get_unchecked(u as usize) {
+                continue;
+            }
+            if u == t {
+                ans = d as i64;
+                break;
+            }
+            let es = *start.get_unchecked(u as usize) as usize;
+            let ee = *start.get_unchecked(u as usize + 1) as usize;
+
+            for ei in es..ee {
+                let entry = *adj.get_unchecked(ei);
+                let v = (entry >> 11) as usize;
+                let mut w = (entry & 0x7FF) as u64;
+
+                if w == 0x7FF {
+                    w = lookup_overflow(overflow, ei as u32);
+                    if w > 1_000_000 {
+                        needs_wide = true;
+                        break 'search;
+                    }
+                }
+                if ei + 1 < ee {
+                    prefetch(
+                        dist.as_ptr()
+                            .add((*adj.get_unchecked(ei + 1) >> 11) as usize),
+                    );
+                }
+
+                let nd = d + w as u32;
+                let cur_d = *dist.get_unchecked(v);
+                if nd < cur_d {
+                    if cur_d == u32::MAX {
+                        touched.push(v as u32);
+                    }
+                    *dist.get_unchecked_mut(v) = nd;
+                    heap.push(nd, v as u32);
+                }
+            }
+        }
+    }
+
+    heap.clear();
+    for v in touched.drain(..) {
+        unsafe {
+            *dist.get_unchecked_mut(v as usize) = u32::MAX;
+        }
+    }
+    if needs_wide {
+        if wide.is_empty() {
+            *wide = vec![u64::MAX; dist.len()];
+        }
+        return search_wide(start, adj, overflow, s, t, wide, touched);
+    }
+    ans
+}
+
+fn search_wide(
+    start: &[u32],
+    adj: &[u32],
+    overflow: &[(u32, u64)],
+    s: u32,
+    t: u32,
+    dist: &mut [u64],
+    touched: &mut Vec<u32>,
+) -> i64 {
+    let mut heap = BinaryHeap::new();
+    unsafe {
+        *dist.get_unchecked_mut(s as usize) = 0;
+    }
+    touched.push(s);
+    heap.push(Reverse((0u64, s)));
+    let mut ans = -1i64;
+
+    while let Some(Reverse((d, u))) = heap.pop() {
+        unsafe {
+            if d > *dist.get_unchecked(u as usize) {
+                continue;
+            }
+            if u == t {
+                ans = d as i64;
+                break;
+            }
+            let es = *start.get_unchecked(u as usize) as usize;
+            let ee = *start.get_unchecked(u as usize + 1) as usize;
+
+            for ei in es..ee {
+                let entry = *adj.get_unchecked(ei);
+                let v = (entry >> 11) as usize;
+                let mut w = (entry & 0x7FF) as u64;
+                if w == 0x7FF {
+                    w = lookup_overflow(overflow, ei as u32);
+                }
+                let nd = d + w;
+                let cur_d = *dist.get_unchecked(v);
+                if nd < cur_d {
+                    if cur_d == u64::MAX {
+                        touched.push(v as u32);
+                    }
+                    *dist.get_unchecked_mut(v) = nd;
+                    heap.push(Reverse((nd, v as u32)));
+                }
+            }
+        }
+    }
+
+    for v in touched.drain(..) {
+        unsafe {
+            *dist.get_unchecked_mut(v as usize) = u64::MAX;
+        }
+    }
+    ans
 }
 
 fn main() {
@@ -140,112 +440,201 @@ fn main() {
     let cut = |i: usize| match i {
         0 => body,
         CHUNKS => len,
-        _ => { let at = body + (len - body) * i / CHUNKS - 1; at + g[at..].iter().position(|&c| c == b'\n').unwrap() + 1 }
+        _ => {
+            let at = body + (len - body) * i / CHUNKS - 1;
+            at + g[at..].iter().position(|&c| c == b'\n').unwrap() + 1
+        }
     };
+
     let degree: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
     let has_in: Vec<AtomicBool> = (0..n).map(|_| AtomicBool::new(false)).collect();
-    let parsed = par(CHUNKS, || (), |_, c| {
-        let chunk = &g[cut(c)..cut(c + 1)];
-        let (mut p, mut edges) = (0, Vec::with_capacity(chunk.len() / 16 + 16));
-        while p < chunk.len() {
-            let (u, v, w) = (fast_num(chunk, &mut p) as u32, fast_num(chunk, &mut p) as u32, fast_num(chunk, &mut p) as u32);
-            if u != v {
-                edges.push((u, v, w));
-                degree[u as usize].fetch_add(1, Relaxed);
-                has_in[v as usize].store(true, Relaxed);
-            }
-        }
-        edges
-    });
-    let mut start = vec![0u32; n + 1];
-    for i in 0..n { start[i + 1] = start[i] + degree[i].swap(start[i], Relaxed); }
-    let adj0: Vec<AtomicU64> = (0..start[n]).map(|_| AtomicU64::new(0)).collect();
-    par(CHUNKS, || (), |_, c| {
-        for &(u, v, w) in &parsed[c] {
-            adj0[degree[u as usize].fetch_add(1, Relaxed) as usize].store((v as u64) << 32 | w as u64, Relaxed);
-        }
-    });
-    drop((parsed, degree));
-
-    // Renumber nodes for cache locality via BFS regions.
-    let claimed: Vec<AtomicBool> = (0..n).map(|_| AtomicBool::new(false)).collect();
-    let scan = AtomicUsize::new(0);
-    let regions = par(THREADS, || (), |_, _| {
-        let mut regions = Vec::new();
-        loop {
-            let from = scan.fetch_add(1024, Relaxed);
-            if from >= n { return regions; }
-            for root in from..(from + 1024).min(n) {
-                if claimed[root].swap(true, Relaxed) { continue; }
-                let (mut region, mut head) = (vec![root as u32], 0);
-                while head < region.len() && region.len() < REGION {
-                    let u = region[head] as usize;
-                    head += 1;
-                    for e in &adj0[start[u] as usize..start[u + 1] as usize] {
-                        let v = (e.load(Relaxed) >> 32) as usize;
-                        if !claimed[v].load(Relaxed) && !claimed[v].swap(true, Relaxed) { region.push(v as u32); }
+    par(
+        CHUNKS,
+        || (),
+        |_, c| {
+            let chunk = &g[cut(c)..cut(c + 1)];
+            let mut p = 0;
+            while p < chunk.len() {
+                unsafe {
+                    let u = parse_fast_u32(chunk, &mut p);
+                    let v = parse_fast_u32(chunk, &mut p);
+                    let _w = parse_fast_u32(chunk, &mut p);
+                    if u != v {
+                        degree[u as usize].fetch_add(1, Relaxed);
+                        has_in[v as usize].store(true, Relaxed);
                     }
                 }
-                regions.push(region);
             }
-        }
-    });
+        },
+    );
+
+    let mut start0 = vec![0u32; n + 1];
+    for i in 0..n {
+        start0[i + 1] = start0[i] + degree[i].swap(start0[i], Relaxed);
+    }
+    let m = start0[n] as usize;
+
+    let edges0: Vec<AtomicU64> = (0..m).map(|_| AtomicU64::new(0)).collect();
+    par(
+        CHUNKS,
+        || (),
+        |_, c| {
+            let chunk = &g[cut(c)..cut(c + 1)];
+            let mut p = 0;
+            while p < chunk.len() {
+                unsafe {
+                    let u = parse_fast_u32(chunk, &mut p);
+                    let v = parse_fast_u32(chunk, &mut p);
+                    let w = parse_fast_u32(chunk, &mut p) as u64;
+                    if u != v {
+                        let slot = degree[u as usize].fetch_add(1, Relaxed) as usize;
+                        edges0[slot].store(((v as u64) << 32) | (w & 0xFFFF_FFFF), Relaxed);
+                    }
+                }
+            }
+        },
+    );
+
+    let claimed: Vec<AtomicBool> = (0..n).map(|_| AtomicBool::new(false)).collect();
+    let scan = AtomicUsize::new(0);
+    let regions = par(
+        THREADS,
+        || (),
+        |_, _| {
+            let mut regions = Vec::new();
+            loop {
+                let from = scan.fetch_add(1024, Relaxed);
+                if from >= n {
+                    return regions;
+                }
+                for root in from..(from + 1024).min(n) {
+                    if claimed[root].swap(true, Relaxed) {
+                        continue;
+                    }
+                    let (mut region, mut head) = (vec![root as u32], 0);
+                    while head < region.len() && region.len() < REGION {
+                        let u = region[head] as usize;
+                        head += 1;
+                        let s = start0[u] as usize;
+                        let e = start0[u + 1] as usize;
+                        for idx in s..e {
+                            let edge = edges0[idx].load(Relaxed);
+                            let v = (edge >> 32) as usize;
+                            if !claimed[v].load(Relaxed) && !claimed[v].swap(true, Relaxed) {
+                                region.push(v as u32);
+                            }
+                        }
+                    }
+                    regions.push(region);
+                }
+            }
+        },
+    );
+
     let regions: Vec<Vec<u32>> = regions.into_iter().flatten().collect();
     let mut offset = vec![0; regions.len() + 1];
-    for (r, region) in regions.iter().enumerate() { offset[r + 1] = offset[r] + region.len(); }
-    let atomics = || (0..n + 1).map(|_| AtomicU32::new(0)).collect::<Vec<_>>();
-    let (order, new_id, deg) = (atomics(), atomics(), atomics());
-    par(regions.len(), || (), |_, r| {
-        for (k, &u) in regions[r].iter().enumerate() {
-            let i = offset[r] + k;
-            order[i].store(u, Relaxed);
-            new_id[u as usize].store(i as u32, Relaxed);
-            deg[i + 1].store(start[u as usize + 1] - start[u as usize], Relaxed);
-        }
-    });
-    let plain = |a: Vec<AtomicU32>| a.into_iter().map(AtomicU32::into_inner).collect::<Vec<u32>>();
-    let (order, new_id, mut first) = (plain(order), plain(new_id), plain(deg));
-    for i in 0..n { first[i + 1] += first[i]; }
-    // Rebuild CSR in the new numbering.
-    let adj: Vec<AtomicU64> = (0..first[n]).map(|_| AtomicU64::new(0)).collect();
-    let block = n.div_ceil(CHUNKS);
-    par(CHUNKS, || (), |_, c| {
-        for i in c * block..((c + 1) * block).min(n) {
-            let u = order[i] as usize;
-            for (k, e) in adj0[start[u] as usize..start[u + 1] as usize].iter().enumerate() {
-                let x = e.load(Relaxed);
-                adj[first[i] as usize + k].store((new_id[(x >> 32) as usize] as u64) << 32 | x & 0xFFFF_FFFF, Relaxed);
+    for (r, region) in regions.iter().enumerate() {
+        offset[r + 1] = offset[r] + region.len();
+    }
+
+    let new_id: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
+    let new_deg: Vec<AtomicU32> = (0..n + 1).map(|_| AtomicU32::new(0)).collect();
+    par(
+        regions.len(),
+        || (),
+        |_, r| {
+            for (k, &u) in regions[r].iter().enumerate() {
+                let i = offset[r] + k;
+                new_id[u as usize].store(i as u32, Relaxed);
+                new_deg[i + 1].store(start0[u as usize + 1] - start0[u as usize], Relaxed);
             }
-        }
-    });
-    drop(adj0);
-    // Zero-copy convert to plain u64 slice; all threads have joined, no more atomic access needed.
-    let adj: Vec<u64> = unsafe { vec_from_atomic(adj) };
+        },
+    );
+    drop(regions);
+
+    let new_id = new_id
+        .into_iter()
+        .map(AtomicU32::into_inner)
+        .collect::<Vec<u32>>();
+    let mut first = new_deg
+        .into_iter()
+        .map(AtomicU32::into_inner)
+        .collect::<Vec<u32>>();
+    for i in 0..n {
+        first[i + 1] += first[i];
+    }
+
+    let adj: Vec<AtomicU32> = (0..m).map(|_| AtomicU32::new(0)).collect();
+    let overflows = par(
+        THREADS,
+        || Vec::new(),
+        |local_overflow, t| {
+            let u_start = t * n / THREADS;
+            let u_end = (t + 1) * n / THREADS;
+            for u in u_start..u_end {
+                let nu = unsafe { *new_id.get_unchecked(u) } as usize;
+                let es = unsafe { *start0.get_unchecked(u) } as usize;
+                let ee = unsafe { *start0.get_unchecked(u + 1) } as usize;
+                let mut out_idx = unsafe { *first.get_unchecked(nu) } as usize;
+
+                for edge_idx in es..ee {
+                    let edge = edges0[edge_idx].load(Relaxed);
+                    let v = (edge >> 32) as usize;
+                    let w = (edge & 0xFFFF_FFFF) as u64;
+                    let nv = unsafe { *new_id.get_unchecked(v) };
+
+                    if w < 2047 {
+                        adj[out_idx].store((nv << 11) | (w as u32), Relaxed);
+                    } else {
+                        adj[out_idx].store((nv << 11) | 0x7FF, Relaxed);
+                        local_overflow.push((out_idx as u32, w));
+                    }
+                    out_idx += 1;
+                }
+            }
+            std::mem::take(local_overflow)
+        },
+    );
+
+    drop(edges0);
+    drop(start0);
+    let mut overflow: Vec<(u32, u64)> = overflows.into_iter().flatten().collect();
+    overflow.sort_unstable_by_key(|&(idx, _)| idx);
+    let adj: Vec<u32> = adj.into_iter().map(AtomicU32::into_inner).collect();
 
     let q = map("/data/queries.txt");
     let mut p = 0;
     let queries: Vec<_> = (0..q.iter().filter(|&&c| c == b'\n').count())
         .map(|_| (num(q, &mut p) as usize, num(q, &mut p) as usize))
         .collect();
+
     let mut order: Vec<usize> = (0..queries.len()).collect();
     order.sort_unstable_by_key(|&i| new_id[queries[i].0]);
+
     let sorted = par(
         queries.len(),
-        || (vec![0u32; n], Vec::new(), Vec::new(), Dial::new()),
+        || (vec![u32::MAX; n], Vec::new(), Vec::new(), PoolDial::new()),
         |(dist, wide, touched, heap), j| {
             let (s, t) = queries[order[j]];
-            if s == t { return 0; }
-            if !has_in[t].load(Relaxed) { return -1; }
-            let (s, t) = (new_id[s], new_id[t]);
-            search(&first, &adj, s, t, dist, touched, heap).unwrap_or_else(|| {
-                if wide.is_empty() { *wide = vec![0u64; n]; }
-                search(&first, &adj, s, t, wide, touched, heap).unwrap()
-            })
+            if s == t {
+                return 0;
+            }
+            if !has_in[t].load(Relaxed) {
+                return -1;
+            }
+            let (s_new, t_new) = (new_id[s], new_id[t]);
+            if first[s_new as usize + 1] == first[s_new as usize] {
+                return -1;
+            }
+            search_fast(
+                &first, &adj, &overflow, s_new, t_new, dist, wide, touched, heap,
+            )
         },
     );
 
     let mut answers = vec![0i64; queries.len()];
     order.iter().zip(sorted).for_each(|(&i, a)| answers[i] = a);
+
     let mut out = Vec::with_capacity(answers.len() * 8);
     for a in answers {
         if a < 0 {
@@ -253,63 +642,16 @@ fn main() {
         } else {
             let mut buf = [b'\n'; 20];
             let (mut i, mut x) = (19, a as u64);
-            loop { i -= 1; buf[i] = b'0' + (x % 10) as u8; x /= 10; if x == 0 { break; } }
+            loop {
+                i -= 1;
+                buf[i] = b'0' + (x % 10) as u8;
+                x /= 10;
+                if x == 0 {
+                    break;
+                }
+            }
             out.extend_from_slice(&buf[i..]);
         }
     }
     std::fs::write("/out/distances.txt", out).expect("write output");
-}
-
-/// Dijkstra from s stopping when t is popped; -1 if unreachable, None if distance overflows D.
-/// dist holds distance+1 (0 = unseen), restored to zero via touched. Hot loop uses get_unchecked and software
-/// prefetch to eliminate bounds checks and hide memory latency on random dist[v] reads.
-#[inline(never)]
-fn search<D: Copy + Default + Into<u64> + TryFrom<u64>>(
-    start: &[u32],
-    adj: &[u64],
-    s: u32,
-    t: u32,
-    dist: &mut [D],
-    touched: &mut Vec<u32>,
-    heap: &mut Dial,
-) -> Option<i64> {
-    dist[s as usize] = D::try_from(1).ok()?;
-    touched.push(s);
-    heap.push(0, s);
-    let mut ans = Some(-1);
-    'search: while let Some((d, u)) = heap.pop() {
-        unsafe {
-            if d + 1 > (*dist.get_unchecked(u as usize)).into() { continue; }
-            if u == t { ans = Some(d as i64); break; }
-            let es = *start.get_unchecked(u as usize) as usize;
-            let ee = *start.get_unchecked(u as usize + 1) as usize;
-            // Batch-prefetch the first few neighbors' distance entries to hide L3 latency.
-            let pre = (ee - es).min(4);
-            for pi in 0..pre {
-                prefetch(dist.as_ptr().add((*adj.get_unchecked(es + pi) >> 32) as usize));
-            }
-            let mut ei = es;
-            while ei < ee {
-                let x = *adj.get_unchecked(ei);
-                let v = (x >> 32) as usize;
-                let nd = d + (x & 0xFFFF_FFFF);
-                // Prefetch the neighbor 4 edges ahead while processing this one.
-                if ei + pre < ee {
-                    prefetch(dist.as_ptr().add((*adj.get_unchecked(ei + pre) >> 32) as usize));
-                }
-                let seen: u64 = (*dist.get_unchecked(v)).into();
-                // Bitwise OR: both conditions evaluated, single branch to predict.
-                if (seen == 0) | (nd + 1 < seen) {
-                    let Ok(stored) = D::try_from(nd + 1) else { ans = None; break 'search; };
-                    if seen == 0 { touched.push(v as u32); }
-                    *dist.get_unchecked_mut(v) = stored;
-                    heap.push(nd, v as u32);
-                }
-                ei += 1;
-            }
-        }
-    }
-    heap.clear();
-    for v in touched.drain(..) { unsafe { *dist.get_unchecked_mut(v as usize) = D::default(); } }
-    ans
 }
