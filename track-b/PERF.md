@@ -18,7 +18,8 @@ They are only used to compare variants, never reported as results.
 | 6 | Per-chunk indexing and evaluation: no global postings at all | a21a357 | 0.329 | 62 | 64.605 (K 19.59, 716 lines) |
 | 7 | Allocation-free per-chunk evaluation with early exits; smaller per-query and sampling state | 55179ca | 0.306 | 59 | 65.464 (K 20.38, 743 lines) |
 | 8 | Batched, prefetched table lookups; bucketised SIMD probe; inline query storage; batched term numbering | fd3e211 | 0.260 | 57 | 67.089 (K 21.97, 815 lines) |
-| 9 | Popcount-based id sums for bitset results | pending | | | |
+| 9 | Popcount-based id sums for bitset results | cce528e | 0.250 | 58 | 67.417 (K 22.30, 827 lines) |
+| 10 | One cache line per scan lookup; one buffer for the scan's stamps and the posting starts; 64 chunks | pending | | | |
 
 ## Local measurements behind step 2 (in-process ms, median)
 
@@ -168,3 +169,26 @@ exits; BOOL evaluation takes ~620 CPU-ms against ~70 for phrases; 650 k evaluati
 | Early exit for a no-OR BOOL query when any ANDed term (not only the first) is absent from the chunk | 191 -> 194 | reverted: no effect |
 | Id sum of a bitset result by popcounts: the positions of a word's set bits sum to the sum over k of 2^k times the popcount of the bits whose position has bit k set, six popcounts per word instead of a step per set bit (a broad query has thousands of set bits per chunk) | 202 -> 189 | kept |
 | Pair key hashed once for both the bloom filter and the table | 200 -> 191 (noisy run, minimums equal) | kept: one multiply fewer |
+
+## Step 10: one cache line per lookup, and memory (local, in-process ms, median of 11)
+
+| Change | Before -> after | Verdict |
+|---|---|---|
+| Bucket of three terms with their metadata in the same 64-byte line (`k0[3]`, `k1[3]`, `meta[4]`; unaligned 32-byte loads, lane 3 masked off) instead of four terms plus a separate `meta` array: a lookup touches, and the batch prefetches, one line instead of two | 178 -> 172, again 186 -> 177; `memory.peak` 53 MB both | kept (-4 lines) |
+| The scan's per-key stamps (`last`) and the counting sort's `start` share one buffer, zeroed before each scan (stamps are `doc + 1`, so zero means "not seen") | 192 -> 190; `memory.peak` 53 -> 47 MB | kept |
+| `malloc_trim(0)` before the chunk pass (the sampling threads leave ~7 MB free in their arenas) | `memory.peak` 47 -> 47 MB | rejected: the chunk threads reuse those arenas anyway |
+| Dense threshold 1/16, 1/64, 1/128 instead of 1/32 | 1/16: +2 ms, 47 MB; 1/64: -2 ms on a quiet re-run, 50 MB; 1/128: +-0, 55 MB | 1/32 stays |
+| 64 chunks instead of 48 (the per-thread pair, posting and bitset buffers scale with the chunk) | 191 -> 196, 192 -> 193, 202 -> 205 (three runs); `memory.peak` 47 -> 41 MB | kept: about -0.1..-0.3 points of time for about +0.5 of memory |
+| Bloom filter of 2^17 or 2^18 bits (fits L1; the profile shows 12.9 M L1 misses on it) instead of 2^20 | 189 -> 191 / 191 | rejected |
+| The three cheap phrase-pair conditions joined with `&` (one branch; the profile shows 12.4 M mispredicts on them) | 189 -> 188 | rejected: no effect |
+
+Ablations of the per-chunk evaluation at 64 chunks (wrong output, timing only): all evaluation ~50 ms (206 -> 154),
+BOOL ~36, phrases ~10, the shared per-query accumulation (atomics and lock) only 3-6.
+
+Cachegrind on the full seed-1 data (build with `-C target-feature=-gfni`: valgrind 3.24 cannot decode the GFNI
+instruction LLVM now emits for the popcount sums): 9.6 G instructions, about 265 per token, 84 M mispredicts. Largest
+mispredict sources: the dense / list / neither branch of the bookkeeping (23 M), the phrase-pair conditions (12 M),
+the probe's hit-or-spilled test (10 M), list merges in BOOL evaluation (7 M). Largest L1 miss sources: the bloom
+filter (13 M), the scan stamps (10 M), the counting sort (16 M), the dense rows (6 M).
+
+Verified on full seeds 1 and 2, sample seeds 1-3, tiny seeds 1-6 and the worked example; `memory.peak` 41 MB local.
