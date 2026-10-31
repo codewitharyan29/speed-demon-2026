@@ -15,6 +15,7 @@ Noise is about +-10 ms, so A/B pairs are timed in one hyperfine session (`BIN=<o
 | 2 | Rewrite: shared lock-free endpoint dictionary, 6-byte records per (chunk, hour), per-hour counting sort, `pread` input | run-ac6fd7774fa8 (9360f49) | 33.9 | 195.3 | 454 | 23.17 | 68.25 |
 | 3 | Step 2 plus `MADV_NOHUGEPAGE` on the arena, hour-major arena layout, `MADV_DONTNEED` of each hour's records once summarised | run-a243658265aa (9c5ca97) | 26.4 | 30.3 | 461 | 38.05 | 79.02 |
 | 4 | Round 2: median-first selection, 4-byte records (second word for latencies of 2^20-1 or more), 64 KB read blocks | run-b4312cc919af (0e8d5bf) | 26.2 | 22.7 | 469 | 40.34 | 80.29 |
+| - | Rejected: step 4 as one `mmap` of the input (demand faults, parsed in place, no read buffers) | run-1d657eb26aa6 (f7be96c) | 29.8 | 22.4 | 457 | 38.06 | 79.02 |
 
 Leader when step 2 was prepared (`tools/board_watch.py`): Cause Of Death, Rust, T 16.9 ms, M 18.6 MB, S 353, K 54.5.
 At M 19.5 MB and S 353, K = 56 needs T <= 15.7 ms.
@@ -122,11 +123,18 @@ reduction is what the board run has to confirm.
 | 0e8d5bf, the full program (12 worker threads on the board) | run-b4312cc919af | 26.18 | 22.74 |
 | 767c3f5: exits right after the parse phase (startup + read + parse) | run-cb78e6db6cd8 | 18.39 | 16.74 |
 | aecba07: formats every hour but skips only the output write | run-b4ae7464cc65 | 25.07 | 22.63 |
+| d1110d4: reads every block with `pread`, no parse, then exits | run-a13d2d78189f | 8.42 | 10.00 |
 
-On the board the parse phase is 70% of T, phase 2 (counting sort, percentiles, formatting) about 26% (6.7 ms), and the write 4%
-(1.1 ms). The output file in the page cache is not what sets the peak (22.63 MB without the write, 22.74 with it). The local split
+On the board (12 worker threads) T = 26.2 ms splits as: startup + `pread` of the whole input + exit 8.4 ms (32%), parse 10.0 ms
+(38%), phase 2 (counting sort, percentiles, formatting) 6.7 ms (26%), output write 1.1 ms (4%). Parse + read together are 70%. The output file in the page cache is not what sets the peak (22.63 MB without the write, 22.74 with it). The local split
 is the same shape (parse-only 58.5 ms of 89), so the Docker VM is a fair guide to where the user CPU goes even though it
 overstates the kernel part.
+
+Step 4 (one read-only `mmap` of the input, demand faults, parsed in place, a zero-filled anonymous mapping behind the end of the file so
+the parser's look-ahead is safe) was 14% slower on the board (29.8 vs 26.2 ms) and saved almost no memory (22.4 vs 22.7 MB), as
+it was 35% slower in the VM: the page-table work for 239 MB (faults, then the unmap at exit) costs more than the copy it removes. Kept `pread`.
+The first board comparison was clear enough (+14% against +-6% noise) that a second run of the mmap build was not spent; the
+revert's run is a second `pread` data point.
 
 Where the parse's user CPU goes (parse-only build, `tools/ab.sh` 20 rounds, user ms, medians; each pair is from one session):
 
