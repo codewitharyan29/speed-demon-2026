@@ -291,7 +291,6 @@ fn record(c: &Ctx, b: &[u8], q: &Quotes, start: usize, sep: &[u32], batch: &mut 
     unsafe {
         // The entry is probably within four lines of the slot where its search starts.
         let slot = c.names.slot(hash) as *const Entry as *const i8;
-        (0..4).for_each(|k| _mm_prefetch::<_MM_HINT_T0>(slot.add(64 * k)));
         if let Some(r) = c.region.get(region as usize) {
             _mm_prefetch::<_MM_HINT_T0>(r as *const AtomicU16 as *const i8);
         }
@@ -306,8 +305,7 @@ fn resolve(c: &Ctx, batch: &mut Batch, aggs: &mut [Agg]) {
     for r in batch.recs.drain(..) {
         let country = c.dense[c.region.get(r.region).map_or(0, |x| x.load(Relaxed)) as usize] as usize;
         // SAFETY: the name has 32 readable bytes after it, as `record` ensured.
-        let name = unsafe { c.names.entry(r.name, r.len, r.hash) };
-        name.mask[country / 64].fetch_or(1 << (country % 64), Relaxed);
+        let name = &c.names.table[0]; // DIAGNOSTIC: no name lookups
         let a = &mut aggs[country];
         a.count += 1;
         a.id_sum += r.id;
@@ -424,7 +422,7 @@ fn run(regions: &[u8], file: &File, len: usize, bits: u32, chunk: usize) -> Opti
         let lo = if j == 0 { body } else { record_start(&ctx, j * chunk) };
         let hi = if j + 1 == chunks { len } else { record_start(&ctx, (j + 1) * chunk) };
         let mut aggs = vec![NONE; countries];
-        Some(aggs) // DIAGNOSTIC: no record parsing
+        (lo >= hi || parse_chunk(&ctx, lo, hi, &mut aggs)).then_some(aggs)
     });
     if names.full.load(Relaxed) || results.iter().any(|r| r.is_none()) {
         return None;
