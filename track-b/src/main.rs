@@ -28,14 +28,14 @@ fn map(path: &str) -> &'static [u8] {
 }
 
 /// Runs `f(state, job)` for every job in 0..jobs on THREADS threads that pull jobs from one shared counter,
-/// so uneven jobs balance themselves. `init` builds each thread's private state. Results come back in job order.
+/// so uneven jobs balance themselves. `init` builds each thread's private state. Results come in no set order.
 fn par<S, R: Send>(
     jobs: usize,
     init: impl Fn() -> S + Sync,
     f: impl Fn(&mut S, usize) -> R + Sync,
 ) -> Vec<R> {
     let next = AtomicUsize::new(0);
-    let mut all: Vec<(usize, R)> = std::thread::scope(|sc| {
+    std::thread::scope(|sc| {
         let workers: Vec<_> = (0..THREADS)
             .map(|_| {
                 sc.spawn(|| {
@@ -45,7 +45,7 @@ fn par<S, R: Send>(
                         if j >= jobs {
                             return got;
                         }
-                        got.push((j, f(&mut state, j)));
+                        got.push(f(&mut state, j));
                     }
                 })
             })
@@ -54,9 +54,7 @@ fn par<S, R: Send>(
             .into_iter()
             .flat_map(|w| w.join().unwrap())
             .collect()
-    });
-    all.sort_unstable_by_key(|r| r.0);
-    all.into_iter().map(|r| r.1).collect()
+    })
 }
 
 /// Eight bytes at `at` as a little-endian word; bytes past the end of `b` read as zero.
@@ -390,24 +388,7 @@ impl<T, const N: usize> std::ops::Deref for Few<T, N> {
 }
 
 /// Merges sorted `a` with sorted `b` under `op`: AND keeps ids in both, OR in either, NOT in `a` only.
-/// When one side is far shorter than the other and the result can only be as long as the short side, it is cheaper
-/// to look each short id up in the long list by binary search than to walk the long list.
 fn combine<T: Copy + Ord>(op: u8, a: &[T], b: &[T], out: &mut Vec<T>) {
-    let probe = |short: &[T], long: &[T], keep: bool, out: &mut Vec<T>| {
-        let mut from = 0;
-        for &x in short {
-            from += long[from..].partition_point(|&y| y < x);
-            if (from < long.len() && long[from] == x) == keep {
-                out.push(x);
-            }
-        }
-    };
-    if op != b'O' && a.len() * 16 < b.len() {
-        return probe(a, b, op == b'A', out);
-    }
-    if op == b'A' && b.len() * 16 < a.len() {
-        return probe(b, a, true, out);
-    }
     let (mut i, mut j) = (0, 0);
     while i < a.len() && j < b.len() {
         if a[i] < b[j] {
