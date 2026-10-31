@@ -188,6 +188,10 @@ What the board says about this program, in order of what each experiment taught:
   on the board as part of 8da2c58): the board keeps gaining from every SMT thread, so the limit is the total work, not contention.
   Locally 6 threads cost 8% more than 8 in the VM.
 - **More threads is slower too.** 1.5x the available threads (18 of 12): T 30.2 ms, K 37.56 (commit e4f8cdf). 12 threads on 12 hardware threads is the optimum.
+- **A from-scratch minimum-lines rewrite (S 304) is far slower.** Per-worker `HashMap`s merged into a sorted `BTreeMap`, two
+  barrier phases, no streaming and no fallback: T 43.2 ms, M 25.2 MB, S 304, K 32.84 (run-19997323681c, b19bc7a). In the VM
+  the stages are parse 35 ms, a serial merge of 8 ms, and phase 2 35 ms (id remapping, in-order writes); the hash map costs
+  +13% single-thread CPU. The lines it saved (x1.076 on K) are worth far less than the time and memory it lost.
 - **What does not help (local, single thread unless stated):** a plain `memcmp` for the key compare (+7% time), a batch of 16
   lookups with prefetched slots (+3.5%), `sort_unstable` for the percentiles, PGO with the pinned compiler (no change, as in
   Tracks B and D), 128 vs 64 KB blocks vs 32 KB (equal time, 32 KB lowers M by 0.4 MB), 512 KB or 256 KB chunks and a lag of
