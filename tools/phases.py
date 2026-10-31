@@ -15,6 +15,6 @@ for a in sys.argv[1:]:
 open(p, "w", newline="\n").write(s)
 subprocess.run(["docker", "build", "-q", "--network=none", "-t", f"sd-{TAG}", tmp], check=True, stdout=subprocess.DEVNULL)
 for _ in range(3):
-    subprocess.run(["docker", "run", "--rm", "--cpuset-cpus=0-11", "--mount", f"type=volume,src=sddata,dst=/data,volume-subpath={T},readonly",
+    subprocess.run(["docker", "run", "--rm", "--cpuset-cpus=" + os.environ.get("CPUS", "0-11"), "--mount", f"type=volume,src=sddata,dst=/data,volume-subpath={T},readonly",
                     "-v", os.path.join(root, ".out", f"new-{T}") + ":/out", f"sd-{TAG}"], env={**os.environ, "MSYS_NO_PATHCONV": "1"})
     print()
