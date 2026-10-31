@@ -21,6 +21,8 @@ Noise is about +-10 ms, so A/B pairs are timed in one hyperfine session (`BIN=<o
 | - | Compact dictionary (inserts under a lock), one state word per chunk, static non-PIE stripped binary | run-03f20e92eb73 (54e9b0f) | 26.46 | 19.49 | 488 | 41.13 | 80.71 |
 | - | Rejected: write the summary out and drop it from the page cache every MiB | run-4c1e6ffe7694 (2e26d0a) | 26.10 | 19.53 | 501 | 41.24 | 80.77 |
 | 6 | Shared pool of summary buffers, 32 KB read blocks | run-9f0f12713f79 (5bf1c87) | 26.16 | 18.66 | 491 | 41.70 | 81.00 |
+| - | Rejected: two thirds of the available threads (8 of 12), run as part of 8da2c58 | | 32.10 | | | 38.73 | |
+| 7 | Step 6 plus vector steps for long endpoints (final) | run-677620696279 (a6199d0) | 26.11 | 18.02 | 496 | 41.96 | 81.14 |
 
 Leader when step 2 was prepared (`tools/board_watch.py`): Cause Of Death, Rust, T 16.9 ms, M 18.6 MB, S 353, K 54.5.
 At M 19.5 MB and S 353, K = 56 needs T <= 15.7 ms.
