@@ -96,6 +96,24 @@ its lines are written). Latencies: 1.2% of the 3.1M are at or above 2^20 (36,447
 
 Ranking drawn from this: user-CPU first (percentile + formatting), then 4-byte records for M, then the serial and idle time.
 
+## Round 2, step 1: percentile selection and formatting (local, `tools/ab.sh`, 20 interleaved rounds, medians, tmpfs output)
+
+Output hash identical for every variant. Summed over threads the percentile step costs about 62 ms of CPU and the rest of the line
+loop (formatting, key copies, the output `Vec`'s page faults) about 65 ms. Group sizes in seed 1: 63% of the 127k groups have at
+most 8 records, 28% at most 32; 331 groups with more than 1024 records hold 29% of all records, 1,135 groups of 257-1024 another 17%.
+
+| Variant | user ms | wall ms | Verdict |
+|---|---|---|---|
+| base (9c5ca97) | 340 (mean 331) | 99.5 | |
+| `sort_unstable` of each group, then index the three ranks | 347 vs 326 for base (separate 20-round session) | 103 vs 97 | **rejected**, slower |
+| 2-digit lookup table, one `reserve` per line + raw pointer writes, key stored with its trailing space (+17 lines) | 300 (mean 304) | 97 | rejected: -8% user, but +17 lines and wall unchanged |
+| select the median first, then p95 inside the upper half, then p99 inside that (about 4.5n comparisons per large group instead of 7n) | 296 (mean 294) | 98 | **kept**, no extra lines |
+| both | 287 (mean 291) | 98.5 | formatting adds only 1-3% user on top of the selection change |
+
+Wall time did not move locally because the VM's wall time is bound by kernel work (pread, faults, writes), not by user CPU. The board
+box spends little time in the kernel (T 26 ms x 12 threads is about the 330 ms of user CPU measured here), so the user-CPU
+reduction is what the board run has to confirm.
+
 ## Rejected or inconclusive (local, 8 threads, interleaved hyperfine)
 
 - **Input mmap'd, `MADV_POPULATE_READ` per worker chunk (E2c):** 161 vs 128 ms for `pread` in the same session (1.26x
