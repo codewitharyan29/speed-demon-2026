@@ -6,7 +6,8 @@ root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 tmp = os.path.join(tempfile.gettempdir(), "sdprof"); shutil.rmtree(tmp, ignore_errors=True)
 shutil.copytree(os.path.join(root, f"track-{T}"), tmp, ignore=shutil.ignore_patterns("target"))
 p = os.path.join(tmp, "src", "main.rs"); s = open(p).read().replace("\r\n", "\n")
-s = s.replace("fn main() {\n", "fn main() {\n    let t0 = std::time::Instant::now();\n    let lap = |m: &str| eprintln!(\"{m:>8} {:?}\", t0.elapsed());\n", 1)
+RSS = 'let rss = std::fs::read_to_string("/proc/self/status").unwrap().lines().filter(|l| l.starts_with("VmRSS")).map(|l| l.split_whitespace().nth(1).unwrap().parse::<u64>().unwrap() / 1024).next().unwrap();'
+s = s.replace("fn main() {\n", "fn main() {\n    let t0 = std::time::Instant::now();\n    let lap = |m: &str| { " + RSS + " eprintln!(\"{m:>8} {:?} rss {rss} MB\", t0.elapsed()) };\n", 1)
 for a in sys.argv[1:]:
     anchor, label = a.rsplit("=", 1)
     s = s.replace(anchor, f'lap("{label}");\n    {anchor}', 1)

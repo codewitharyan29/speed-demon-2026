@@ -16,10 +16,7 @@ fn map(path: &str) -> &'static [u8] {
     let len = f.metadata().unwrap().len() as usize;
     // SAFETY: PROT_READ (1), MAP_PRIVATE (2) on a file we just opened; the length is the file's.
     unsafe {
-        std::slice::from_raw_parts(
-            mmap(std::ptr::null_mut(), len, 1, 2, f.as_raw_fd(), 0),
-            len,
-        )
+        std::slice::from_raw_parts(mmap(std::ptr::null_mut(), len, 1, 2, f.as_raw_fd(), 0), len)
     }
 }
 
@@ -147,23 +144,23 @@ fn main() {
     );
     let mut start = vec![0u32; n + 1];
     for i in 0..n {
-        start[i + 1] = start[i] + degree[i].load(Relaxed);
+        // The degree array turns into the write cursor: each tail's next free slot, starting at its first.
+        start[i + 1] = start[i] + degree[i].swap(start[i], Relaxed);
     }
     // Counting sort by tail. An edge is packed as head << 32 | weight; slots are claimed with fetch_add, so the
     // order of parallel edges is arbitrary, which Dijkstra does not care about.
-    let cursor: Vec<AtomicU32> = start[..n].iter().map(|&s| AtomicU32::new(s)).collect();
     let adj0: Vec<AtomicU64> = (0..start[n]).map(|_| AtomicU64::new(0)).collect();
     par(
         CHUNKS,
         || (),
         |_, c| {
             for &(u, v, w) in &parsed[c] {
-                adj0[cursor[u as usize].fetch_add(1, Relaxed) as usize]
+                adj0[degree[u as usize].fetch_add(1, Relaxed) as usize]
                     .store((v as u64) << 32 | w as u64, Relaxed);
             }
         },
     );
-    drop(parsed);
+    drop((parsed, degree));
 
     // Renumber nodes so that a search's neighbourhood is contiguous in memory. Ids are a random relabelling of a road
     // lattice, so every neighbour lookup would otherwise be a cache miss. Each thread repeatedly takes an unclaimed
