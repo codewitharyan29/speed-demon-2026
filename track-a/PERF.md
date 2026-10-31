@@ -182,6 +182,9 @@ What the board says about this program, in order of what each experiment taught:
 - **The page cache of the output counts, and cannot be dropped on the board.** On a real filesystem the peak falls from 17.4 to
   9.4 MB when the summary is written out and dropped every MiB (`sync_file_range` + `posix_fadvise(DONTNEED)`), but the
   board's M did not change (19.53 vs 19.49 MB), so `/out` there behaves like tmpfs. Reverted.
+- **Fewer threads is slower, a lot.** Two thirds of the available threads (8 of 12) gave T 32.1 ms, M not read (commit 4c2d9b2, run
+  on the board as part of 8da2c58): the board keeps gaining from every SMT thread, so the limit is the total work, not contention.
+  Locally 6 threads cost 8% more than 8 in the VM.
 - **What does not help (local, single thread unless stated):** a plain `memcmp` for the key compare (+7% time), a batch of 16
   lookups with prefetched slots (+3.5%), `sort_unstable` for the percentiles, PGO with the pinned compiler (no change, as in
   Tracks B and D), 128 vs 64 KB blocks vs 32 KB (equal time, 32 KB lowers M by 0.4 MB), 512 KB or 256 KB chunks and a lag of
