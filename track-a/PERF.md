@@ -16,6 +16,11 @@ Noise is about +-10 ms, so A/B pairs are timed in one hyperfine session (`BIN=<o
 | 3 | Step 2 plus `MADV_NOHUGEPAGE` on the arena, hour-major arena layout, `MADV_DONTNEED` of each hour's records once summarised | run-a243658265aa (9c5ca97) | 26.4 | 30.3 | 461 | 38.05 | 79.02 |
 | 4 | Round 2: median-first selection, 4-byte records (second word for latencies of 2^20-1 or more), 64 KB read blocks | run-b4312cc919af (0e8d5bf) | 26.2 | 22.7 | 469 | 40.34 | 80.29 |
 | - | Rejected: step 4 as one `mmap` of the input (demand faults, parsed in place, no read buffers) | run-1d657eb26aa6 (f7be96c) | 29.8 | 22.4 | 457 | 38.06 | 79.02 |
+| 5 | Round 3: speculative streaming (an hour is summarised and its records released as soon as the chunks to come should not hold it), 1 MiB chunks, fixed mmap threshold, exit after the last write | run-2e2c1b8cc858 (76db73c) | 25.66 | 18.81 | 499 | 41.92 | 81.12 |
+| - | Rejected: a reader thread per parser feeding it 64 KB blocks through channels | run-44ff9ba108dd (ab591ca) | 30.42 | 21.19 | 555 | 37.01 | 78.41 |
+| - | Compact dictionary (inserts under a lock), one state word per chunk, static non-PIE stripped binary | run-03f20e92eb73 (54e9b0f) | 26.46 | 19.49 | 488 | 41.13 | 80.71 |
+| - | Rejected: write the summary out and drop it from the page cache every MiB | run-4c1e6ffe7694 (2e26d0a) | 26.10 | 19.53 | 501 | 41.24 | 80.77 |
+| 6 | Shared pool of summary buffers, 32 KB read blocks | run-9f0f12713f79 (5bf1c87) | 26.16 | 18.66 | 491 | 41.70 | 81.00 |
 
 Leader when step 2 was prepared (`tools/board_watch.py`): Cause Of Death, Rust, T 16.9 ms, M 18.6 MB, S 353, K 54.5.
 At M 19.5 MB and S 353, K = 56 needs T <= 15.7 ms.
@@ -149,6 +154,41 @@ Where the parse's user CPU goes (parse-only build, `tools/ab.sh` 20 rounds, user
 
 So the dictionary lookup is about 40% of the parse CPU (the exact key compare about 19%, the hash 7%) and the digit conversion
 is free.
+
+## Round 3: toward the leader (K 55, T 18.5 ms, M 16.3 MB, S 294)
+
+What the board says about this program, in order of what each experiment taught:
+
+- **The log is not sorted, but it is nearly so.** Seed 1 is several interleaved ordered streams: 26k lines carry an earlier
+  timestamp than their predecessor, 13% of the lines are in an hour behind the newest one, never by more than one hour (the
+  largest lag in time is 70 minutes). So an hour can be finished once the oldest unfinished chunk starts two hours later;
+  every chunk checks that guess when it ends (its earliest hour must not be below the next hour to hand out) and a wrong
+  guess redoes the whole input without it. Shuffled and sorted stress inputs, the sentinel inputs and the page-multiple
+  file all match the Python reference through both paths.
+- **Streaming cut M by 4 MB (22.9 to 18.8) and did not move T (25.7 both).** The board has 12 threads on 6 cores, so T is bound
+  by the total CPU work, not by phase barriers: overlapping the summaries with the parse hides nothing that was idle.
+- **The board's CPU work is about 190 single-thread-ms spread over 12 SMT threads.** A single thread in the Docker VM takes
+  190 ms for the whole program (`pread` 32, scan 77, histogram 8.5, scatter 8, percentiles ~20, the rest of the formatting ~23,
+  `madvise` 3), and 190 / (12 x ~0.6) is the board's 26 ms. The leader's 18.5 ms means about 35% less work than this.
+  `tools/ab.sh` with `CPUS=0` measures that single-thread cost; 8-thread wall time in the VM is dominated by VM artefacts
+  (kernel work, a slow serialised file write, expensive faults).
+- **Read and parse do not overlap.** On the board a read-only run takes 8.4 ms (239 MB at about 30 GB/s, close to memory
+  bandwidth) and read + parse 18.4 ms, i.e. the two add up, although a thread stalled on memory should leave its SMT sibling
+  free. A reader thread per parser, handing 64 KB blocks over through channels, was 18% slower (30.4 ms): the futex wake-ups
+  and the doubled thread count cost more than the overlap gave.
+- **mmap, again, cannot win.** A read-only mapping with software prefetch was 40% slower in the VM, and a helper thread
+  populating the page tables ahead of the workers was 2x slower (populating 239 MB of page tables through one thread runs at
+  about 2 GB/s here), so the page-table work costs about what the copy does.
+- **The page cache of the output counts, and cannot be dropped on the board.** On a real filesystem the peak falls from 17.4 to
+  9.4 MB when the summary is written out and dropped every MiB (`sync_file_range` + `posix_fadvise(DONTNEED)`), but the
+  board's M did not change (19.53 vs 19.49 MB), so `/out` there behaves like tmpfs. Reverted.
+- **What does not help (local, single thread unless stated):** a plain `memcmp` for the key compare (+7% time), a batch of 16
+  lookups with prefetched slots (+3.5%), `sort_unstable` for the percentiles, PGO with the pinned compiler (no change, as in
+  Tracks B and D), 128 vs 64 KB blocks vs 32 KB (equal time, 32 KB lowers M by 0.4 MB), 512 KB or 256 KB chunks and a lag of
+  1 hour (no change in M), a static non-PIE binary (equal within noise).
+- **What S is.** The board's S is the number of non-comment, non-blank lines of `rustfmt`'s output, plus 6 (checked on four
+  commits: 455/463/493 formatted lines against S 461/469/499). `tools/lines.sh` predicts it. Reaching S < 294 would need about
+  40% fewer lines than this design has; each 10% fewer lines is worth only 1.5% of K.
 
 ## Round 2, step 2: 4-byte records (local, `tools/ab.sh` 20 rounds, `tools/mem.sh` fresh container, tmpfs output)
 
