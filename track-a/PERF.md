@@ -14,6 +14,7 @@ Noise is about +-10 ms, so A/B pairs are timed in one hyperfine session (`BIN=<o
 | 1 | Rust: mmap, per-chunk `HashMap<(hour, endpoint), Vec<u32>>`, merge and sort per hour-of-day shard | run-659d7a9038a2 | 132.2 | 100.1 | 170 | 15.54 | 59.57 |
 | 2 | Rewrite: shared lock-free endpoint dictionary, 6-byte records per (chunk, hour), per-hour counting sort, `pread` input | run-ac6fd7774fa8 (9360f49) | 33.9 | 195.3 | 454 | 23.17 | 68.25 |
 | 3 | Step 2 plus `MADV_NOHUGEPAGE` on the arena, hour-major arena layout, `MADV_DONTNEED` of each hour's records once summarised | run-a243658265aa (9c5ca97) | 26.4 | 30.3 | 461 | 38.05 | 79.02 |
+| 4 | Round 2: median-first selection, 4-byte records (second word for latencies of 2^20-1 or more), 64 KB read blocks | run-b4312cc919af (0e8d5bf) | 26.2 | 22.7 | 469 | 40.34 | 80.29 |
 
 Leader when step 2 was prepared (`tools/board_watch.py`): Cause Of Death, Rust, T 16.9 ms, M 18.6 MB, S 353, K 54.5.
 At M 19.5 MB and S 353, K = 56 needs T <= 15.7 ms.
@@ -113,6 +114,33 @@ most 8 records, 28% at most 32; 331 groups with more than 1024 records hold 29% 
 Wall time did not move locally because the VM's wall time is bound by kernel work (pread, faults, writes), not by user CPU. The board
 box spends little time in the kernel (T 26 ms x 12 threads is about the 330 ms of user CPU measured here), so the user-CPU
 reduction is what the board run has to confirm.
+
+## Round 2, board diagnostics (not solutions; both fail the correctness gate but report T and M)
+
+| Build | Run | T (ms) | M (MB) |
+|---|---|---|---|
+| 0e8d5bf, the full program (12 worker threads on the board) | run-b4312cc919af | 26.18 | 22.74 |
+| 767c3f5: exits right after the parse phase (startup + read + parse) | run-cb78e6db6cd8 | 18.39 | 16.74 |
+| aecba07: formats every hour but skips only the output write | run-b4ae7464cc65 | 25.07 | 22.63 |
+
+On the board the parse phase is 70% of T, phase 2 (counting sort, percentiles, formatting) about 26% (6.7 ms), and the write 4%
+(1.1 ms). The output file in the page cache is not what sets the peak (22.63 MB without the write, 22.74 with it). The local split
+is the same shape (parse-only 58.5 ms of 89), so the Docker VM is a fair guide to where the user CPU goes even though it
+overstates the kernel part.
+
+Where the parse's user CPU goes (parse-only build, `tools/ab.sh` 20 rounds, user ms, medians; each pair is from one session):
+
+| Parse-only variant | user ms |
+|---|---|
+| full | 181.5 / 184.5 |
+| dictionary probe replaced by a bare hash | 108.5 |
+| ... and no digit conversion | 109.5 |
+| ... and no hash (id = 0) | 95 |
+| `key_eq` skipped (incorrect, ablation only) | 149.5 |
+| 8192 dictionary slots instead of 4096 | 190.5 (no gain) |
+
+So the dictionary lookup is about 40% of the parse CPU (the exact key compare about 19%, the hash 7%) and the digit conversion
+is free.
 
 ## Round 2, step 2: 4-byte records (local, `tools/ab.sh` 20 rounds, `tools/mem.sh` fresh container, tmpfs output)
 
