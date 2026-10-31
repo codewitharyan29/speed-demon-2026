@@ -196,6 +196,15 @@ What the board says about this program, in order of what each experiment taught:
   (e271777); 76% slower in the VM. Reverted: `pread` stays.
 - **PGO** (profile generated in the pinned LLVM-tools image on the full public data, accepted by the board-style build): T 26.50 ms,
   K 41.30 (081c800) against 26.11 ms and K 41.96 without. Reverted.
+- **Rules checked against the official context (speeddemon.dev, the track spec, FAQ):** the scoring box is an i5-13500 with turbo off,
+  containers pinned to the 12 threads of the six P-cores; M is the cgroup `memory.peak` and includes what is written; the spec
+  promises the log is *not* sorted (eight shards, chunks interleaved) and **no bound on how far a line can be out of order**, so
+  the streaming guess must stay verified per chunk with a full fallback, as it is. S is `scc` over the whole `track-a/` folder after
+  `rustfmt` defaults (reproduced locally: 499 against the board's 496).
+- **Writing the summary with `O_DIRECT` (page-aligned stage, whole-page blocks, padded and truncated at the end):** on a real filesystem
+  in the VM the peak fell from 16-24 to 8-9 MB with the exact file size and hash, but on the board M was 19.43 MB (18.02 without),
+  T 26.83 ms, S 549, K 40.16 (run-7ffb7d851748, 9811e6f). Together with the earlier `fadvise` run this shows the board charges the
+  output to the cgroup however it is written (its `/out` behaves like tmpfs), so the output's 10 MB are a fixed part of M. Reverted.
 - **What does not help (local, single thread unless stated):** a plain `memcmp` for the key compare (+7% time), a batch of 16
   lookups with prefetched slots (+3.5%), `sort_unstable` for the percentiles, PGO with the pinned compiler (no change, as in
   Tracks B and D), 128 vs 64 KB blocks vs 32 KB (equal time, 32 KB lowers M by 0.4 MB), 512 KB or 256 KB chunks and a lag of
