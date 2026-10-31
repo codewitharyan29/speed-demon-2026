@@ -15,7 +15,8 @@ They are only used to compare variants, never reported as results.
 | 4 | `-C target-cpu=native` | 5f206c6 | 0.474 | 223 | 56.310 (K 13.37, 496 lines) |
 | 4b | (unchanged code, re-run with a Track D push) | ac9a033 | 0.469 | 222 | 56.436 (K 13.45, 496 lines) |
 | 5 | AVX2 block tokeniser, right-sized hash tables, batched probe with the key in the slot, bitset-native BOOL evaluation, pairs tracked only where a phrase needs them | 175c722 | 0.342 | 171 | 59.748 (K 15.67, 731 lines) |
-| 6 | Per-chunk indexing and evaluation: no global postings at all | pending | | | |
+| 6 | Per-chunk indexing and evaluation: no global postings at all | a21a357 | 0.329 | 62 | 64.605 (K 19.59, 716 lines) |
+| 7 | Allocation-free per-chunk evaluation with early exits; smaller per-query and sampling state | pending | | | |
 
 ## Local measurements behind step 2 (in-process ms, median)
 
@@ -115,3 +116,17 @@ own and answer every query for its own documents:
 
 Same time (the extra cost of running every query once per chunk is paid back by dropping the global posting build),
 61% less memory. Verified on full seeds 1 and 2, sample seeds 1-3, tiny seeds 1-6 and the worked example.
+
+## Step 7: cheaper per-chunk evaluation (local, in-process ms, median of 9-11)
+
+An ablation of step 6 showed the per-chunk query evaluation at about 75 ms of ~250: 48 chunks x 50,000 queries,
+about 190 ns per (query, chunk), most of them trivially empty.
+
+| Change | Before -> after | Verdict |
+|---|---|---|
+| `summary` no longer allocates a `Vec` per evaluation (2.4 M allocations); early exit for a phrase whose rarest pair, or a BOOL query with no OR whose first term, has nothing in the chunk | 268 -> 253 | kept |
+| Evaluate only queries reachable from the keys a chunk holds (inverted index key -> queries) | 252 -> 284 | reverted: most queries are reachable through common terms anyway, and walking every key per chunk costs more |
+| Number query terms in parallel (hash-sharded tables) after a parallel parse | 246 -> 255; parse 35 -> 25 ms | reverted: no end-to-end gain |
+| 96 chunks instead of 48 | 245 -> 264; `memory.peak` 58 -> 47 MB | reverted: on the score an even trade, at 8% more time |
+| 6 threads instead of 12 (the scan alone did not gain from hyper-threading) | 237 -> 329; `memory.peak` 55 -> 40 MB | reverted: the whole program does gain from the second hardware thread |
+| Sampling counts freed once document frequencies are summed; the ten smallest ids per query in a fixed array | `memory.peak` 58 -> 55 MB | kept |
