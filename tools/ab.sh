@@ -7,7 +7,7 @@
 cd "$(dirname "$0")/.."
 pairs=$1; shift; names="$*"; cpus=${CPUS:-0-7}; outdir=${OUT:-/dev/shm/o}
 MSYS_NO_PATHCONV=1 docker run --rm --network=none --memory=8g --cpuset-cpus=$cpus -e PAIRS=$pairs -e NAMES="$names" -e CPUS=$cpus -e OUTDIR=$outdir \
-  -v sdtarget-a:/target -v sdout:/out --mount type=volume,src=sddata,dst=/data,volume-subpath=a,readonly sd-bench bash -ec '
+  -v sdtarget-a:/target --tmpfs /out --mount type=volume,src=sddata,dst=/data,volume-subpath=a,readonly sd-bench bash -ec '
   mkdir -p $OUTDIR; TIMEFORMAT="%R %U %S"; : > /tmp/res
   for n in $NAMES; do rm -f $OUTDIR/summary.txt; taskset -c $CPUS /target/$n --data /data --out $OUTDIR 2>/dev/null; done   # warm-up
   for i in $(seq $PAIRS); do for n in $NAMES; do
