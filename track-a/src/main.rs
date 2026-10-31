@@ -8,7 +8,7 @@
 use std::arch::x86_64::*;
 use std::fs::File;
 use std::io::Write;
-use std::os::fd::AsRawFd;
+use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering::*};
 use std::sync::{Mutex, OnceLock};
 
@@ -19,13 +19,14 @@ extern "C" {
 
 const THREADS: usize = 12;
 const CHUNK: usize = 4 << 20;
+const BLOCK: usize = 64 << 10; // bytes read at a time; small enough to stay in the core's cache while it is parsed
 const HOURS: usize = 72;
 const SLOTS: usize = 4096; // dictionary slots; the spec has at most 1,842 endpoints
 const STRIDE: usize = 128; // bytes per stored endpoint; endpoints are 1..=125 bytes
 /// A record is one `u32` word: latency in bits 0..20, endpoint id in bits 20..31, 5xx flag in bit 31. A latency that does not
 /// fit (`SENT` or more) is stored as `SENT` and followed by a second word holding the whole latency.
 const SENT: u32 = (1 << 20) - 1;
-const SLACK: usize = 192; // bytes the parser may read past the start of a line; the input mapping is followed by 8 KiB of zeros
+const SLACK: usize = 192; // bytes the parser may read past the start of a line
 const MIN_LINE: usize = 40; // shortest possible line, bounds the records of one chunk
 /// Bytes reserved for the records of one (chunk, hour): the whole chunk could fall in a single hour, with two words per line.
 const REGION: usize = (((CHUNK + 256) / MIN_LINE + 4) * 8 + 8 + 4095) & !4095;
@@ -207,7 +208,7 @@ unsafe fn scan(
 
 /// State shared by all workers.
 struct Job {
-    input: usize, // address of the mapped input
+    input: File,
     len: usize,
     chunks: usize,
     arena: usize,
@@ -235,17 +236,41 @@ impl Job {
         if i == 0 || i >= self.len {
             return i.min(self.len);
         }
-        // SAFETY: the mapping holds `len` bytes of the file.
-        let rest = unsafe { std::slice::from_raw_parts((self.input + i - 1) as *const u8, self.len - (i - 1)) };
-        rest.iter().position(|&c| c == b'\n').map_or(self.len, |k| i + k)
+        let mut buf = [0u8; 256]; // longer than any line
+        let n = (self.len - (i - 1)).min(buf.len());
+        self.input
+            .read_exact_at(&mut buf[..n], i as u64 - 1)
+            .unwrap();
+        buf[..n]
+            .iter()
+            .position(|&c| c == b'\n')
+            .map_or(self.len, |k| i + k)
     }
 
-    /// Parses chunk `c`, straight from the mapped input.
-    fn parse_chunk(&self, c: usize) {
-        let (at, hi) = (self.cut(c * CHUNK), self.cut((c + 1) * CHUNK));
+    /// Parses chunk `c` through `buf`, which holds one block plus the bytes carried over from the previous one.
+    fn parse_chunk(&self, c: usize, buf: &mut [u8]) {
+        let (mut at, hi) = (self.cut(c * CHUNK), self.cut((c + 1) * CHUNK));
         let mut cur: [usize; HOURS] = std::array::from_fn(|h| self.region(h, c));
-        // SAFETY: lines starting before `hi` are complete, and `SLACK` bytes after any of them are mapped.
-        unsafe { scan((self.input + at) as _, (self.input + hi) as _, &self.dict, &mut cur) };
+        let mut keep = 0;
+        loop {
+            let n = (BLOCK - keep).min(hi - at);
+            self.input
+                .read_exact_at(&mut buf[keep..keep + n], at as u64)
+                .unwrap();
+            at += n;
+            let (end, last) = (keep + n, at == hi);
+            buf[end..end + SLACK].fill(0); // the parser may read past the last line
+                                           // SAFETY: lines starting before `lim` are complete and have SLACK readable bytes after their start.
+            let stop = unsafe {
+                let lim = buf.as_ptr().add(if last { end } else { end - SLACK });
+                scan(buf.as_ptr(), lim, &self.dict, &mut cur)
+            };
+            if last {
+                break;
+            }
+            keep = end - (stop as usize - buf.as_ptr() as usize);
+            buf.copy_within(end - keep..end, 0);
+        }
         for (h, at) in cur.iter().enumerate() {
             self.counts[h * self.chunks + c]
                 .store(((at - self.region(h, c)) / 4) as u32, Relaxed);
@@ -360,12 +385,13 @@ impl Job {
     }
 
     fn work(&self) {
+        let mut buf = vec![0u8; BLOCK + SLACK];
         loop {
             let c = self.next_chunk.fetch_add(1, Relaxed);
             if c >= self.chunks {
                 break;
             }
-            self.parse_chunk(c);
+            self.parse_chunk(c, &mut buf);
         }
         if self.parsed.fetch_add(1, SeqCst) == THREADS - 1 {
             self.order.set(self.endpoint_order()).unwrap();
@@ -471,14 +497,9 @@ fn main() {
     let file = File::open(format!("{data}/requests.log")).expect("open input");
     let len = file.metadata().unwrap().len() as usize;
     let chunks = len.div_ceil(CHUNK);
-    // The file is mapped over the start of a zero-filled anonymous mapping, so reads past its end see zeros.
-    let input = unsafe {
-        let at = mmap(std::ptr::null_mut(), len + 8192, 1, 0x4022, -1, 0);
-        mmap(at, len, 1, 0x12, file.as_raw_fd(), 0) as usize
-    };
     let arena = map(chunks * HOURS * REGION);
     let job = Job {
-        input,
+        input: file,
         len,
         chunks,
         arena,
