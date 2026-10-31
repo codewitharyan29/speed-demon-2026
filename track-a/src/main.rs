@@ -14,6 +14,7 @@ use std::sync::{Mutex, OnceLock};
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
 }
 
 const THREADS: usize = 12;
@@ -222,6 +223,11 @@ struct Job {
 }
 
 impl Job {
+    /// Address of the records of chunk `c` in hour `h`; an hour's regions are contiguous so they can be released at once.
+    fn region(&self, h: usize, c: usize) -> usize {
+        self.arena + (h * self.chunks + c) * REGION
+    }
+
     /// Start of the first line that begins at or after byte `i`.
     fn cut(&self, i: usize) -> usize {
         if i == 0 || i >= self.len {
@@ -241,8 +247,7 @@ impl Job {
     /// Parses chunk `c` through `buf`, which holds one block plus the bytes carried over from the previous one.
     fn parse_chunk(&self, c: usize, buf: &mut [u8]) {
         let (mut at, hi) = (self.cut(c * CHUNK), self.cut((c + 1) * CHUNK));
-        let base = self.arena + c * HOURS * REGION;
-        let mut cur: [usize; HOURS] = std::array::from_fn(|h| base + h * REGION);
+        let mut cur: [usize; HOURS] = std::array::from_fn(|h| self.region(h, c));
         let mut keep = 0;
         loop {
             let n = (BLOCK - keep).min(hi - at);
@@ -264,7 +269,8 @@ impl Job {
             buf.copy_within(end - keep..end, 0);
         }
         for (h, at) in cur.iter().enumerate() {
-            self.counts[c * HOURS + h].store(((at - base - h * REGION) / REC) as u32, Relaxed);
+            self.counts[h * self.chunks + c]
+                .store(((at - self.region(h, c)) / REC) as u32, Relaxed);
         }
     }
 
@@ -285,8 +291,8 @@ impl Job {
     fn summarise(&self, h: usize, order: &[u16], scratch: &mut Scratch) -> Vec<u8> {
         let regions = || {
             (0..self.chunks).filter_map(move |c| {
-                let n = self.counts[c * HOURS + h].load(Relaxed) as usize;
-                (n > 0).then(|| (self.arena + (c * HOURS + h) * REGION, n))
+                let n = self.counts[h * self.chunks + c].load(Relaxed) as usize;
+                (n > 0).then(|| (self.region(h, c), n))
             })
         };
         let record =
@@ -414,6 +420,8 @@ impl Job {
                 break;
             }
             let lines = self.summarise(h, order, &mut scratch);
+            // MADV_DONTNEED: the records of this hour are no longer needed, so the output can reuse their memory.
+            unsafe { madvise(self.region(h, 0) as *mut u8, self.chunks * REGION, 4) };
             self.publish(h, lines);
         }
     }
@@ -462,7 +470,10 @@ fn number(out: &mut Vec<u8>, mut v: u64) {
 /// Maps `len` bytes of anonymous memory, which is only backed once touched, and never unmaps it.
 fn map(len: usize) -> usize {
     // PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, no file.
-    unsafe { mmap(std::ptr::null_mut(), len, 3, 0x4022, -1, 0) as usize }
+    let at = unsafe { mmap(std::ptr::null_mut(), len, 3, 0x4022, -1, 0) };
+    // MADV_NOHUGEPAGE: the touched parts are sparse, so with transparent huge pages every touched 2 MiB would be backed.
+    unsafe { madvise(at, len, 15) };
+    at as usize
 }
 
 fn main() {
