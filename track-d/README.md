@@ -18,7 +18,8 @@ are scattered into place with `fetch_add`, each packed as `head << 32 | weight`.
 cache on every neighbour. Each thread repeatedly takes an unclaimed node and grows a breadth-first region of up to
 32k nodes around it. Regions are numbered one after another; with their offsets known, every region writes its new
 ids, slots and degrees in parallel. The CSR is then rebuilt in the new numbering, so a search walks memory that is
-mostly contiguous.
+mostly contiguous. The final edge array is zero-copy transmuted from `Vec<AtomicU64>` to `Vec<u64>` to unblock LLVM
+optimisations in the search loop.
 
 **Queries.** Each query is a forward Dijkstra from `s` that stops when `t` is popped, with Dial's buckets: a
 ring of 2^14 buckets, key k in bucket k % 2^14, popped exactly in key order by scanning forward. Main-body weights
@@ -29,16 +30,24 @@ Four bytes per node halve the memory 12 threads keep resident; the few searches 
 edges of near-maximal weight) run again with `u64`, through the same generic search. `s == t` and targets without
 in-edges are answered without searching. Queries run in order of their source's new id, each thread working through
 its own contiguous share before helping the others, so a thread's searches reuse the same part of the graph in cache.
+
+**Hot-loop micro-optimisations.** The relaxation inner loop uses `get_unchecked` throughout to eliminate bounds checks
+that LLVM cannot prove redundant (indices come from runtime graph data). Software prefetch (`_mm_prefetch`) issues
+batch prefetches for the first four neighbours' distance entries before the loop, then a sliding-window prefetch four
+edges ahead during the loop, hiding L3 latency on the random `dist[v]` reads that the cachegrind profile identified as
+the main L1 misses. The relaxation test uses bitwise OR (`(seen == 0) | (nd + 1 < seen)`) instead of short-circuit OR
+to give the branch predictor a single branch instead of two, targeting the main mispredicted branch from the profile.
+
 Answers are written in input order with one `write`.
 
 ## Dependencies
 
-None: standard library only. `mmap` is declared by hand with `extern "C"`.
+None: standard library only. `mmap` is declared by hand with `extern "C"`. `_mm_prefetch` is from `std::arch::x86_64`.
 
 ## With another 24 hours
 
-- A cheaper build: the scatter, the region growth and the rebuild still read and write the edge list three times
-  (about 70 ms locally); a parallel radix sort by source could replace the atomic scatter.
-- A leaner search kernel: the relaxation test is the main mispredicted branch, and the distance loads the main cache
-  misses. Bidirectional search did less work but ran slower here (see `PERF.md`), so goal-directed search with cheap
-  landmarks is the next idea to measure.
+- A cheaper build: the scatter, the region growth and the rebuild still read and write the edge list three times;
+  a parallel radix sort by source could replace the atomic scatter.
+- A leaner search kernel: goal-directed search with cheap landmarks (ALT) if the build cost can be amortised.
+- Profile-guided optimisation with sampling PGO (AutoFDO) instead of instrumentation, which paradoxically slowed
+  the previous build.

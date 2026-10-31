@@ -134,3 +134,25 @@ above the key last popped.
 | Parallel radix sort of the edge list instead of the atomic scatter | not built: needs a second 60 MB edge buffer, raising the build peak from ~134 to ~190 MB, for an estimated <= 10 ms | rejected on paper |
 | A timestamped distance array shared by all threads | incorrect: 12 concurrent searches' balls overlap | rejected |
 | BFS from one node or a Hilbert order instead of regions | neighbours in adjacent BFS levels are thousands of ids apart, and there are no coordinates for a space-filling curve | rejected |
+
+## Step 7: search-loop micro-optimisations (bounds checks, prefetch, branch reduction)
+
+The cachegrind profile from step 5 identified two dominant costs in the search kernel: (1) L1 misses on random
+`dist[v]` loads and (2) branch mispredictions on the relaxation test `seen == 0 || nd + 1 < seen`. Step 7 targets
+both, plus the general instruction overhead of bounds checks that LLVM cannot elide.
+
+| Change | Rationale | Expected effect |
+|---|---|---|
+| `adj` from `Vec<AtomicU64>` to `Vec<u64>` via zero-copy transmute after the parallel build | `AtomicU64` prevents LLVM from caching values in registers, reordering loads, and performing alias analysis across iterations of the inner loop. After all threads have joined, sole ownership is guaranteed. The transmute avoids a 40 MB allocation + copy that `.into_iter().map(into_inner).collect()` would incur | Search: 10-20% faster (LLVM unblocked); build: saves ~3 ms |
+| `get_unchecked` on `start[u]`, `start[u+1]`, `adj[ei]`, `dist[v]` read and write in the hot loop | LLVM cannot prove bounds safety because indices come from runtime graph data (indirect access). Each bounds check is a conditional branch + panic call site that inhibits unrolling and increases i-cache pressure | Search: 5-15% faster |
+| Batch software prefetch (`_mm_prefetch T0`) of `dist[v]` for the first 4 neighbours before the edge loop, then a sliding-window prefetch 4 edges ahead during the loop | The profile's main L1 misses are the random `dist[v]` reads. Previous attempt (prefetch next-node-to-pop) was in noise because the *node's edges* are sequential in CSR (hardware prefetcher handles them); it is `dist[v]` at random addresses that misses. Batch prefetch at loop start gives ~60-80 ns of latency hiding for the first edges; the sliding window maintains it for high-degree nodes | Search: 5-15% faster |
+| Bitwise OR in relaxation: `(seen == 0) | (nd + 1 < seen)` instead of `seen == 0 || nd + 1 < seen` | Short-circuit `||` compiles to two conditional branches; the second is the main mispredicted branch from the profile. Bitwise `|` evaluates both conditions unconditionally and folds them into a single branch for the `if`. Both sub-expressions are trivially cheap (comparison + sete) | Search: 3-8% fewer mispredictions |
+| `get_unchecked` in the Dial push/pop ring access and in the touched-drain cleanup loop | Minor: removes bounds checks on the ring index (always in 0..WINDOW) and the dist reset loop | ~1-2% |
+| `strip = true` in `[profile.release]` | Smaller binary = fewer i-cache misses; no debug info needed on the scoring box | ~1% |
+| `-C llvm-args=-inline-threshold=1000` | Encourages LLVM to inline the generic `search::<u32>` hot path and Dial methods more aggressively, especially with the new non-atomic `adj` that enables it | ~2-5% |
+
+Source lines: 371 → ~315 after rustfmt (the Dial, par and build code is more compact; the search function grew
+slightly from the prefetch and unsafe blocks but the net is shorter).
+
+Combined estimated search improvement: 20-40% (from ~330 ms toward ~200-260 ms), total time from ~0.321 s toward
+~0.23-0.27 s, pending board measurement.
