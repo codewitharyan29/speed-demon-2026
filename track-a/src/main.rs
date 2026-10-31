@@ -370,7 +370,8 @@ impl Job {
                 });
                 let mut next = self.written.load(SeqCst);
                 while next < HOURS && self.ready[next].load(SeqCst) {
-                    let _ = (&file, std::mem::take(&mut *self.hours[next].lock().unwrap())); // DIAGNOSTIC: no write
+                    file.write_all(&std::mem::take(&mut *self.hours[next].lock().unwrap()))
+                        .unwrap();
                     next += 1;
                     self.written.store(next, SeqCst);
                 }
