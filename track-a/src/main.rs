@@ -11,7 +11,6 @@ use std::fs::File;
 use std::io::Write;
 use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
-use std::sync::mpsc::{Receiver, Sender, SyncSender};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -31,7 +30,6 @@ const STRIDE: usize = 128; // bytes per stored endpoint (at most 125) and, in th
 /// A record is one `u32`: latency in bits 0..20, endpoint id in bits 20..31, 5xx flag in bit 31. A latency that does not
 /// fit (`SENT` or more) is stored as `SENT` and followed by a second word holding the whole latency.
 const SENT: u32 = (1 << 20) - 1;
-const HEAD: usize = 512; // room before a block for the unfinished line carried over from the one before
 const SLACK: usize = 192; // bytes the parser may read past the start of a line
 const MIN_LINE: usize = 40; // shortest possible line, bounds the records of one chunk
 /// Bytes reserved for the records of one (chunk, hour): the whole chunk could fall in a single hour, with two words per line.
@@ -232,14 +230,6 @@ fn each_record(regions: &[(usize, usize)], mut f: impl FnMut(u32, u32)) {
     }
 }
 
-/// A block of the input: `n` bytes at `HEAD` in `buf`, from chunk `chunk`; `last` if it ends the chunk.
-struct Block {
-    buf: Vec<u8>,
-    chunk: usize,
-    n: usize,
-    last: bool,
-}
-
 /// Per-worker buffers for `summarise`: per-endpoint count (low 32 bits) and 5xx count (high), group starts, values.
 struct Scratch {
     counts: Vec<u64>,
@@ -323,63 +313,40 @@ impl Job {
             .map_or(self.len, |k| i + k)
     }
 
-    /// Reads the chunks this thread claims, one block at a time, into the buffers it is given (at `HEAD`) and sends them on.
-    fn read_chunks(&self, free: Receiver<Vec<u8>>, full: SyncSender<Block>) {
+    /// Parses chunk `c` through `buf`, which holds one block plus the bytes carried over from the previous one.
+    fn parse_chunk(&self, c: usize, buf: &mut [u8]) {
+        let (first, hi) = (self.cut(c * CHUNK), self.cut((c + 1) * CHUNK));
+        let (mut at, mut keep, mut lo) = (first, 0, HOURS);
+        let mut cur: [usize; HOURS] = std::array::from_fn(|h| self.region(h, c));
         loop {
-            let chunk = self.next_chunk.fetch_add(1, Relaxed);
-            if chunk >= self.chunks {
-                return;
+            let n = (BLOCK - keep).min(hi - at);
+            self.input
+                .read_exact_at(&mut buf[keep..keep + n], at as u64)
+                .unwrap();
+            if at == first && n > 0 {
+                let key = u64::from_le_bytes(buf[5..13].try_into().unwrap());
+                self.first_hour[c].store(hour_index(key), Relaxed);
             }
-            let (mut at, hi) = (self.cut(chunk * CHUNK), self.cut((chunk + 1) * CHUNK));
-            loop {
-                let Ok(mut buf) = free.recv() else { return };
-                let n = BLOCK.min(hi - at);
-                self.input.read_exact_at(&mut buf[HEAD..HEAD + n], at as u64).unwrap();
-                at += n;
-                if full.send(Block { buf, chunk, n, last: at == hi }).is_err() || at == hi {
-                    break;
-                }
-            }
-        }
-    }
-
-    /// Parses the blocks sent by a reader, in order, and summarises the hours that become ready.
-    fn parse_blocks(&self, full: Receiver<Block>, free: Sender<Vec<u8>>) {
-        let (mut carry, mut keep, mut lo) = ([0u8; HEAD], 0, HOURS);
-        let mut cur = [0usize; HOURS];
-        let mut first = true;
-        while let Ok(Block { mut buf, chunk: c, n, last }) = full.recv() {
-            if first {
-                cur = std::array::from_fn(|h| self.region(h, c));
-                if n > 0 {
-                    let key = u64::from_le_bytes(buf[HEAD + 5..HEAD + 13].try_into().unwrap());
-                    self.first_hour[c].store(hour_index(key), Relaxed);
-                }
-            }
-            buf[HEAD - keep..HEAD].copy_from_slice(&carry[..keep]);
-            let end = HEAD + n;
+            at += n;
+            let (end, last) = (keep + n, at == hi);
             buf[end..end + SLACK].fill(0); // the parser may read past the last line
-            // SAFETY: lines starting before `lim` are complete and have SLACK readable bytes after their start.
+                                           // SAFETY: lines starting before `lim` are complete and have SLACK readable bytes after their start.
             let stop = unsafe {
                 let lim = buf.as_ptr().add(if last { end } else { end - SLACK });
-                scan(buf.as_ptr().add(HEAD - keep), lim, &self.dict, &mut cur, &mut lo) as usize - buf.as_ptr() as usize
+                scan(buf.as_ptr(), lim, &self.dict, &mut cur, &mut lo)
             };
-            keep = end - stop;
-            carry[..keep].copy_from_slice(&buf[stop..end]);
-            free.send(buf).ok();
-            first = last;
             if last {
-                for (h, at) in cur.iter().enumerate() {
-                    self.counts[h * self.chunks + c].store(((at - self.region(h, c)) / 4) as u32, SeqCst);
-                }
-                // An hour already handed out cannot take this chunk's records any more: the guess was wrong.
-                if lo < self.next_hour.load(SeqCst) {
-                    self.bad.store(true, Relaxed);
-                }
-                self.done[c].store(true, Release);
-                (keep, lo) = (0, HOURS);
-                self.summarise_ready();
+                break;
             }
+            keep = end - (stop as usize - buf.as_ptr() as usize);
+            buf.copy_within(end - keep..end, 0);
+        }
+        for (h, at) in cur.iter().enumerate() {
+            self.counts[h * self.chunks + c].store(((at - self.region(h, c)) / 4) as u32, SeqCst);
+        }
+        // An hour already handed out cannot take this chunk's records any more: the guess was wrong.
+        if lo < self.next_hour.load(SeqCst) {
+            self.bad.store(true, Relaxed);
         }
     }
 
@@ -483,32 +450,27 @@ impl Job {
         }
     }
 
-    /// Summarises the hours that can be summarised now.
-    fn summarise_ready(&self) {
-        while let Some(h) = self.claim_hour() {
-            let mut scratch = self.spare.lock().unwrap().pop().unwrap_or_else(|| Scratch {
-                counts: vec![0; SLOTS],
-                starts: vec![0; SLOTS],
-                values: Vec::new(),
-            });
-            let lines = self.summarise(h, &mut scratch);
-            self.spare.lock().unwrap().push(scratch);
-            self.publish(h, lines);
-        }
-    }
-
-    /// One parser and the reader that feeds it. Three buffers circulate between them, so the reader fills one while the
-    /// parser works on another.
-    fn work<'a>(&'a self, scope: &'a std::thread::Scope<'a, '_>) {
-        let ((free_tx, free_rx), (full_tx, full_rx)) = (std::sync::mpsc::channel(), std::sync::mpsc::sync_channel(2));
-        for _ in 0..3 {
-            free_tx.send(vec![0u8; HEAD + BLOCK + SLACK]).unwrap();
-        }
-        scope.spawn(move || self.read_chunks(free_rx, full_tx));
-        self.parse_blocks(full_rx, free_tx);
+    fn work(&self) {
+        let mut buf = vec![0u8; BLOCK + SLACK];
         while self.next_hour.load(SeqCst) < HOURS {
-            self.summarise_ready();
-            std::thread::sleep(Duration::from_micros(50)); // the chunks still being parsed decide what comes next
+            let c = self.next_chunk.fetch_add(1, Relaxed);
+            if c < self.chunks {
+                self.parse_chunk(c, &mut buf);
+                self.done[c].store(true, Release);
+            }
+            while let Some(h) = self.claim_hour() {
+                let mut scratch = self.spare.lock().unwrap().pop().unwrap_or_else(|| Scratch {
+                    counts: vec![0; SLOTS],
+                    starts: vec![0; SLOTS],
+                    values: Vec::new(),
+                });
+                let lines = self.summarise(h, &mut scratch);
+                self.spare.lock().unwrap().push(scratch);
+                self.publish(h, lines);
+            }
+            if c >= self.chunks {
+                std::thread::sleep(Duration::from_micros(50)); // the chunks still being parsed decide what comes next
+            }
         }
     }
 }
@@ -567,9 +529,9 @@ fn main() {
         let job = Job::new(&data, &out, guess);
         std::thread::scope(|s| {
             for _ in 1..threads {
-                s.spawn(|| job.work(s));
+                s.spawn(|| job.work());
             }
-            job.work(s);
+            job.work();
         });
     }
 }
