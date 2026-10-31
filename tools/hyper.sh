@@ -20,7 +20,7 @@ MSYS_NO_PATHCONV=1 docker run --rm --network=none --memory=8g --cpuset-cpus=$cpu
     rm -f /out/summary.txt; taskset -c $CPUS $bin --data /data --out /out
     got=$(sha256sum < /out/summary.txt | cut -d" " -f1)
     [ "$got" = "$EXPECT" ] && echo "HASH OK" || { echo "HASH MISMATCH $got"; exit 1; }
-    hyperfine -N --warmup 5 --runs $RUNS "taskset -c $CPUS $bin --data /data --out /out" ${BIN:+"taskset -c $CPUS $BIN --data /data --out /out"}
+    hyperfine -N --prepare "rm -f /out/summary.txt" --warmup 5 --runs $RUNS "taskset -c $CPUS $bin --data /data --out /out" ${BIN:+"taskset -c $CPUS $BIN --data /data --out /out"}
     echo "cgroup memory.peak after build+runs (upper bound): $(( $(cat /sys/fs/cgroup/memory.peak) / 1048576 )) MB"'
 # The real M: a fresh container that runs the final image once and reads memory.peak.
 docker build -q --network=none -t sd-$t track-$t >/dev/null

@@ -54,6 +54,48 @@ The 24 ms teardown of the mapped input is what made `pread` win (E2d): it also r
 - Step 3 also ran faster than step 2 (26.4 vs 33.9 ms): with huge pages off the kernel no longer zeroes a 2 MiB page
   for every touched region.
 
+## Round 2, Step 0: profile of step 3 (9c5ca97), no code change
+
+Setup: Docker VM, 8 CPUs (`taskset -c 0-7`, 8 threads), THP set to `always` to mirror the board kernel, output file removed before
+every run, 20 runs per column, medians. Instrumentation was an uncommitted copy of `main.rs` (timestamps per thread, `getrusage`,
+`/proc/self/status`), `strace -f -tt -T` for the syscall timeline. No `perf` in the VM, so no cycles/instructions.
+
+**VM caveats.** The VM runs this binary in about 98 ms against 26 ms on the board (3.7x) and has 8 CPUs, not 12. It inflates
+kernel work (pread, clone3, madvise, faults, writes) much more than CPU work, so rank by user CPU and treat every sys-side
+conclusion as a hypothesis until a board run confirms it. Board noise is about +-6% (same code: 26.4 and 28.0 ms), so a single
+board run cannot confirm a gain under about 8%. `tools/hyper.sh` overwrote an existing `summary.txt` in every run; `close` of a
+truncated file then took 7 ms under strace (ext4 flushes on close). A fresh board run probably has no such file. `tools/hyper.sh`
+now removes it before each run, and `tools/ab.sh` does interleaved A/B rounds with wall/user/sys.
+
+| Event (ms since `main`) | output on tmpfs | output on Docker volume |
+|---|---|---|
+| 7 worker threads spawned (serial in main) | 4.4 | 4.9 |
+| first / last thread finishes parse | 51.6 / 56.2 | 52.2 / 56.5 |
+| endpoint sort (one thread, the rest idle) | 0.85 | 0.97 |
+| first / last non-writer thread finishes phase 2 | 88.1 / 91.5 | 90.0 / 93.6 |
+| everything written and joined | 97.6 | 108.6 |
+| tail after the last non-writer thread (writer draining) | 5.4 | 15.0 |
+
+| CPU | tmpfs | volume |
+|---|---|---|
+| user ms | 344 | 341 |
+| sys ms | 305 | 323 |
+| sys share | 48% | 50% |
+| minor faults | 7.9k | 8.2k |
+
+Per thread: phase 1 busy 54.5 ms, slowest/mean 1.07 (median over runs), `pread` 21.8 ms of it (40%), barrier wait after the parse
+4.4 ms mean (16 max); phase 2 `summarise` 30.5 ms for about 10 hours, `madvise(MADV_DONTNEED)` 3.9 ms (72 calls of about 0.45 ms),
+the writer thread 32-42 ms in `write`. `summarise` sub-steps summed over all threads: histogram 31 ms, scatter 33 ms,
+percentile selection + formatting 155-160 ms, i.e. about 46% of all user CPU. Strace: 1084 `pread`, 7 `clone3`, 315 `sched_yield`
+(the spin barrier), 72 `write`.
+
+Memory (fresh container, `memory.peak` 28.9 MB; board 30.3 MB): records 3.1M x 6 B = 18.6 MB (RssAnon after the parse is 20.6-22.6),
+read buffers 8 x 256 KB = 2.1, dictionary + scratch + runtime + stacks about 2, binary and libc 1.8, kernel (slab, stacks, page
+tables) 1.9, output file in the page cache 10.1 at the end (2-3 MB of it at the peak, because each hour's records are released as
+its lines are written). Latencies: 1.2% of the 3.1M are at or above 2^20 (36,447), 14.6% at or above 2^16.
+
+Ranking drawn from this: user-CPU first (percentile + formatting), then 4-byte records for M, then the serial and idle time.
+
 ## Rejected or inconclusive (local, 8 threads, interleaved hyperfine)
 
 - **Input mmap'd, `MADV_POPULATE_READ` per worker chunk (E2c):** 161 vs 128 ms for `pread` in the same session (1.26x
