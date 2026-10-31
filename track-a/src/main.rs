@@ -263,7 +263,7 @@ impl Job {
                                            // SAFETY: lines starting before `lim` are complete and have SLACK readable bytes after their start.
             let stop = unsafe {
                 let lim = buf.as_ptr().add(if last { end } else { end - SLACK });
-                lim // DIAGNOSTIC: read only, no parse
+                scan(buf.as_ptr(), lim, &self.dict, &mut cur)
             };
             if last {
                 break;
@@ -394,7 +394,7 @@ impl Job {
             self.parse_chunk(c, &mut buf);
         }
         if self.parsed.fetch_add(1, SeqCst) == THREADS - 1 {
-            std::process::exit(0); // DIAGNOSTIC: stop after the read phase
+            self.order.set(self.endpoint_order()).unwrap();
         }
         let order = loop {
             match self.order.get() {
