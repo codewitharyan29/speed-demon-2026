@@ -1,9 +1,9 @@
 //! Track A (ingest): per (hour, endpoint) request count, latency percentiles and 5xx rate.
 //!
 //! Workers take 1 MiB chunks of the log in order, read them in blocks and parse every line with AVX2/SWAR into a 4-byte
-//! record in a region private to (chunk, hour); endpoint ids come from one shared lock-free dictionary. The log is nearly
-//! in time order, so an hour is summarised, and its records released, as soon as the chunks still to come are expected not
-//! to contain it. That overlaps the summaries with the parsing of later hours. Every chunk checks the guess when it
+//! record in a region private to (chunk, hour); endpoint ids come from one shared dictionary. The log is nearly in time
+//! order, so an hour is summarised, and its records released, as soon as the chunks still to come are expected not to
+//! contain it. That overlaps the summaries with the parsing of later hours. Every chunk checks the guess when it
 //! finishes; if it was wrong the whole input is processed again without guessing.
 
 use std::arch::x86_64::*;
@@ -25,6 +25,7 @@ const CHUNK: usize = 1 << 20;
 const BLOCK: usize = 64 << 10; // bytes read at a time; small enough to stay in the core's cache while it is parsed
 const HOURS: usize = 72;
 const LAG: usize = 2; // hours a line may trail the first line of its chunk without breaking the guess
+const DONE: u32 = 1 << 8; // in a chunk's state; below it is 1 + the hour of the chunk's first line, or 0 before it starts
 const SLOTS: usize = 4096; // dictionary slots; the spec has at most 1,842 endpoints
 const STRIDE: usize = 128; // bytes per stored endpoint (at most 125) and, in the last one, its length
 /// A record is one `u32`: latency in bits 0..20, endpoint id in bits 20..31, 5xx flag in bit 31. A latency that does not
@@ -36,22 +37,15 @@ const MIN_LINE: usize = 40; // shortest possible line, bounds the records of one
 const REGION: usize = (((CHUNK + 256) / MIN_LINE + 4) * 8 + 8 + 4095) & !4095;
 const DAYS: [&str; 4] = ["2026-10-30", "2026-10-31", "2026-11-01", "2026-11-02"];
 
-/// Endpoint dictionary shared by all workers: open addressing, slots are claimed with compare-and-swap.
-/// A slot holds `hash tag << 32 | key length << 16 | id + 1`; the key bytes live in `keys`, `STRIDE` per id.
-struct Dict {
-    slots: Vec<AtomicU64>,
-    keys: usize,
-    next: AtomicU32,
+fn zeros<T: Default>(n: usize) -> Vec<T> {
+    (0..n).map(|_| T::default()).collect()
 }
 
 /// True if the first `len` bytes at `a` and `b` are equal. Both may be read up to 128 bytes past their start.
 #[inline(always)]
 unsafe fn key_eq(a: *const u8, b: *const u8, len: usize) -> bool {
     let block = |o: usize| {
-        let (x, y) = (
-            _mm256_loadu_si256(a.add(o) as _),
-            _mm256_loadu_si256(b.add(o) as _),
-        );
+        let (x, y) = (_mm256_loadu_si256(a.add(o) as _), _mm256_loadu_si256(b.add(o) as _));
         _mm256_movemask_epi8(_mm256_cmpeq_epi8(x, y)) as u32 as u64
     };
     let need = u64::MAX >> (64 - len.min(64));
@@ -67,79 +61,76 @@ unsafe fn key_eq(a: *const u8, b: *const u8, len: usize) -> bool {
 /// Hash of an endpoint from its first and last 16 bytes and its length; `key_eq` settles collisions.
 #[inline(always)]
 unsafe fn hash(s: *const u8, len: usize) -> u64 {
+    let read = |p: *const u8| (p as *const u128).read_unaligned();
     let mix = |x: u128, k: u128| {
         let r = (x as u64 ^ k as u64) as u128 * ((x >> 64) as u64 ^ (k >> 64) as u64) as u128;
         r as u64 ^ (r >> 64) as u64
     };
-    let head = (s as *const u128).read_unaligned() & (!0u128 >> (128 - 8 * len.min(16)));
-    let tail =
-        (s.add(len).sub(16) as *const u128).read_unaligned() & if len >= 16 { !0 } else { 0 };
-    mix(head, 0x9E37_79B9_7F4A_7C15_D6E8_FEB8_6659_FD93)
-        ^ mix(
-            tail,
-            0xA076_1D64_78BD_642F_E703_7ED1_A0B4_28DB ^ len as u128,
-        )
+    let head = read(s) & (!0u128 >> (128 - 8 * len.min(16)));
+    let tail = if len > 16 { read(s.add(len - 16)) } else { 0 };
+    mix(head, 0x9E37_79B9_7F4A_7C15_D6E8_FEB8_6659_FD93) ^ mix(tail, 0xA076_1D64_78BD_642F_E703_7ED1_A0B4_28DB ^ len as u128)
+}
+
+/// Endpoint dictionary shared by all workers: open addressing, lock-free lookups, inserts under a lock.
+/// A slot holds `hash tag << 32 | id + 1`; the key bytes live in `keys`, `STRIDE` per id, the length in the last one.
+struct Dict {
+    slots: Vec<AtomicU64>,
+    keys: usize,
+    count: Mutex<usize>,
 }
 
 impl Dict {
     fn new() -> Self {
-        Dict {
-            slots: (0..SLOTS).map(|_| AtomicU64::new(0)).collect(),
-            keys: vec![0u8; SLOTS * STRIDE + 128].leak().as_mut_ptr() as usize,
-            next: AtomicU32::new(0),
-        }
+        let keys = vec![0u8; SLOTS * STRIDE].leak().as_ptr() as usize;
+        Dict { slots: zeros(SLOTS), keys, count: Mutex::new(0) }
     }
 
     fn ptr(&self, id: usize) -> *mut u8 {
         (self.keys + id * STRIDE) as _
     }
 
-    /// The bytes of endpoint `id`, which `lookup` must have returned.
+    /// The bytes of endpoint `id`.
     fn key(&self, id: usize) -> &[u8] {
-        let p = self.ptr(id);
-        unsafe { std::slice::from_raw_parts(p, *p.add(STRIDE - 1) as usize) }
+        unsafe { std::slice::from_raw_parts(self.ptr(id), *self.ptr(id).add(STRIDE - 1) as usize) }
+    }
+
+    /// The id of the endpoint at `s` (`len` bytes, hash `h`) if it is in the probe sequence from `slot`, which is left at
+    /// the empty slot that ends the sequence otherwise.
+    #[inline(always)]
+    unsafe fn find(&self, s: *const u8, len: usize, h: u64, slot: &mut usize) -> Option<u32> {
+        loop {
+            let v = self.slots[*slot].load(Acquire);
+            let id = (v & 0xFFFF) as usize;
+            if v == 0 {
+                return None;
+            }
+            if v >> 32 == h >> 32 && self.key(id - 1).len() == len && key_eq(s, self.ptr(id - 1), len) {
+                return Some(id as u32 - 1);
+            }
+            *slot = (*slot + 1) % SLOTS;
+        }
     }
 
     /// Id of the endpoint at `s` (`len` bytes, hash `h`), adding it if it is new.
     #[inline(always)]
     unsafe fn lookup(&self, s: *const u8, len: usize, h: u64) -> u32 {
-        let mut i = h as usize & (SLOTS - 1);
-        loop {
-            let v = self.slots[i].load(Acquire);
-            if v == 0 {
-                return self.insert(s, len, h, i);
-            }
-            if (v >> 32) as u32 == (h >> 32) as u32 && (v >> 16) as usize & 0xFF == len {
-                let id = (v & 0xFFFF) as usize - 1;
-                if key_eq(s, self.ptr(id), len) {
-                    return id as u32;
-                }
-            }
-            i = (i + 1) & (SLOTS - 1);
-        }
+        let mut slot = h as usize % SLOTS;
+        self.find(s, len, h, &mut slot).unwrap_or_else(|| self.insert(s, len, h, slot))
     }
 
     #[cold]
     #[inline(never)]
-    unsafe fn insert(&self, s: *const u8, len: usize, h: u64, mut i: usize) -> u32 {
-        let id = self.next.fetch_add(1, Relaxed) as usize;
+    unsafe fn insert(&self, s: *const u8, len: usize, h: u64, mut slot: usize) -> u32 {
+        let mut count = self.count.lock().unwrap();
+        if let Some(id) = self.find(s, len, h, &mut slot) {
+            return id; // another worker added it first
+        }
+        let id = *count;
         std::ptr::copy_nonoverlapping(s, self.ptr(id), len);
         *self.ptr(id).add(STRIDE - 1) = len as u8;
-        let new = h & !0xFFFF_FFFF | (len as u64) << 16 | (id as u64 + 1);
-        loop {
-            match self.slots[i].compare_exchange(0, new, AcqRel, Acquire) {
-                Ok(_) => return id as u32,
-                Err(v) if (v >> 32) == (new >> 32) && (v >> 16) & 0xFF == len as u64 => {
-                    // Another worker may have added this very endpoint first.
-                    let other = (v & 0xFFFF) as usize - 1;
-                    if key_eq(s, self.ptr(other), len) {
-                        return other as u32;
-                    }
-                    i = (i + 1) & (SLOTS - 1);
-                }
-                Err(_) => i = (i + 1) & (SLOTS - 1),
-            }
-        }
+        self.slots[slot].store(h & !0xFFFF_FFFF | (id as u64 + 1), Release);
+        *count += 1;
+        id as u32
     }
 }
 
@@ -159,9 +150,8 @@ unsafe fn latency(p: *const u8) -> (u32, usize) {
     let v = if n <= 8 {
         digits8((p as *const u64).read_unaligned() << (8 * (8 - n)))
     } else {
-        let lead = n - 8;
-        let hi = (0..lead).fold(0, |a, i| a * 10 + (*p.add(i) & 15) as u64);
-        hi * 100_000_000 + digits8((p.add(lead) as *const u64).read_unaligned())
+        let hi = (0..n - 8).fold(0, |a, i| a * 10 + (*p.add(i) & 15) as u64);
+        hi * 100_000_000 + digits8((p.add(n - 8) as *const u64).read_unaligned())
     };
     (v as u32, n)
 }
@@ -177,13 +167,7 @@ fn hour_index(key: u64) -> usize {
 
 /// Parses the lines starting before `lim` and appends their records to the per-hour cursors `cur`; `lo` is lowered to the
 /// earliest hour seen. Returns where it stopped. Every line must have `SLACK` readable bytes after its start.
-unsafe fn scan(
-    mut p: *const u8,
-    lim: *const u8,
-    dict: &Dict,
-    cur: &mut [usize; HOURS],
-    lo: &mut usize,
-) -> *const u8 {
+unsafe fn scan(mut p: *const u8, lim: *const u8, dict: &Dict, cur: &mut [usize; HOURS], lo: &mut usize) -> *const u8 {
     let (mut last, mut hour) = (0, 0);
     let space = _mm256_set1_epi8(b' ' as i8);
     while p < lim {
@@ -194,17 +178,14 @@ unsafe fn scan(
         }
         // Bit i of `spaces` is set if the byte i after the timestamp is a space: method, endpoint, status, latency.
         let w = p.add(28);
-        let find = |q: *const u8| {
-            _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256(q as _), space)) as u32 as u64
-        };
+        let find = |q: *const u8| _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256(q as _), space)) as u32 as u64;
         let spaces = find(w) | find(w.add(32)) << 32;
         let start = spaces.trailing_zeros() as usize + 1;
         let end = match spaces & spaces.wrapping_sub(1) {
             0 => (64..).find(|&i| *w.add(i) == b' ').unwrap(),
             more => more.trailing_zeros() as usize,
         };
-        let endpoint = w.add(start);
-        let id = dict.lookup(endpoint, end - start, hash(endpoint, end - start));
+        let id = dict.lookup(w.add(start), end - start, hash(w.add(start), end - start));
         let failed = *w.add(end + 1) == b'5';
         let (lat, digits) = latency(w.add(end + 5));
         let word = lat.min(SENT) | (id | (failed as u32) << 11) << 20;
@@ -230,7 +211,9 @@ fn each_record(regions: &[(usize, usize)], mut f: impl FnMut(u32, u32)) {
     }
 }
 
-/// Per-worker buffers for `summarise`: per-endpoint count (low 32 bits) and 5xx count (high), group starts, values.
+/// Per-worker buffers for `summarise`: per endpoint the count with the 5xx count above bit 32, and where its group of
+/// values starts; and the values of the hour grouped by endpoint.
+#[derive(Default)]
 struct Scratch {
     counts: Vec<u64>,
     starts: Vec<usize>,
@@ -243,19 +226,15 @@ struct Job {
     len: usize,
     chunks: usize,
     arena: usize,
-    guess: bool,                  // finish hours early; false once the guess has failed
-    first_hour: Vec<AtomicUsize>, // hour of the first line of each chunk, once the chunk has started
+    guess: bool, // finish hours early; false once the guess has failed
+    state: Vec<AtomicU32>,
     counts: Vec<AtomicU32>,
     dict: Dict,
     next_chunk: AtomicUsize,
-    done: Vec<AtomicBool>,
-    prefix: AtomicUsize, // chunks before this one are all done
     next_hour: AtomicUsize,
     bad: AtomicBool,
     /// Endpoints that occur in an hour summarised so far, and the same ones in the byte order of their names.
     seen: Mutex<(Vec<bool>, Vec<u16>)>,
-    /// Buffers for `summarise` that are not in use; only a few hours are summarised at a time.
-    spare: Mutex<Vec<Scratch>>,
     /// The summary file, the next hour to write to it, and the lines of the hours that wait for earlier ones.
     out: Mutex<(File, usize, Vec<Option<Vec<u8>>>)>,
 }
@@ -267,28 +246,22 @@ impl Job {
         let chunks = len.div_ceil(CHUNK);
         std::fs::create_dir_all(out).unwrap();
         // PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE: only the touched parts are backed.
-        let arena = unsafe { mmap(std::ptr::null_mut(), chunks * HOURS * REGION, 3, 0x4022, -1, 0) };
+        let arena = unsafe { mmap(std::ptr::null_mut(), chunks * HOURS * REGION, 3, 0x4022, -1, 0) } as usize;
+        let summary = File::create(format!("{out}/summary.txt")).unwrap();
         Job {
             input,
             len,
             chunks,
-            arena: arena as usize,
+            arena,
             guess,
-            first_hour: (0..chunks).map(|_| AtomicUsize::new(0)).collect(),
-            counts: (0..chunks * HOURS).map(|_| AtomicU32::new(0)).collect(),
+            state: zeros(chunks),
+            counts: zeros(chunks * HOURS),
             dict: Dict::new(),
             next_chunk: AtomicUsize::new(0),
-            done: (0..chunks).map(|_| AtomicBool::new(false)).collect(),
-            prefix: AtomicUsize::new(0),
             next_hour: AtomicUsize::new(0),
             bad: AtomicBool::new(false),
             seen: Mutex::new((vec![false; SLOTS], Vec::new())),
-            spare: Mutex::new(Vec::new()),
-            out: Mutex::new((
-                File::create(format!("{out}/summary.txt")).unwrap(),
-                0,
-                vec![None; HOURS],
-            )),
+            out: Mutex::new((summary, 0, vec![None; HOURS])),
         }
     }
 
@@ -304,13 +277,8 @@ impl Job {
         }
         let mut buf = [0u8; 256]; // longer than any line
         let n = (self.len - (i - 1)).min(buf.len());
-        self.input
-            .read_exact_at(&mut buf[..n], i as u64 - 1)
-            .unwrap();
-        buf[..n]
-            .iter()
-            .position(|&c| c == b'\n')
-            .map_or(self.len, |k| i + k)
+        self.input.read_exact_at(&mut buf[..n], i as u64 - 1).unwrap();
+        buf[..n].iter().position(|&c| c == 10).map_or(self.len, |k| i + k)
     }
 
     /// Parses chunk `c` through `buf`, which holds one block plus the bytes carried over from the previous one.
@@ -320,17 +288,15 @@ impl Job {
         let mut cur: [usize; HOURS] = std::array::from_fn(|h| self.region(h, c));
         loop {
             let n = (BLOCK - keep).min(hi - at);
-            self.input
-                .read_exact_at(&mut buf[keep..keep + n], at as u64)
-                .unwrap();
+            self.input.read_exact_at(&mut buf[keep..keep + n], at as u64).unwrap();
             if at == first && n > 0 {
                 let key = u64::from_le_bytes(buf[5..13].try_into().unwrap());
-                self.first_hour[c].store(hour_index(key), Relaxed);
+                self.state[c].store(1 + hour_index(key) as u32, Relaxed);
             }
             at += n;
             let (end, last) = (keep + n, at == hi);
             buf[end..end + SLACK].fill(0); // the parser may read past the last line
-                                           // SAFETY: lines starting before `lim` are complete and have SLACK readable bytes after their start.
+            // SAFETY: lines starting before `lim` are complete and have SLACK readable bytes after their start.
             let stop = unsafe {
                 let lim = buf.as_ptr().add(if last { end } else { end - SLACK });
                 scan(buf.as_ptr(), lim, &self.dict, &mut cur, &mut lo)
@@ -348,19 +314,15 @@ impl Job {
         if lo < self.next_hour.load(SeqCst) {
             self.bad.store(true, Relaxed);
         }
+        self.state[c].fetch_or(DONE, Release);
     }
 
     /// The next hour to summarise, if it can be done now: the hours before the guessed first hour of the chunks to come.
     fn claim_hour(&self) -> Option<usize> {
-        let mut p = self.prefix.load(Relaxed);
-        while p < self.chunks && self.done[p].load(Acquire) {
-            p += 1;
-        }
-        self.prefix.fetch_max(p, Relaxed);
-        let limit = match p == self.chunks {
-            true => HOURS,
-            false if self.guess => self.first_hour[p].load(Relaxed).saturating_sub(LAG),
-            false => 0,
+        let limit = match self.state.iter().position(|s| s.load(Acquire) & DONE == 0) {
+            None => HOURS,
+            Some(p) if self.guess => (self.state[p].load(Relaxed) as usize & 0xFF).saturating_sub(1 + LAG),
+            Some(_) => 0,
         };
         let h = self.next_hour.load(SeqCst);
         (h < limit && self.next_hour.compare_exchange(h, h + 1, SeqCst, SeqCst).is_ok()).then_some(h)
@@ -371,9 +333,8 @@ impl Job {
         let mut guard = self.seen.lock().unwrap();
         let (seen, order) = &mut *guard;
         let before = order.len();
-        for id in 0..counts.len() {
-            if counts[id] != 0 && !seen[id] {
-                seen[id] = true;
+        for id in (0..counts.len()).filter(|&id| counts[id] != 0) {
+            if !std::mem::replace(&mut seen[id], true) {
                 order.push(id as u16);
             }
         }
@@ -392,14 +353,12 @@ impl Job {
             })
             .collect();
         let Scratch { counts, starts, values } = scratch;
-        let total: usize = regions.iter().map(|r| r.1).sum();
+        let total = regions.iter().map(|r| r.1).sum();
         if values.len() < total {
             values.resize(total, 0);
         }
-        each_record(&regions, |key, _| {
-            counts[(key & 0x7FF) as usize] += 1 + ((key as u64 >> 11) << 32)
-        });
-        let order = self.endpoint_order(&counts[..self.dict.next.load(Relaxed) as usize]);
+        each_record(&regions, |key, _| counts[(key & 0x7FF) as usize] += 1 + ((key as u64 >> 11) << 32));
+        let order = self.endpoint_order(&counts[..*self.dict.count.lock().unwrap()]);
         let mut sum = 0;
         for &id in &order {
             starts[id as usize] = sum;
@@ -452,20 +411,14 @@ impl Job {
 
     fn work(&self) {
         let mut buf = vec![0u8; BLOCK + SLACK];
+        let mut scratch = Scratch { counts: vec![0; SLOTS], starts: vec![0; SLOTS], ..Default::default() };
         while self.next_hour.load(SeqCst) < HOURS {
             let c = self.next_chunk.fetch_add(1, Relaxed);
             if c < self.chunks {
                 self.parse_chunk(c, &mut buf);
-                self.done[c].store(true, Release);
             }
             while let Some(h) = self.claim_hour() {
-                let mut scratch = self.spare.lock().unwrap().pop().unwrap_or_else(|| Scratch {
-                    counts: vec![0; SLOTS],
-                    starts: vec![0; SLOTS],
-                    values: Vec::new(),
-                });
                 let lines = self.summarise(h, &mut scratch);
-                self.spare.lock().unwrap().push(scratch);
                 self.publish(h, lines);
             }
             if c >= self.chunks {
@@ -510,19 +463,15 @@ fn number(out: &mut Vec<u8>, mut v: u64) {
 }
 
 fn main() {
-    // PR_SET_THP_DISABLE: the records are sparse, so with transparent huge pages every touched 2 MiB would be backed.
-    unsafe { prctl(41, 1u64, 0u64, 0u64, 0u64) };
-    // M_MMAP_THRESHOLD, fixed: the output buffers of the hours are returned when freed instead of piling up in malloc arenas.
-    unsafe { mallopt(-3, 1 << 16) };
-    let (mut data, mut out) = ("/data".to_string(), "/out".to_string());
-    let mut args = std::env::args().skip(1);
-    while let Some(a) = args.next() {
-        match a.as_str() {
-            "--data" => data = args.next().unwrap(),
-            "--out" => out = args.next().unwrap(),
-            _ => {}
-        }
+    unsafe {
+        // PR_SET_THP_DISABLE: the records are sparse, so with transparent huge pages every touched 2 MiB would be backed.
+        prctl(41, 1u64, 0u64, 0u64, 0u64);
+        // M_MMAP_THRESHOLD, fixed: the buffers of the hours are returned when freed instead of piling up in malloc arenas.
+        mallopt(-3, 1 << 16);
     }
+    let args: Vec<String> = std::env::args().collect();
+    let arg = |name: &str, default: &str| args.iter().position(|a| a == name).map_or(default, |i| &args[i + 1]).to_string();
+    let (data, out) = (arg("--data", "/data"), arg("--out", "/out"));
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
     // The first pass ends the process unless a chunk found the guess wrong.
     for guess in [true, false] {
