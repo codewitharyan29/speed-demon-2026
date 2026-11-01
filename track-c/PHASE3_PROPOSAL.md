@@ -106,3 +106,13 @@ Source sha256 `<see commit>`, S 630.
   prefetch is consistent; the latency gain it targets cannot show without SMT.
 * **Stopped before the board run**: the approved conditions say to reject a meaningful local regression; the board run needs a
   separate decision.
+
+**P1 decision: rejected without a board run (user decision, Nov 1).** Source sha256 `bb00a90822320a7e...`. Reasoning:
+1. The dependent tag-to-entry step P1 removes exists locally too, and locally lookups are memory-bound (about 2x CPU at 4 threads
+   versus 1). P1 still got slower there, so the step is most likely already hidden: `warm()` prefetches the entry one batch
+   (about 16 records, about 1 µs) ahead, far more than an L3 miss takes.
+2. P1 adds 3.32 M requests, about 40% wasted (displaced names) and about 60% duplicating `warm()`'s request. On the board two
+   SMT threads share each core's outstanding-request slots, so extra requests cost more there, not less. No counter data exists
+   (no PMU in the VM, no `perf`).
+3. Local-to-board ratios seen before (R2 -8% local, about 0 on the board; Candidate A +23% local, about +6% on the board)
+   suggest 0 to +1 ms on the board: inside the board's noise, so low information value, and low odds of a clear gain.
