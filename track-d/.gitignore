@@ -1,1 +1,7 @@
 target/
+
+# Old Rust solution, kept locally until deleted (the board counts every source file in the track folder)
+src/main.rs
+Cargo.toml
+Cargo.lock
+.cargo/
