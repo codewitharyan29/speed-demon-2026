@@ -33,6 +33,7 @@ They are only used to compare variants, never reported as results.
 | 22 | Spare bitset row (every token sets a bit; one condition left in the bookkeeping) and a tokeniser with one step per token | b8b05c6 | 0.182 | 41 | 72.380 (K 28.03, 749 lines) |
 | 23 | A list term's pair written without a branch (every token stamps and writes; the count moves by 0 or 1) | 84edbf2 | 0.182 | 62 | 70.904 (K 26.19, 750 lines); reverted |
 | 25 | Bitset rows stored in BOOL queries (one random read less per operand in the evaluation) | 7341f08, 90ca9fe | 0.185, 0.180 | 40 | 72.499 (K 28.18, 758 lines) |
+| 26 | Evaluation operands prefetched a few queries ahead | c274b3a, a24571d | 0.187, 0.193 | 40 | 71.70 (K 27.53, 772 lines); reverted |
 
 ## Local measurements behind step 2 (in-process ms, median)
 
@@ -513,3 +514,5 @@ starts are in cache by then) its postings, so the evaluation's dependent random 
 noise (12 threads 147 -> 161, +14 lines); judged on the board over two runs against step 25's 0.185 and 0.180 s.
 
 Run 1 (c274b3a, run-919e05d93317): 0.1872 s, 40 MB, K 27.53.
+Run 2 (a24571d, run-2f094248e91e): 0.1925 s. Both runs slower than step 25's (0.185, 0.180) for +14 lines: reverted to the
+step-25 code.
