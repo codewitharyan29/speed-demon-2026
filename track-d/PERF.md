@@ -22,7 +22,7 @@ They are noisy in absolute terms (a Windows laptop VM, not the scoring box) and 
 | 12 | Summary-Bitmap `clear()` in `PoolDial`, unaligned 64-bit bounds load, 256 KB thread stack size, query pre-filtering & malloc_trim, line compaction | c5c2c96 | 0.246 | 75 | 63.471 (K 18.60, 687 lines) |
 | 13 | Zero-order memory scatter, unified sequential renumbering, kernel MADV_SEQUENTIAL readahead, Worker context bundling (-127 lines) | 686f5be | 0.283 | 85 | 62.083 (K 17.44, 561 lines) |
 | 14 | Disjoint sequential streaming scatter, 256 KB worker thread stacks, sliding-window neighbor LFB prefetch, drop MADV_SEQUENTIAL | 061ec57 | 0.281 | 74 | 62.576 (K 17.85, 592 lines) |
-| 15 | Plain store prefix sum 0 (no locked XCHG), eliminate inner-loop LFB prefetch, unchecked line parsing, drop unmap_file syscalls (-28 lines) | pending | | | |
+| 15 | Plain store prefix sum 0 (no locked XCHG), eliminate inner-loop LFB prefetch, unchecked line parsing, drop unmap_file syscalls (-28 lines) | 9af42e6 | 0.245 | 76 | 64.159 (K 19.20, 564 lines) |
 
 ## Local measurements behind step 2 (full data, in-process ms, 12 CPUs)
 
