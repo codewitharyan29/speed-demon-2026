@@ -25,7 +25,8 @@ They are only used to compare variants, never reported as results.
 | 13 | Board experiment: scan table on 2 MB pages (2 MB-aligned, `MADV_HUGEPAGE`, exactly 4 MB with wrap-around spills) | 1e99e80 | 0.253 | 45 | 68.421 (K 23.36, 812 lines); reverted |
 | 14 | Board experiment: tokens looked up 16 at a time instead of 48 (the box has 16 L1D fill buffers per core, shared by two threads) | 6f0f6e7 | 0.262 | 45 | 68.055 (K 22.97, 805 lines); reverted to 48 |
 | 15 | Phrases checked on each document's term-id sequence at their rarest term (no pair postings, bloom filter or re-tokenising) | cc9739a | 0.248 | 42 | 69.006 (K 24.00, 755 lines) |
-| 17 | 60 chunks instead of 64: five per thread, no idle tail | pending | | | |
+| 17 | 60 chunks instead of 64: five per thread, no idle tail | 6921432 | 0.242 | 43 | 69.285 (K 24.31, 755 lines) |
+| 18 | Less single-threaded work: queries parsed in 12 pieces at once, no rebuild of the term table, a 1% sample | pending | | | |
 
 ## Local measurements behind step 2 (in-process ms, median)
 
@@ -358,4 +359,20 @@ no change. 60 chunks: five each, and fewer chunks to evaluate every query on.
 | 72 | 172 | 37 MB |
 | 48 | 170 | 44 MB |
 
-60 chunks: verified on full seeds 1 and 2, sample seeds 1-3, tiny seeds 1-6 and the worked example. Board: pending.
+60 chunks: verified on full seeds 1 and 2, sample seeds 1-3, tiny seeds 1-6 and the worked example. Board: 0.248 -> 0.242 s.
+
+## Step 18: the single-threaded parts (local, in-process ms)
+
+Phases of the step-17 code (one thread unless stated): query parse 7.3, term numbering 5.9, building the query list
+and rebuilding the term table 3.1, sample 5.4 (12 threads), df sums, triggers, the probe table and the accumulators
+4.7, chunks 119 (12 threads), formatting and writing 2.8. So ~24 ms of ~148 run on one thread; at the box's fixed
+2.5 GHz (against ~4.5 GHz turbo here) that is likely ~45 ms of its 242.
+
+| Change | Queries parsed by (ms) | Setup done by (ms) | 12 threads (median of 11) | Verdict |
+|---|---|---|---|---|
+| Step-17 code | 15.9-19.1 | 25.1-30.2 | 163 | |
+| Queries parsed in 12 line-aligned pieces at once (numbering walks the pieces in order); no rebuild of the term table (it only serves the sample and tokens over 16 bytes; +1 MB) | 10.9-13.0 | 19.9-24.1 | 159 | kept |
+| + output formatted in 12 pieces at once | | | 163 | rejected: no gain (thread start-up eats the 3 ms) |
+| + a 1% sample instead of 2% (only steers bitset and trigger choices) | 11.3-12.6 | 19.2-20.4 | 158 | kept |
+
+Verified on full seeds 1 and 2, sample seeds 1-3, tiny seeds 1-6 and the worked example; `memory.peak` 40 MB local; +1 line.

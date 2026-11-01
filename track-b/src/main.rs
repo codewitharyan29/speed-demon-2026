@@ -316,16 +316,6 @@ impl<K: PartialEq + Copy> Table<K> {
         }
     }
 
-    /// Rebuilds the table at three times the number of keys it holds, so lookups touch less memory.
-    fn shrink(&mut self, hash: impl Fn(&K) -> u64) {
-        self.bits = (self.keys.len() * 3).next_power_of_two().trailing_zeros();
-        self.slots = vec![0; 1 << self.bits];
-        for id in 0..self.keys.len() {
-            let slot = self.find(hash(&self.keys[id]), &self.keys[id]).unwrap_err();
-            self.slots[slot] = id as u32 + 1;
-        }
-    }
-
     /// Asks for the cache line of the slot where a key with hash `h` would be looked for.
     fn prefetch(&self, h: u64) {
         let slot = self
@@ -555,6 +545,18 @@ struct Chunk {
     run: Run,
 }
 
+/// Boundary i of n equal parts of `b`, moved to the start of the next line.
+fn cut(b: &[u8], i: usize, n: usize) -> usize {
+    match i {
+        0 => 0,
+        _ if i == n => b.len(),
+        _ => {
+            let at = (b.len() * i / n).saturating_sub(1);
+            at + b[at..].iter().position(|&c| c == b'\n').unwrap() + 1
+        }
+    }
+}
+
 fn put(out: &mut Vec<u8>, mut x: u64) {
     let mut buf = [0u8; 20];
     let mut i = 20;
@@ -570,41 +572,49 @@ fn put(out: &mut Vec<u8>, mut x: u64) {
 }
 
 fn main() {
-    // Parse every query; the keys of all terms go into one list. They are read from the whole mapped file, so that
-    // the eight-byte loads never run off the end of a short slice.
+    // Parse every query, in line-aligned pieces at once; the keys of each piece's terms go into one list. They are read
+    // from the whole mapped file, so that the eight-byte loads never run off the end of a short slice.
     let q = map("/data/queries.txt");
-    let mut keys: Vec<[u64; 4]> = Vec::new();
-    let shapes: Vec<(bool, usize, Few<u8, 8>)> = q
-        .split(|&c| c == b'\n')
-        .filter(|l| !l.is_empty())
-        .map(|line| {
-            let mut parts = line.split(|&c| c == b' ');
-            let phrase = parts.next().unwrap() == b"PHRASE";
-            let (mut ops, before) = (Vec::new(), keys.len());
-            for (k, w) in parts.enumerate() {
-                if !phrase && k % 2 == 1 {
-                    ops.push(w[0]);
-                } else {
-                    let w = w.strip_prefix(b"\"").unwrap_or(w);
-                    let w = w.strip_suffix(b"\"").unwrap_or(w);
-                    keys.push(key(q, w.as_ptr() as usize - q.as_ptr() as usize, w.len()));
-                }
-            }
-            (phrase, keys.len() - before, Few::new(&ops))
-        })
-        .collect();
+    let mut pieces = par(
+        THREADS,
+        || (),
+        |_, j| {
+            let mut keys: Vec<[u64; 4]> = Vec::new();
+            let lines = q[cut(q, j, THREADS)..cut(q, j + 1, THREADS)].split(|&c| c == b'\n');
+            let shapes: Vec<(bool, usize, Few<u8, 8>)> = (lines.filter(|l| !l.is_empty()))
+                .map(|line| {
+                    let mut parts = line.split(|&c| c == b' ');
+                    let phrase = parts.next().unwrap() == b"PHRASE";
+                    let (mut ops, before) = (Vec::new(), keys.len());
+                    for (k, w) in parts.enumerate() {
+                        if !phrase && k % 2 == 1 {
+                            ops.push(w[0]);
+                        } else {
+                            let w = w.strip_prefix(b"\"").unwrap_or(w);
+                            let w = w.strip_suffix(b"\"").unwrap_or(w);
+                            keys.push(key(q, w.as_ptr() as usize - q.as_ptr() as usize, w.len()));
+                        }
+                    }
+                    (phrase, keys.len() - before, Few::new(&ops))
+                })
+                .collect();
+            (j, keys, shapes)
+        },
+    );
+    pieces.sort_unstable_by_key(|piece| piece.0);
 
     // Number the terms, sixteen at a time: the table slots of a batch are fetched together, so their cache misses
     // overlap. `used` says how a term is used: bit 0 in a BOOL query (needs a posting list), bit 2 in a phrase; bit 1,
     // set later, if it triggers phrase checks.
-    let (mut terms, mut ids) = (Table::new(keys.len()), Vec::new());
-    for batch in keys.chunks(16) {
+    let all = pieces.iter().map(|piece| piece.1.len()).sum();
+    let (mut terms, mut ids) = (Table::new(all), Vec::new());
+    for batch in pieces.iter().flat_map(|piece| piece.1.chunks(16)) {
         batch.iter().for_each(|k| terms.prefetch(hash(k)));
         ids.extend(batch.iter().map(|&k| terms.intern(hash(&k), k)));
     }
     let (mut used, mut at) = (vec![0u8; terms.keys.len()], 0);
-    let queries: Vec<Query> = (shapes.into_iter())
-        .map(|(phrase, n, ops)| {
+    let queries: Vec<Query> = (pieces.iter().flat_map(|piece| &piece.2))
+        .map(|&(phrase, n, ops)| {
             let t = &ids[at..at + n];
             at += n;
             t.iter()
@@ -616,23 +626,13 @@ fn main() {
             }
         })
         .collect();
-    drop((keys, ids));
-    terms.shrink(hash);
+    drop((pieces, ids));
     let nterms = terms.keys.len();
 
     // Scan the corpus in newline-aligned chunks. A chunk yields (term, doc) pairs for the query terms only,
     // each once per document, in document order, plus the byte offset of each of its documents. The first token
     // of a line is the document id.
     let docs = map("/data/docs.txt");
-    // Boundary i of n equal parts of the file, moved to the start of the next line.
-    let cut = |i: usize, n: usize| match i {
-        0 => 0,
-        _ if i == n => docs.len(),
-        _ => {
-            let at = (docs.len() * i / n).saturating_sub(1);
-            at + docs[at..].iter().position(|&c| c == b'\n').unwrap() + 1
-        }
-    };
     // The id at the start of a line, which is also its number.
     let first_doc = |at: usize| {
         let digits = docs[at..].iter().take_while(|c| c.is_ascii_digit());
@@ -644,13 +644,13 @@ fn main() {
     let n_docs = first_doc(last_line) as usize + 1;
 
     // Terms in over 1/32 of the documents are kept as bitsets (a list that long would not be smaller), the rest as
-    // lists. The first 12/576 of the corpus is a good enough sample to choose; a wrong guess only costs speed.
+    // lists. The first 12/1152 of the corpus is a good enough sample to choose; a wrong guess only costs speed.
     const SAMPLE: usize = 12;
     let sampled = par(
         SAMPLE,
         || vec![0u32; nterms],
         |stamp, j| {
-            let range = (cut(j, 48 * SAMPLE), cut(j + 1, 48 * SAMPLE));
+            let range = (cut(docs, j, 96 * SAMPLE), cut(docs, j + 1, 96 * SAMPLE));
             let (mut lines, mut df) = (Vec::new(), vec![0u32; nterms]);
             scan(docs, range, first_doc(range.0), true, &mut lines, |batch| {
                 for t in batch.iter().filter(|t| t.len <= 32) {
@@ -732,7 +732,7 @@ fn main() {
     // The ten smallest ids of each query so far, and in the eleventh slot how many of the ten there are.
     let first: Vec<Mutex<[u32; 11]>> = (0..queries.len()).map(|_| Mutex::new([0; 11])).collect();
     par(CHUNKS, Chunk::default, |w, c| {
-        let range = (cut(c, CHUNKS), cut(c + 1, CHUNKS));
+        let range = (cut(docs, c, CHUNKS), cut(docs, c + 1, CHUNKS));
         let base = first_doc(range.0);
         let end = if range.1 == docs.len() {
             n_docs as u32
