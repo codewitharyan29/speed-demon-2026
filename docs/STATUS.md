@@ -2,7 +2,7 @@
 
 Updated: 2026-11-01 (code freeze: 2026-11-02 15:00 UTC).
 
-* Best verified commit: **647e26f** (tag `tc-good-4`), board run **run-10dbb3692f36**: T 47.56 ms, M 14.4 MB, S 606, D 1, **K 25.70** (previous: 95582d0, run-c30f1d80a49f, K 24.05).
+* Best verified commit: **9fb5c93** (tag `tc-good-6`), board run **run-99e4e3237a66**: T 36.59 ms, M 13.5 MB, S 629, D 1, **K 29.52** (before: 647e26f K 25.70; A 75bd0cd K 28.36).
   Baseline K 9.07 (`tc-baseline`). Leaders K 41-47 (docs/COMPETITORS.md). Board noise for identical code: T 52.6-55.8 ms.
 * Correctness (local, Docker, reference = official `reference/c_join.py`): full seeds 1-5, sample 2-10, tiny 1-30, adversarial file,
   hostile-LF files (fallback fires) at five chunk sizes; thread count forced to 3, 5, 12, 24 and by cpuset 1/2/4/8: same hash.
