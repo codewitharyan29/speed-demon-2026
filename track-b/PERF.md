@@ -501,3 +501,5 @@ On the box the per-chunk BOOL evaluation waits on memory (it is ~6% of the instr
 threads' chunk buffers (~2.2 MB) do not fit their shared 1.25 MB L2. Storing a bitset term's row in the query (top bit
 set) removes the `dense_of` read from every such operand. Locally within noise (12 threads 153 -> 147, +9 lines);
 judged on the board over two runs against the step-22 code's 0.182 s (and 0.208 s on its second run).
+
+Run 1 (7341f08, run-18820662088c): 0.1851 s, 40 MB, K 27.76.
