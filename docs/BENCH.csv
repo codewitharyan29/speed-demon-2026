@@ -24,3 +24,4 @@ board,46829d6,run-a3e9f05bd3dc,36.09,13.3,656,29.63,"R2 (cloud): no gain over B,
 board,80abb30,run-c79ae56cc4c1,38.51,13.2,608,29.05,"candidate A of the cloud session: worse than B, reverted"
 board,6ec50ad,run-50cc84be09bb,36.34,13.9,494,30.54,"Track C in C++ (first version)"
 board,4452f30,run-c6a876ca3df0,35.47,13.95,434,31.51,"C++ cx3 compact rewrite (best)"
+board,66693b1,run-ce3a1da5b3de,34.51,14.14,432,31.88,"C++ cx5: distinct names counted when the bit is first set (best)"

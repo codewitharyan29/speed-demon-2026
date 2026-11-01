@@ -2,7 +2,7 @@
 
 Updated: 2026-11-01 (code freeze: 2026-11-02 15:00 UTC).
 
-* Best verified commit: **4452f30** (tag `tc-good-7`; C++ rewrite cx3 by the cloud session), board run **run-c6a876ca3df0**: T 35.47 ms, M 13.95 MB, S 434, D 1, **K 31.51**. Earlier: Rust candidate B 9fb5c93 (K 29.29-29.76, tag `tc-good-6`), first C++ 6ec50ad (run-50cc84be09bb, K 30.54).
+* Best verified commit: **66693b1** (tag `tc-good-8`; C++ cx5 by the cloud session), board run **run-ce3a1da5b3de**: T 34.51 ms, M 14.14 MB, S 432, D 1, **K 31.88**. Earlier: cx3 4452f30 (run-c6a876ca3df0, K 31.51), first C++ 6ec50ad (K 30.54), Rust candidate B 9fb5c93 (K 29.29-29.76). Recovery points: 4452f30, 4e11c91 (Rust).
   Baseline K 9.07 (`tc-baseline`). Leaders K 41-47 (docs/COMPETITORS.md). Board noise for identical code: T 52.6-55.8 ms.
 * Correctness (local, Docker, reference = official `reference/c_join.py`): full seeds 1-5, sample 2-10, tiny 1-30, adversarial file,
   hostile-LF files (fallback fires) at five chunk sizes; thread count forced to 3, 5, 12, 24 and by cpuset 1/2/4/8: same hash.
