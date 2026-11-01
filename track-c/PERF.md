@@ -32,10 +32,12 @@ D = 1 throughout (no dependencies). Output hash on every row below: the board's 
 | 16 | f8c5b1c | source of row 12 again (repeat) | run-7d972f222c6a | 52.9 | 16.2 | 604 | 23.73 |
 | 17 | 704be8c | region table only as lazily zeroed pages, 48 pieces | run-2a43e35c614d | 53.16 | 16.3 | 608 | 23.70 |
 | 18 | c0a86ae | source of row 12 once more (final HEAD) | run-df1808806b72 | 55.77 | 16.4 | 604 | 23.14 |
+| 19 | 5586502 | name slots as u32 (tag above the id bits): 1 MB instead of 2 MB | run-8836fdcebdbb | 55.81 | 15.3 | 606 | 23.44 |
+| 20 | 95582d0 | branch-free name comparison (`word`), entry found while warming used as a hint | run-c30f1d80a49f | 52.85 | 15.5 | 605 | **24.05** |
 
 Kept: 1, 3, 4, 7, 8, 10, 12 (13-15 reverted: 64 KiB blocks and eagerly written zeros are the best measured). Rejected or reverted: 2 (equal to 1 within noise, kept for the instruction counts it enabled), 6 (alone: M
 37.5 MB until THP was disabled, then kept as part of 7), 9 (fewer instructions but 2.1 ms slower on the board, cause not found), 11. Rows 5 and 16 show the board's run-to-run noise: 0.04% on one pair, 6% (52.6, 52.9 and 55.8 ms for the same source, rows 12, 16, 18) on the other, so differences below about 3 ms are not distinguishable.
-Rows 16-17 are not improvements; the final source is the one of row 12.
+Row 19: M fell by 0.9 MB as expected, T is inside the noise (52.6-55.8 ms for identical code). Row 20 is the final source; its T is inside the noise of row 12 too, so its gain is the 0.7 MB of M and a lower misprediction count (cachegrind on the full file: 10.0 M to 5.4 M mispredicts, ~1,250 M instructions), not a measured T gain. Rows 16-17 are not improvements; the final source is the one of row 12.
 
 ## Board diagnostics (labelled; they print wrong output on purpose, T and M are still reported)
 
@@ -77,3 +79,11 @@ faults on the 10 MB table) is therefore untested; the memory risk made it not wo
   diagnostic above did not isolate it.
 * One persistent thread pool and barriers instead of three `thread::scope`s (36 spawns): about 1 ms.
 * A region table of bytes instead of 16-bit codes: 1 MB of M.
+
+## Session 3 (local only, no board runs): what was tried and rejected
+
+* Transparent huge pages for the tables (`prctl` removed, THP `always` in the VM): no faster (median 200 vs 187 ms on the VM) and M 22.8 vs 15.0 MB. Rejected.
+* 2^19 slots (load 0.19 instead of 0.38): slower (179 vs 172 ms) and +1.2 MB. Rejected.
+* The process floor was already read from the board (run-8c4eea5206b0: exit at the top of `main`, T 0.72 ms, M 8.14 MB; run-914f499201c3: after the region table 3.54 ms). A static / no_std / raw-syscall start can therefore save at most about 0.7 ms (1.4% of T) and costs lines; not pursued.
+* Not done: partitioning the name space across workers (needs a bounded-round record exchange; local VM has 4 MB of L3 against the board's 24 MB, so it cannot rank the idea); a persistent thread pool (about 1 ms).
+* Tools: `tools/c_memcheck.sh` (debug assertions + overflow checks + valgrind memcheck; Rust sanitizers need nightly, not in the offline image) and `tools/c_ab.sh` (interleaved timing + memory.peak).
