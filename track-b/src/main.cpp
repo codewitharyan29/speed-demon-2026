@@ -660,8 +660,6 @@ void worker(int tid) {
   g_bar.arrive_and_wait();
   PH(6)
 
-  if (tid == 0) _exit(0);  // DIAGNOSTIC DA: stop after the startup
-  for (;;) pause();
   // ---- The scan: chunks of whole lines, each indexed and answered on its own.
   free(w.df);
   w.df = nullptr;
