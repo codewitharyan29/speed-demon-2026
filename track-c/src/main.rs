@@ -378,7 +378,8 @@ fn resolve(c: &Ctx, batch: &mut Batch, aggs: &mut [Agg]) {
     for r in &batch.recs[..batch.n] {
         let country = c.region.get(r.region as usize).map_or(0, |x| x.load(Relaxed)) as usize;
         // SAFETY: the name has 32 readable bytes after it, as `record` ensured.
-
+        let name = unsafe { c.names.entry(r.name, r.len as usize, r.hash, r.hint) };
+        name.mask[country / 64].fetch_or(1 << (country % 64), Relaxed);
         let a = &mut aggs[country];
         a.count += 1;
         a.id_sum += r.id;
@@ -425,7 +426,7 @@ fn parse_chunk(c: &Ctx, lo: usize, hi: usize, aggs: &mut [Agg], w: &mut Worker) 
                 // The batch before this one has had the slots of its names prefetched while this one was parsed: look at
                 // them now, and prefetch the entries. The batch before that has had its entries prefetched: resolve it.
                 let w = &mut batches[(now + 2) % 3];
-                w.recs[..w.n].iter_mut().for_each(|r| r.hint = 0);
+                w.recs[..w.n].iter_mut().for_each(|r| r.hint = c.names.warm(r.hash));
                 resolve(c, &mut batches[(now + 1) % 3], aggs);
                 now = (now + 1) % 3;
             }
@@ -433,7 +434,7 @@ fn parse_chunk(c: &Ctx, lo: usize, hi: usize, aggs: &mut [Agg], w: &mut Worker) 
         for k in [1, 2, 0] {
             // before the buffer changes
             let b = &mut batches[(now + k) % 3];
-            b.recs[..b.n].iter_mut().for_each(|r| r.hint = 0);
+            b.recs[..b.n].iter_mut().for_each(|r| r.hint = c.names.warm(r.hash));
             resolve(c, b, aggs);
         }
         if last {
