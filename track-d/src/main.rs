@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::{
     __m256i, _mm256_cmpgt_epi8, _mm256_loadu_si256, _mm256_movemask_epi8, _mm256_set1_epi8,
+    _mm_prefetch, _MM_HINT_T0,
 };
 
 const THREADS: usize = 12;
@@ -30,11 +31,7 @@ fn map_file(path: &str) -> (&'static [u8], usize, i32) {
     let (len, fd) = (f.metadata().unwrap().len() as usize, f.as_raw_fd());
     std::mem::forget(f);
     let ptr = unsafe { mmap(std::ptr::null_mut(), len, 1, 2, fd, 0) };
-    unsafe {
-        madvise(ptr, len, 2);
-        posix_fadvise(fd, 0, len as i64, 2);
-        (std::slice::from_raw_parts(ptr, len), len, fd)
-    }
+    (unsafe { std::slice::from_raw_parts(ptr, len) }, len, fd)
 }
 
 #[cfg(unix)]
@@ -112,17 +109,20 @@ fn par<R: Send>(jobs: usize, f: impl Fn(usize) -> R + Sync) -> Vec<R> {
     let mut all: Vec<(usize, R)> = std::thread::scope(|sc| {
         let h: Vec<_> = (0..THREADS)
             .map(|_| {
-                sc.spawn(|| {
-                    let mut got = Vec::new();
-                    loop {
-                        let j = next.fetch_add(1, Relaxed);
-                        if j >= jobs {
-                            break;
+                std::thread::Builder::new()
+                    .stack_size(256 * 1024)
+                    .spawn_scoped(sc, || {
+                        let mut got = Vec::new();
+                        loop {
+                            let j = next.fetch_add(1, Relaxed);
+                            if j >= jobs {
+                                break;
+                            }
+                            got.push((j, f(j)));
                         }
-                        got.push((j, f(j)));
-                    }
-                    got
-                })
+                        got
+                    })
+                    .unwrap()
             })
             .collect();
         h.into_iter().flat_map(|w| w.join().unwrap()).collect()
@@ -148,7 +148,7 @@ impl PoolDial {
             head: [u32::MAX; WINDOW],
             bitmap: [0u64; WINDOW / 64],
             summary: 0,
-            pool: Vec::with_capacity(8192),
+            pool: Vec::with_capacity(16384),
             free_head: u32::MAX,
             at: 0,
             len: 0,
@@ -280,6 +280,11 @@ unsafe fn search_fast(g: &Graph, s: u32, t: u32, w: &mut Worker) -> i64 {
         let pair = (g.start.as_ptr().add(u as usize) as *const u64).read_unaligned();
         let (es, ee) = (pair as u32 as usize, (pair >> 32) as usize);
         for ei in es..ee {
+            #[cfg(target_arch = "x86_64")]
+            if ei + 1 < ee {
+                let nv = (*g.adj.get_unchecked(ei + 1) >> 11) as usize;
+                _mm_prefetch(w.dist.as_ptr().add(nv) as *const i8, _MM_HINT_T0);
+            }
             let entry = *g.adj.get_unchecked(ei);
             let (v, mut wt) = ((entry >> 11) as usize, entry & 0x7FF);
             if wt == 0x7FF {
@@ -331,6 +336,11 @@ unsafe fn search_wide(g: &Graph, s: u32, t: u32, w: &mut Worker) -> i64 {
         let pair = (g.start.as_ptr().add(u as usize) as *const u64).read_unaligned();
         let (es, ee) = (pair as u32 as usize, (pair >> 32) as usize);
         for ei in es..ee {
+            #[cfg(target_arch = "x86_64")]
+            if ei + 1 < ee {
+                let nv = (*g.adj.get_unchecked(ei + 1) >> 11) as usize;
+                _mm_prefetch(w.dist.as_ptr().add(nv) as *const i8, _MM_HINT_T0);
+            }
             let entry = *g.adj.get_unchecked(ei);
             let (v, mut wt) = ((entry >> 11) as usize, (entry & 0x7FF) as u64);
             if wt == 0x7FF {
@@ -467,36 +477,58 @@ fn main() {
     drop(claimed);
 
     let (mut new_id, mut first) = (vec![0u32; n], vec![0u32; n + 1]);
+    let (nid_ptr, f_ptr) = (new_id.as_mut_ptr() as usize, first.as_mut_ptr() as usize);
+
+    par(THREADS, |t| {
+        let (i_start, i_end) = (t * n / THREADS, (t + 1) * n / THREADS);
+        let (nid, f) = (nid_ptr as *mut u32, f_ptr as *mut u32);
+        for i in i_start..i_end {
+            let u = order[i] as usize;
+            unsafe {
+                *nid.add(u) = i as u32;
+                *f.add(i + 1) = start0[u + 1] - start0[u];
+            }
+        }
+    });
+
     for i in 0..n {
-        let u = order[i] as usize;
-        new_id[u] = i as u32;
-        first[i + 1] = first[i] + (start0[u + 1] - start0[u]);
+        first[i + 1] += first[i];
     }
-    drop(order);
 
     let mut adj = vec![0u32; m];
     let adj_ptr = adj.as_mut_ptr() as usize;
 
-    let of_threads = par(CHUNKS, |c| {
-        let (u_start, u_end) = (c * n / CHUNKS, (c + 1) * n / CHUNKS);
+    let of_threads = par(THREADS, |t| {
+        let (i_start, i_end) = (t * n / THREADS, (t + 1) * n / THREADS);
         let out_adj = adj_ptr as *mut u32;
+        let mut out_idx = first[i_start] as usize;
         let mut local_of = Vec::new();
 
-        for old_u in u_start..u_end {
-            let new_u = new_id[old_u] as usize;
-            let out_base = first[new_u] as usize;
+        for i in i_start..i_end {
+            #[cfg(target_arch = "x86_64")]
+            if i + 8 < i_end {
+                let next_u = order[i + 8] as usize;
+                unsafe {
+                    _mm_prefetch(start0.as_ptr().add(next_u) as *const i8, _MM_HINT_T0);
+                    _mm_prefetch(
+                        edges0.as_ptr().add(*start0.get_unchecked(next_u) as usize) as *const i8,
+                        _MM_HINT_T0,
+                    );
+                }
+            }
+            let old_u = order[i] as usize;
             let (s, e) = (start0[old_u] as usize, start0[old_u + 1] as usize);
             for old_idx in s..e {
                 let entry = edges0[old_idx];
                 let (old_v, w) = ((entry >> 11) as usize, entry & 0x7FF);
                 let nv = new_id[old_v];
-                let out_idx = out_base + (old_idx - s);
                 unsafe {
                     *out_adj.add(out_idx) = (nv << 11) | w;
                 }
                 if w == 0x7FF {
                     local_of.push((out_idx as u32, lookup_overflow(&overflow0, old_idx as u32)));
                 }
+                out_idx += 1;
             }
         }
         local_of
@@ -504,6 +536,7 @@ fn main() {
 
     drop(edges0);
     drop(start0);
+    drop(order);
     drop(overflow0);
 
     let mut overflow: Vec<(u32, u64)> = of_threads.into_iter().flatten().collect();
@@ -555,7 +588,7 @@ fn main() {
                     let mut w = Worker {
                         dist: vec![0u16; n],
                         wide: Vec::new(),
-                        touched: Vec::with_capacity(32768),
+                        touched: Vec::with_capacity(65536),
                         heap: PoolDial::new(),
                     };
                     let ans_out = ans_ptr as *mut i64;
