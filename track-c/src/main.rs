@@ -82,17 +82,19 @@ impl Names {
         &self.slots[h as usize & (self.slots.len() - 1)]
     }
 
-    /// Fetches, for writing, the entry that a later `entry` call for hash `h` will most likely look at.
-    fn warm(&self, h: u64) {
+    /// Fetches, for writing, the entry that a later `entry` call for hash `h` will most likely look at; returns its id + 1
+    /// (0: none yet), which `entry` takes as a hint.
+    fn warm(&self, h: u64) -> u32 {
         let mut i = h as usize & (self.slots.len() - 1);
         loop {
-            let v = self.slots[i].load(Relaxed);
+            let v = self.slots[i].load(Acquire);
             if v == 0 {
-                return;
+                return 0;
             }
             if v & !self.idmask == (h >> 32) as u32 & !self.idmask {
                 // SAFETY: prefetching has no effect on correctness, whatever the address.
-                return unsafe { _mm_prefetch::<_MM_HINT_ET0>(&self.entries[(v & self.idmask) as usize - 1] as *const Entry as *const i8) };
+                unsafe { _mm_prefetch::<_MM_HINT_ET0>(&self.entries[(v & self.idmask) as usize - 1] as *const Entry as *const i8) };
+                return v & self.idmask;
             }
             i = (i + 1) & (self.slots.len() - 1);
         }
@@ -101,22 +103,20 @@ impl Names {
     /// Whether entry `id` is the name `s[..len]`.
     unsafe fn same(&self, id: usize, s: *const u8, len: usize) -> bool {
         let e = &self.entries[id];
-        if e.len.load(Relaxed) as usize != len {
-            return false;
-        }
         if len > 24 {
             let at = e.name[0].load(Relaxed) as usize;
-            return self.spill[at..at + len] == *std::slice::from_raw_parts(s, len);
+            return e.len.load(Relaxed) as usize == len && self.spill[at..at + len] == *std::slice::from_raw_parts(s, len);
         }
-        // The name as three zero-padded words, to compare with the entry's.
-        (0..3).all(|k| match len.saturating_sub(8 * k) {
-            0 => e.name[k].load(Relaxed) == 0,
-            n => e.name[k].load(Relaxed) == (s.add(8 * k) as *const u64).read_unaligned() & (u64::MAX >> (64 - 8 * n.min(8))),
-        })
+        // No branch on the length: the lengths of names are not predictable.
+        (0..3).fold(e.len.load(Relaxed) ^ len as u64, |d, k| d | e.name[k].load(Relaxed) ^ word(s, len, k)) == 0
     }
 
-    /// The entry of the name `s[..len]` (`s` must have 32 readable bytes after the name) with hash `h`; adds it if new.
-    unsafe fn entry(&self, s: *const u8, len: usize, h: u64) -> &Entry {
+    /// The entry of the name `s[..len]` (`s` must have 32 readable bytes after the name) with hash `h`; adds it if new. `hint` is
+    /// an entry that probably is it (0: none): it is checked first, so that the common case does not walk the table again.
+    unsafe fn entry(&self, s: *const u8, len: usize, h: u64, hint: u32) -> &Entry {
+        if hint != 0 && self.same(hint as usize - 1, s, len) {
+            return &self.entries[hint as usize - 1];
+        }
         let (tag, mut mine) = ((h >> 32) as u32 & !self.idmask, None);
         let mut i = h as usize & (self.slots.len() - 1);
         loop {
@@ -146,9 +146,7 @@ impl Names {
         e.len.store(len as u64, Relaxed);
         if len <= 24 {
             for k in 0..3 {
-                let n = len.saturating_sub(8 * k);
-                let w = if n == 0 { 0 } else { (s.add(8 * k) as *const u64).read_unaligned() & (u64::MAX >> (64 - 8 * n.min(8))) };
-                e.name[k].store(w, Relaxed);
+                e.name[k].store(word(s, len, k), Relaxed);
             }
         } else {
             let at = self.spilled.fetch_add(len, Relaxed);
@@ -157,6 +155,12 @@ impl Names {
         }
         id // published to other threads by the Release half of the compare-exchange of the slot
     }
+}
+
+/// Bytes 8k.. of the name `s[..len]` as a word, zero padded past the end of the name (8 bytes after 8k must be readable).
+#[inline(always)]
+unsafe fn word(s: *const u8, len: usize, k: usize) -> u64 {
+    (s.add(8 * k) as *const u64).read_unaligned() & ((1u128 << (8 * len.saturating_sub(8 * k).min(8))) - 1) as u64
 }
 
 /// 64-bit hash of a name from its length and its first and last 16 bytes, which must be readable. It only places names in
@@ -205,6 +209,7 @@ struct Rec {
     name: *const u8,
     len: usize,
     hash: u64,
+    hint: u32,
     note_bytes: usize,
 }
 
@@ -336,7 +341,7 @@ unsafe fn record(c: &Ctx, b: &[u8], q: &Quotes, start: usize, sep: &[u32], batch
         _mm_prefetch::<_MM_HINT_T0>(r as *const AtomicU16 as *const i8);
     }
     let cents = if neg { -cents } else { cents };
-    batch.recs.push(Rec { id, cents, region, name, len, hash, note_bytes: note_len });
+    batch.recs.push(Rec { id, cents, region, name, len, hash, hint: 0, note_bytes: note_len });
     Some(())
 }
 
@@ -345,7 +350,7 @@ fn resolve(c: &Ctx, batch: &mut Batch, aggs: &mut [Agg]) {
     for r in batch.recs.iter() {
         let country = c.dense[c.region.get(r.region).map_or(0, |x| x.load(Relaxed)) as usize] as usize;
         // SAFETY: the name has 32 readable bytes after it, as `record` ensured.
-        let name = unsafe { c.names.entry(r.name, r.len, r.hash) };
+        let name = unsafe { c.names.entry(r.name, r.len, r.hash, r.hint) };
         name.mask[country / 64].fetch_or(1 << (country % 64), Relaxed);
         let a = &mut aggs[country];
         a.count += 1;
@@ -393,7 +398,7 @@ fn parse_chunk(c: &Ctx, lo: usize, hi: usize, aggs: &mut [Agg], w: &mut Worker) 
             if batches[now].recs.len() == BATCH {
                 // The batch before this one has had the slots of its names prefetched while this one was parsed: look at
                 // them now, and prefetch the entries. The batch before that has had its entries prefetched: resolve it.
-                batches[(now + 2) % 3].recs.iter().for_each(|r| c.names.warm(r.hash));
+                batches[(now + 2) % 3].recs.iter_mut().for_each(|r| r.hint = c.names.warm(r.hash));
                 resolve(c, &mut batches[(now + 1) % 3], aggs);
                 now = (now + 1) % 3;
             }
@@ -401,7 +406,7 @@ fn parse_chunk(c: &Ctx, lo: usize, hi: usize, aggs: &mut [Agg], w: &mut Worker) 
         for k in [1, 2, 0] {
             // before the buffer changes
             let b = &mut batches[(now + k) % 3];
-            b.recs.iter().for_each(|r| c.names.warm(r.hash));
+            b.recs.iter_mut().for_each(|r| r.hint = c.names.warm(r.hash));
             resolve(c, b, aggs);
         }
         if last {
