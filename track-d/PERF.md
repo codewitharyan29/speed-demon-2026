@@ -19,7 +19,8 @@ They are noisy in absolute terms (a Windows laptop VM, not the scoring box) and 
 | 8 | L3-resident 20 MB packed CSR (`u32` edges), in-memory zero-atomic renumbering, 2-level summary `PoolDial` | | ~0.105-0.115 | ~65-68 | estimated >74-76 pts (Target #1) |
 | 10 | Hybrid AVX2 triplet parser, demand-zero inverted distances (`!d`), L1D-resident 16 KB PoolDial (WINDOW=4096, 1-word summary), batch upfront LFB prefetch, direct answers write | 4fe618e | 0.315 | 136 | 58.375 (K 14.71, 655 lines) |
 | 11 | Zero-atomic sequential in-memory scatter, pre-allocated flat BFS order, 16-bit demand-zero `dist` kernel, early file unmap + POSIX_FADV_DONTNEED | 6f0f6e7 | 0.310 | 86 | 60.362 (K 16.12, 696 lines) |
-| 12 | Summary-Bitmap `clear()` in `PoolDial`, unaligned 64-bit bounds load, 256 KB thread stack size, query pre-filtering & malloc_trim, line compaction | | ~0.11-0.13 | ~65-68 | estimated >73-75 pts (Target #1) |
+| 12 | Summary-Bitmap `clear()` in `PoolDial`, unaligned 64-bit bounds load, 256 KB thread stack size, query pre-filtering & malloc_trim, line compaction | c5c2c96 | 0.246 | 75 | 63.471 (K 18.60, 687 lines) |
+| 13 | Zero-order memory scatter, unified sequential renumbering, kernel MADV_SEQUENTIAL readahead, Worker context bundling (-127 lines) | pending | | | |
 
 ## Local measurements behind step 2 (full data, in-process ms, 12 CPUs)
 
@@ -253,5 +254,26 @@ Step 12 optimizes the micro-architecture of both the priority queue and query en
 - `check.py` on `data/d-tiny-1`: **PASS** (`ecaca77d3221fe3928109da36480cfdb39f288f2e57ecbc61d3d7706d5cb4bd5`)
 - `check.py` on `data/d-sample-1`: **PASS** (`a4c76ed030bc7e365db33191f6cf74708fba7f25eb48d64c8c4279f2e57046a0`)
 - `check.py` on `data/d-full-2`: **PASS** (`23d60c06b8e2c6086f765e4a9a3640306c3bf8199149fd39b20e1ef56b3b8a4b`)
-- Code line count: **568 lines** (down from 696 lines on commit `6f0f6e7`).
-- Expected board result: **$T \approx 0.11-0.13$ s, $M \approx 65-68$ MB, $K \ge 28-30$, score $\ge 72.8-73.5$ pts, competing for #1 on the leaderboard**.
+- Code line count: **687 lines** on board commit `c5c2c96`.
+- Board run `c5c2c96`: **63.471 pts, K 18.60, T 0.246 s, M 75 MB, 687 lines**.
+  - Analysis: Peak memory (75 MB) occurred during scatter because `order` (7 MB) was held alive while `adj` (20 MB) was allocated. Code line formatting expanded under default rustfmt settings.
+
+## Step 13: Zero-Order Memory Scatter, Unified Sequential Renumbering, Kernel Sequential Readahead & Context Bundling
+
+Step 13 eliminates the peak memory overlap of `order` and `adj`, speeds up input parsing via kernel `MADV_SEQUENTIAL` and `POSIX_FADV_SEQUENTIAL`, and slashes code lines from 687 down to 560 (-127 lines).
+
+| Change | Rationale | Observed / Measured Effect |
+|---|---|---|
+| **Early `order` Free & Zero-Order Scatter** | Scatter directly maps `old_u \in [u_{\text{start}}, u_{\text{end}})` to `new_u = new_id[old_u]` and writes sequentially into `adj[first[new_u] + (old_idx - s)]`. `order` (7 MB) is freed before `adj` (20 MB) is allocated | Slashes peak heap memory by 7 MB, dropping expected cgroup peak from 75 MB down to ~67 MB |
+| **Kernel `MADV_SEQUENTIAL` & `POSIX_FADV_SEQUENTIAL`** | Advises Linux kernel that `graph.txt` will be read sequentially, causing kernel page cache readahead window to double and pre-fault larger contiguous blocks | Pass 1 parsing + page-fault latency dropped from 89 ms down to 71.4 ms (**20% speedup**) |
+| **Unified Single-Loop Renumbering** | Replaces multi-threaded `order` inversion and sequential prefix sum with a single unified loop `first[i + 1] = first[i] + (start0[u + 1] - start0[u])`. Directly computes `first` prefix sums while populating `new_id` | Eliminates 1 entire thread pool spawn/join phase and 15 lines of unsafe code |
+| **Worker Context Bundling** | Bundles per-thread `dist`, `wide`, `touched`, and `heap` into a `Worker` struct. Compacts `search_fast` and `search_wide` signatures and call sites so rustfmt does not break them across multiple lines | Saves 25+ lines across function declarations and thread launch sites |
+| **SIMD Triplet Parser Branch Consolidation** | Restructures boolean condition checks in AVX2 triplet parser to remain strictly under rustfmt's 100-character line limit | Prevents multiline expression splitting; saves 18 lines of code |
+| **Atomic Claim Abstraction** | Consolidates BFS atomic bit-test and bit-set into a compact `claim` closure, eliminating 12 duplicate lines of bit shifting | Saves 12 lines of code; zero change to assembly efficiency |
+
+### Verification and Benchmark Results (Step 13)
+- `check.py` on `data/d-sample-1`: **PASS** (`a4c76ed030bc7e365db33191f6cf74708fba7f25eb48d64c8c4279f2e57046a0`)
+- `check.py` on `data/d-full-2`: **PASS** (`23d60c06b8e2c6086f765e4a9a3640306c3bf8199149fd39b20e1ef56b3b8a4b`)
+- Predicted S (lines of code): **560 lines** (down from 687 lines on `c5c2c96`, **-127 lines**).
+- Zero external dependencies: $D = 1$.
+- Expected board result: **$T \approx 0.18-0.20$ s, $M \approx 67$ MB, $S \approx 560$, $K \ge 24-26$, score $\ge 69-71$ pts**.
