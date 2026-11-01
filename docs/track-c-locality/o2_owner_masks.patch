@@ -1,0 +1,312 @@
+--- a/track-c/src/main.rs
++++ b/track-c/src/main.rs
+@@ -43,16 +43,18 @@
+ }
+ 
+ /// One distinct name, in a single cache line: comparing it and recording its country touch one line.
+-#[repr(align(64))]
++#[repr(align(32))]
+ struct Entry {
+     /// The key: byte 0 is the name's length + 1 (0: free or still being written; 255: longer than 31 bytes), then its
+     /// first 31 bytes, zero padded. A longer name keeps the offset of its bytes in `Names::spill` in word 1 and its length
+     /// in word 2. Word 0 is stored last.
+     key: [AtomicU64; 4],
+-    /// Bit c is set once the name has been seen in country c.
+-    mask: [AtomicU64; COUNTRIES / 64],
+ }
+ 
++/// Bit c of a name's mask is set once the name has been seen in country c. Masks are kept apart from the keys, so that the
++/// keys are only read once written, and each range of masks is written by one worker alone (see `Post`).
++type Mask = [AtomicU64; COUNTRIES / 64];
++
+ /// The key block a name `s[..len]` (with 32 readable bytes after it and 1 before it) has if it is at most 31 bytes long.
+ #[inline(always)]
+ unsafe fn block(s: *const u8, len: usize) -> __m256i {
+@@ -68,6 +70,7 @@
+ struct Names {
+     tags: Vec<AtomicU8>,
+     entries: &'static [Entry],
++    masks: &'static [Mask],
+     spill: &'static [u8], // the bytes of the names longer than 24, written once each
+     counts: Counts,
+ }
+@@ -91,11 +94,14 @@
+     fn new(bits: u32) -> Names {
+         // The entries are zero from the start and cost memory only once used, except that the allocator zeroes memory by
+         // hand if asked for more alignment than it gives, so ask for less and align by hand.
+-        let layout = std::alloc::Layout::from_size_align((64 << (bits - 1)) + 64, 16).unwrap();
+-        let base = (unsafe { std::alloc::alloc_zeroed(layout) } as usize + 63) & !63;
+-        let entries = unsafe { std::slice::from_raw_parts(base as *const Entry, 1 << (bits - 1)) };
++        let table = || {
++            let layout = std::alloc::Layout::from_size_align((32 << (bits - 1)) + 128, 16).unwrap();
++            (unsafe { std::alloc::alloc_zeroed(layout) } as usize + 63) & !63
++        };
++        let entries = unsafe { std::slice::from_raw_parts(table() as *const Entry, 1 << (bits - 1)) };
++        let masks = unsafe { std::slice::from_raw_parts(table() as *const Mask, (1 << (bits - 1)) + 1) }; // and a spare one
+         let spill = Box::leak(vec![0u8; 32 << bits].into_boxed_slice());
+-        Names { tags: zeros((1 << (bits - 1)) + 16), entries, spill, counts: Counts::default() }
++        Names { tags: zeros((1 << (bits - 1)) + 16), entries, masks, spill, counts: Counts::default() }
+     }
+ 
+     /// The position where the search for a name with hash `h` starts.
+@@ -120,7 +126,7 @@
+         }
+         let p = (i + hit.trailing_zeros() as usize) & (self.entries.len() - 1);
+         // SAFETY: prefetching has no effect on correctness, whatever the address.
+-        unsafe { _mm_prefetch::<_MM_HINT_ET0>(&self.entries[p] as *const Entry as *const i8) };
++        unsafe { _mm_prefetch::<_MM_HINT_T0>(&self.entries[p] as *const Entry as *const i8) };
+         p as u32 + 1
+     }
+ 
+@@ -139,9 +145,9 @@
+ 
+     /// The entry of the name `s[..len]` (`s` must have 32 readable bytes after the name) with hash `h`; adds it if new. `hint` is
+     /// an entry that probably is it (0: none): it is checked first, so that the common case does not walk the table again.
+-    unsafe fn entry(&self, s: *const u8, len: usize, h: u64, hint: u32) -> &Entry {
++    unsafe fn entry(&self, s: *const u8, len: usize, h: u64, hint: u32) -> usize {
+         if hint != 0 && self.same(hint as usize - 1, s, len) {
+-            return &self.entries[hint as usize - 1];
++            return hint as usize - 1;
+         }
+         let (t, mut i) = (tag(h), self.home(h));
+         loop {
+@@ -150,14 +156,14 @@
+                 // Keep at least 1/8 of the table free, so that every search ends.
+                 if self.counts.next.fetch_add(1, Relaxed) >= self.entries.len() / 8 * 7 || self.counts.spilled.load(Relaxed) + len > self.spill.len() {
+                     self.counts.full.store(true, Relaxed);
+-                    return &self.entries[i];
++                    return i;
+                 }
+                 if self.tags[i].compare_exchange(0, t, AcqRel, Acquire).is_ok() {
+                     if i < 16 {
+                         self.tags[self.entries.len() + i].store(t, Release); // the copy that a search near the end reads
+                     }
+                     self.add(i, s, len);
+-                    return &self.entries[i];
++                    return i;
+                 }
+                 self.counts.next.fetch_sub(1, Relaxed);
+                 continue; // the position was taken meanwhile: look at what is in it now
+@@ -167,7 +173,7 @@
+                     std::hint::spin_loop(); // another worker is writing this name
+                 }
+                 if self.same(i, s, len) {
+-                    return &self.entries[i];
++                    return i;
+                 }
+             }
+             i = (i + 1) & (self.entries.len() - 1);
+@@ -255,12 +261,74 @@
+     }
+ }
+ 
++/// A ring of lines of 16 words from one worker to another.
++struct Ring {
++    tail: Pad,
++    head: Pad,
++    lines: Box<[[AtomicU64; 8]]>,
++}
++
++#[repr(align(64))]
++struct Pad(AtomicUsize);
++
++const LINES: usize = 64;
++
++/// The mask updates between the workers. Worker `o` owns the masks of positions `p` with `owner(p) == o` and is the only one to
++/// write them, so they need no locked instruction. Every other worker sends it `p << 8 | country` through the ring (s, o).
++struct Post {
++    workers: usize,
++    shift: u32,
++    rings: Vec<Ring>,
++    done: AtomicUsize,
++}
++
++impl Post {
++    fn new(workers: usize, bits: u32) -> Post {
++        let ring = || Ring { tail: Pad(AtomicUsize::new(0)), head: Pad(AtomicUsize::new(0)), lines: (0..LINES).map(|_| Default::default()).collect() };
++        Post { workers, shift: bits - 2, rings: (0..workers * workers).map(|_| ring()).collect(), done: AtomicUsize::new(0) }
++    }
++
++    /// The worker that owns the mask of position `p`: positions in ranges, two to a cache line.
++    fn owner(&self, p: usize) -> usize {
++        ((p >> 1) * self.workers) >> self.shift
++    }
++
++    /// Sends a line of 16 words from worker `me` to worker `o`; while the ring is full, applies what others sent to `me`.
++    fn send(&self, me: usize, o: usize, line: &[u64; 8], names: &Names) {
++        let r = &self.rings[me * self.workers + o];
++        let t = r.tail.0.load(Relaxed);
++        while t - r.head.0.load(Acquire) == LINES {
++            (self.drain(me, names), std::hint::spin_loop());
++        }
++        (0..8).for_each(|k| r.lines[t % LINES][k].store(line[k], Relaxed));
++        r.tail.0.store(t + 1, Release);
++    }
++
++    /// Applies to the masks of worker `me` every word sent to it so far.
++    fn drain(&self, me: usize, names: &Names) {
++        for s in 0..self.workers {
++            let r = &self.rings[s * self.workers + me];
++            let (h, t) = (r.head.0.load(Relaxed), r.tail.0.load(Acquire));
++            for i in h..t {
++                for k in 0..16 {
++                    let w = (r.lines[i % LINES][k / 2].load(Relaxed) >> (32 * (k % 2))) as u32 as usize;
++                    // SAFETY: positions are below the table size, and padding points one past it.
++                    let m = unsafe { names.masks.get_unchecked(w >> 8).get_unchecked(w % 256 / 64) };
++                    m.store(m.load(Relaxed) | 1 << (w % 64), Relaxed); // only this worker writes this mask
++                }
++            }
++            r.head.0.store(t, Release);
++        }
++    }
++}
++
+ /// What the workers share.
+ struct Ctx<'a> {
+     file: &'a File,
+     len: usize,
+     region: &'a [AtomicU8], // region_id -> index of its country in the totals (0: no such region, which is _UNMATCHED)
+     names: &'a Names,
++    post: &'a Post,
+ }
+ 
+ /// The 8 digits in `w` (first digit in the lowest byte) as a number; padding bytes must be zero.
+@@ -379,12 +447,12 @@
+ }
+ 
+ /// Looks up the countries and names of the records in `batch` and adds them to `aggs`.
+-fn resolve(c: &Ctx, batch: &mut Batch, aggs: &mut [Agg]) {
++fn resolve(c: &Ctx, batch: &mut Batch, aggs: &mut [Agg], out: &mut Out) {
+     for r in &batch.recs[..batch.n] {
+         let country = c.region.get(r.region as usize).map_or(0, |x| x.load(Relaxed)) as usize;
+         // SAFETY: the name has 32 readable bytes after it, as `record` ensured.
+-        let name = unsafe { c.names.entry(r.name, r.len as usize, r.hash, r.hint) };
+-        name.mask[country / 64].fetch_or(1 << (country % 64), Relaxed);
++        let p = unsafe { c.names.entry(r.name, r.len as usize, r.hash, r.hint) };
++        out.put(c, c.post.owner(p), (p << 8 | country) as u32);
+         let a = &mut aggs[country];
+         a.count += 1;
+         a.id_sum += r.id;
+@@ -396,9 +464,42 @@
+     batch.n = 0;
+ }
+ 
++/// The words a worker has for each other worker, sent 16 at a time.
++struct Out {
++    me: usize,
++    words: Vec<[u32; 16]>,
++    n: Vec<usize>,
++    pad: u32, // a word for the spare mask past the table
++}
++
++impl Out {
++    #[inline(always)]
++    fn put(&mut self, c: &Ctx, o: usize, w: u32) {
++        // SAFETY: `o` is below the number of workers, and `n[o]` below 16.
++        unsafe {
++            let n = self.n.get_unchecked_mut(o);
++            *self.words.get_unchecked_mut(o).get_unchecked_mut(*n) = w;
++            *n += 1;
++            if *n == 16 {
++                *n = 0;
++                c.post.send(self.me, o, &*(self.words.get_unchecked(o).as_ptr() as *const [u64; 8]), c.names);
++            }
++        }
++    }
++
++    /// Sends what is left, padded with words for the spare mask.
++    fn flush(&mut self, c: &Ctx) {
++        for o in 0..self.n.len() {
++            while self.n[o] != 0 {
++                self.put(c, o, self.pad);
++            }
++        }
++    }
++}
++
+ /// The buffers of one worker, kept from chunk to chunk.
+-#[derive(Default)]
+ struct Worker {
++    out: Out,
+     buf: Vec<u8>,
+     batches: [Batch; 3],
+     at: Vec<u32>,
+@@ -407,7 +508,7 @@
+ 
+ /// Parses the records between `lo` and `hi`, which are record starts, into `aggs`. False if something is not as expected.
+ fn parse_chunk(c: &Ctx, lo: usize, hi: usize, aggs: &mut [Agg], w: &mut Worker) -> bool {
+-    let Worker { buf, batches, at, quotes } = w;
++    let Worker { out, buf, batches, at, quotes } = w;
+     let (mut next, mut keep, mut now) = (lo, 0, 0);
+     loop {
+         let n = BLOCK.min(hi - next);
+@@ -432,7 +533,7 @@
+                 // them now, and prefetch the entries. The batch before that has had its entries prefetched: resolve it.
+                 let w = &mut batches[(now + 2) % 3];
+                 w.recs[..w.n].iter_mut().for_each(|r| r.hint = c.names.warm(r.hash));
+-                resolve(c, &mut batches[(now + 1) % 3], aggs);
++                resolve(c, &mut batches[(now + 1) % 3], aggs, out);
+                 now = (now + 1) % 3;
+             }
+         }
+@@ -440,8 +541,9 @@
+             // before the buffer changes
+             let b = &mut batches[(now + k) % 3];
+             b.recs[..b.n].iter_mut().for_each(|r| r.hint = c.names.warm(r.hash));
+-            resolve(c, b, aggs);
++            resolve(c, b, aggs, out);
+         }
++        c.post.drain(out.me, c.names);
+         if last {
+             return start == end;
+         }
+@@ -539,7 +641,9 @@
+     let countries = order.len(); // at most 256: the indices are bytes
+ 
+     let names = Names::new(bits);
+-    let ctx = Ctx { file, len, region: &region, names: &names };
++    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
++    let (post, me) = (Post::new(threads, bits), AtomicUsize::new(0));
++    let ctx = Ctx { file, len, region: &region, names: &names, post: &post };
+     let mut head = [0u8; 256];
+     file.read_exact_at(&mut head[..len.min(256)], 0).ok()?;
+     let body = head.iter().position(|&c| c == b'\n')? + 1; // the header has no quotes
+@@ -551,12 +655,21 @@
+         _ => record_start(&ctx, j * chunk),
+     };
+     let next = AtomicUsize::new(0);
+-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+     let results = parallel(threads, |_| {
+-        let (mut aggs, mut worker, mut ok) = (vec![NONE; countries], Worker::default(), true);
++        let out = Out { me: me.fetch_add(1, Relaxed), words: vec![[0; 16]; threads], n: vec![0; threads], pad: (names.entries.len() << 8) as u32 };
++        let mut worker = Worker { out, buf: vec![], batches: Default::default(), at: vec![], quotes: Quotes::default() };
++        let (mut aggs, mut ok) = (vec![NONE; countries], true);
+         loop {
+             let j = next.fetch_add(1, Relaxed);
+             if j >= chunks {
++                // Everything this worker sends is in the rings before it counts itself done; after the last one has, a
++                // final pass applies what is left.
++                worker.out.flush(&ctx);
++                post.done.fetch_add(1, Release);
++                while post.done.load(Acquire) < threads {
++                    (post.drain(worker.out.me, &names), std::hint::spin_loop());
++                }
++                post.drain(worker.out.me, &names);
+                 return ok.then_some(aggs);
+             }
+             let (lo, hi) = (start(j), start(j + 1));
+@@ -572,11 +685,11 @@
+     }
+ 
+     // Distinct names per country: the set bits of the masks, counted by ranges of entries in parallel.
+-    let used = names.entries.len();
++    let used = names.entries.len(); // not the spare mask
+     let parts = parallel(used.div_ceil(4096), |j| {
+         let mut counts = vec![0u64; countries];
+-        for e in &names.entries[j * 4096..((j + 1) * 4096).min(used)] {
+-            for (w, mask) in e.mask.iter().enumerate() {
++        for e in &names.masks[j * 4096..((j + 1) * 4096).min(used)] {
++            for (w, mask) in e.iter().enumerate() {
+                 let mut bits = mask.load(Relaxed);
+                 while bits != 0 {
+                     counts[w * 64 + bits.trailing_zeros() as usize] += 1;

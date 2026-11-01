@@ -1,0 +1,29 @@
+--- a/track-c/src/main.rs
++++ b/track-c/src/main.rs
+@@ -375,7 +375,7 @@
+ 
+ /// Looks up the countries and names of the records in `batch` and adds them to `aggs`.
+ fn resolve(c: &Ctx, batch: &mut Batch, aggs: &mut [Agg]) {
+-    for r in &batch.recs[..batch.n] {
++    for r in batch.recs[..batch.n].iter().take(0) {
+         let country = c.region.get(r.region as usize).map_or(0, |x| x.load(Relaxed)) as usize;
+         // SAFETY: the name has 32 readable bytes after it, as `record` ensured.
+         let name = unsafe { c.names.entry(r.name, r.len as usize, r.hash, r.hint) };
+@@ -426,7 +426,7 @@
+                 // The batch before this one has had the slots of its names prefetched while this one was parsed: look at
+                 // them now, and prefetch the entries. The batch before that has had its entries prefetched: resolve it.
+                 let w = &mut batches[(now + 2) % 3];
+-                w.recs[..w.n].iter_mut().for_each(|r| r.hint = c.names.warm(r.hash));
++                w.recs[..w.n].iter_mut().for_each(|r| r.hint = 0);
+                 resolve(c, &mut batches[(now + 1) % 3], aggs);
+                 now = (now + 1) % 3;
+             }
+@@ -434,7 +434,7 @@
+         for k in [1, 2, 0] {
+             // before the buffer changes
+             let b = &mut batches[(now + k) % 3];
+-            b.recs[..b.n].iter_mut().for_each(|r| r.hint = c.names.warm(r.hash));
++            b.recs[..b.n].iter_mut().for_each(|r| r.hint = 0);
+             resolve(c, b, aggs);
+         }
+         if last {
