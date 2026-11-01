@@ -265,112 +265,111 @@ fn digits8(w: u64) -> u64 {
     (w & 0x0000_FFFF_0000_FFFF).wrapping_mul(42949672960001) >> 32
 }
 
-// The functions that read the buffer without bounds checks rely on one fact: the buffer extends 64 bytes past the data
-// (`PAD`), and every index they use is at most a separator position plus 8.
+// The parser reads at most 64 bytes past a position before `end`; the buffer has `PAD` zero bytes after the data. A function
+// that runs into `end` returns `Err(true)` (the record is not complete in this buffer); `Err(false)` means it is not valid.
 
-/// The decimal number of `n` digits (1 or more) at `b[i..]`. Up to 8 digits are converted at once, without a branch.
+/// The first `c` at or after `q` and before `end`, 32 bytes at a time.
 #[inline(always)]
-unsafe fn digits(b: &[u8], i: usize, n: usize) -> u64 {
-    if n > 8 {
-        return (i..i + n).fold(0, |v, k| v * 10 + (*b.get_unchecked(k) - b'0') as u64);
-    }
-    digits8((b.as_ptr().add(i) as *const u64).read_unaligned() << (8 * (8 - n)))
-}
-
-/// Where the quotes are in a buffer: bit i of word w is set if byte 64 w + i is a `"`, and `before[w]` quotes precede word w.
-#[derive(Default)]
-struct Quotes {
-    words: Vec<u64>,
-    before: Vec<u32>,
-}
-
-impl Quotes {
-    /// The number of quotes among the bytes before `pos`.
-    #[inline(always)]
-    unsafe fn before(&self, pos: usize) -> u32 {
-        *self.before.get_unchecked(pos / 64) + (*self.words.get_unchecked(pos / 64) & ((1u64 << (pos % 64)) - 1)).count_ones()
-    }
-}
-
-/// Stage 1: the positions of the commas and LFs outside quotes in `b[..end]` (which starts outside quotes) go to `at`,
-/// and the quotes to `quotes`. A quote toggles being inside quotes, and so does each half of a `""`, so the bytes inside
-/// quotes are the prefix XOR of the quote bits, which a carry-less multiplication by all ones computes.
-fn structure(b: &[u8], end: usize, at: &mut Vec<u32>, quotes: &mut Quotes) {
-    // Room for every byte of the block being a separator, reserved once per block (pages that are never written cost
-    // no memory); the quote words are written in place.
-    let words = end.div_ceil(64);
-    (at.clear(), at.reserve(64 * words + 8), quotes.words.resize(words + 1, 0), quotes.before.resize(words + 1, 0));
-    let (mut inside, mut seen, mut n, out) = (0u64, 0u32, 0usize, at.as_mut_ptr());
-    for w in 0..words {
-        let base = 64 * w;
-        // SAFETY: the buffer extends 64 bytes past `end`.
-        let (quote, separators, in_quotes) = unsafe {
-            let (lo, hi) = (_mm256_loadu_si256(b.as_ptr().add(base) as _), _mm256_loadu_si256(b.as_ptr().add(base + 32) as _));
-            let bits = |c: u8| {
-                let c = _mm256_set1_epi8(c as i8);
-                let (x, y) = (_mm256_cmpeq_epi8(lo, c), _mm256_cmpeq_epi8(hi, c));
-                _mm256_movemask_epi8(x) as u32 as u64 | (_mm256_movemask_epi8(y) as u32 as u64) << 32
-            };
-            let quote = bits(b'"');
-            let prefix_xor = _mm_clmulepi64_si128(_mm_set_epi64x(0, quote as i64), _mm_set1_epi8(-1), 0);
-            (quote, bits(b',') | bits(b'\n'), _mm_cvtsi128_si64(prefix_xor) as u64 ^ inside)
-        };
-        inside = ((in_quotes as i64) >> 63) as u64; // all ones if the next 64 bytes start inside quotes
-        // Eight positions are written whether or not there are that many, and the length advances by the real number: a
-        // branch per block would be mispredicted about as often as it is taken. More than eight are rare.
-        let (mut outside, count) = (separators & !in_quotes, (separators & !in_quotes).count_ones() as usize);
-        let mut put = |k: usize| {
-            // SAFETY: there is room for 64 per word, plus 8.
-            unsafe { out.add(n + k).write((base + outside.trailing_zeros() as usize) as u32) };
-            outside &= outside.wrapping_sub(1);
-        };
-        (0..8).for_each(&mut put);
-        if count > 8 {
-            (8..count).for_each(put);
+unsafe fn scan(b: &[u8], mut q: usize, end: usize, c: u8) -> Result<usize, bool> {
+    loop {
+        if q >= end {
+            return Err(true);
         }
-        n += count;
-        // SAFETY: both have `words + 1` elements.
-        unsafe { (*quotes.words.get_unchecked_mut(w), *quotes.before.get_unchecked_mut(w)) = (quote, seen) };
-        seen += quote.count_ones();
+        let m = _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256(b.as_ptr().add(q) as _), _mm256_set1_epi8(c as i8))) as u32;
+        if m != 0 {
+            let k = q + m.trailing_zeros() as usize;
+            return if k < end { Ok(k) } else { Err(true) };
+        }
+        q += 32;
     }
-    // SAFETY: `n` positions were written.
-    unsafe { at.set_len(n) };
-    (quotes.words[words], quotes.before[words]) = (0, seen); // so that `before` works for a position at the very end
 }
 
-/// Stage 2: the record that starts at `start` and whose four commas and LF are at `sep` goes into `batch`.
-/// Fields are taken to be what the grammar says (spec 2.1: a solution may assume well-formed input), but the five
-/// separators must be the bytes they should be: a chunk that started inside a quoted field would fail that.
-unsafe fn record(c: &Ctx, b: &[u8], q: &Quotes, start: usize, sep: &[u32], batch: &mut Batch) -> Option<()> {
-    let [e1, e2, e3, e4, e5] = [0, 1, 2, 3, 4].map(|k| sep[k] as usize);
+/// The decimal number (1 or more digits) at `b[p..]` that ends before the first `delim`, and its digit count.
+#[inline(always)]
+unsafe fn number(b: &[u8], p: usize, end: usize, delim: u8) -> Result<(u64, usize), bool> {
+    let w = (b.as_ptr().add(p) as *const u64).read_unaligned();
+    let x = w ^ 0x0101_0101_0101_0101 * delim as u64;
+    let zero = x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080;
+    let n = if zero != 0 { zero.trailing_zeros() as usize / 8 } else { scan(b, p, end, delim)? - p };
+    if p + n >= end {
+        return Err(true);
+    }
+    match n {
+        0 => Err(false),
+        1..=8 => Ok((digits8(w << (8 * (8 - n))), n)),
+        _ => Ok(((p..p + n).fold(0, |v, k| v * 10 + (*b.get_unchecked(k) - b'0') as u64), n)),
+    }
+}
+
+/// The text field at `b[p..]`: where its bytes as written start, how many there are, how many `""` pairs they hold, and the
+/// position just after the field. An unquoted field has no quotes and ends at a comma.
+#[inline(always)]
+unsafe fn text(b: &[u8], p: usize, end: usize) -> Result<(usize, usize, usize, usize), bool> {
+    if p >= end {
+        return Err(true);
+    }
+    if *b.get_unchecked(p) != b'"' {
+        let k = scan(b, p, end, b',')?;
+        return Ok((p, k - p, 0, k));
+    }
+    let (mut q, mut pairs) = (p + 1, 0);
+    loop {
+        let k = scan(b, q, end, b'"')?;
+        if *b.get_unchecked(k + 1) != b'"' {
+            return Ok((p + 1, k - p - 1, pairs, k + 1));
+        }
+        (q, pairs) = (k + 2, pairs + 1);
+    }
+}
+
+/// Parses the record that starts at `s` into `batch`, in one pass over its bytes; returns where the next record starts.
+#[inline(always)]
+unsafe fn record(c: &Ctx, b: &[u8], s: usize, end: usize, batch: &mut Batch) -> Result<usize, bool> {
     let at = |i: usize| *b.get_unchecked(i);
-    let sep_bad = (at(e1) ^ b',') | (at(e2) ^ b',') | (at(e3) ^ b',') | (at(e4) ^ b',') | (at(e5) ^ b'\n');
-    let bom = at(start) == 0xEF;
-    let p = start + 3 * bom as usize; // a BOM in front of the record
-    (sep_bad == 0 && (!bom || (b.as_ptr().add(start + 1) as *const u16).read_unaligned() == 0xBFBB)).then_some(())?;
-    let (neg, cr) = (at(e4 + 1) == b'-', (at(e5 - 1) == b'\r') as usize);
-    let (whole_at, dot) = (e4 + 1 + neg as usize, e5 - cr - 3); // the amount ends in ".dd"
-    let cents = (digits(b, whole_at, dot - whole_at) * 100 + (at(dot + 1) - b'0') as u64 * 10 + (at(dot + 2) - b'0') as u64) as i64;
-    let (id, region) = (digits(b, p, e1 - p), digits(b, e3 + 1, e4 - e3 - 1) as usize);
-    // An unquoted text field has no quotes; a quoted one has its two delimiters and two more for every `""` pair inside.
-    let (qname, qnote) = ((q.before(e2) - q.before(e1)) as usize, (q.before(e3) - q.before(e2)) as usize);
-    let (name_quoted, note_quoted) = ((qname != 0) as usize, (qnote != 0) as usize);
-    // A name is looked up by the bytes between its delimiters as written, with `""` for each `"`: writing a value that way
-    // is one to one, so two names are equal exactly when these bytes are. Its length after unescaping is one less per pair.
-    let (ns, len) = (e1 + 1 + name_quoted, e2 - e1 - 1 - 2 * name_quoted);
-    let name_bytes = len - (qname / 2 - name_quoted);
-    let note_len = e3 - e2 - 1 - 2 * note_quoted - (qnote / 2 - note_quoted);
+    if s + 3 >= end {
+        return Err(true);
+    }
+    let bom = at(s) == 0xEF; // a BOM in front of the record
+    if bom && (b.as_ptr().add(s + 1) as *const u16).read_unaligned() != 0xBFBB {
+        return Err(false);
+    }
+    let (id, n) = number(b, s + 3 * bom as usize, end, b',')?;
+    let (ns, len, pairs, p) = text(b, s + 3 * bom as usize + n + 1, end)?;
+    if at(p) != b',' {
+        return Err(p >= end);
+    }
+    let (_, note_raw, note_pairs, p) = text(b, p + 1, end)?;
+    if at(p) != b',' {
+        return Err(p >= end);
+    }
+    let (region, n) = number(b, p + 1, end, b',')?;
+    let p = p + n + 2;
+    let neg = at(p) == b'-';
+    let (whole, n) = number(b, p + neg as usize, end, b'.')?;
+    let dot = p + neg as usize + n; // the amount ends in ".dd", then CRLF or LF
+    let lf = dot + 3 + (at(dot + 3) == b'\r') as usize;
+    if lf >= end {
+        return Err(true);
+    }
+    if at(lf) != b'\n' {
+        return Err(false);
+    }
+    let cents = (whole * 100 + (at(dot + 1) - b'0') as u64 * 10 + (at(dot + 2) - b'0') as u64) as i64;
+    let region = region as usize;
+    // A name is looked up by its bytes as written, with `""` for each `"`: writing a value that way is one to one, so two names
+    // are equal exactly when these bytes are. Its length after unescaping is one less per pair.
     let name = b.as_ptr().add(ns);
-    // SAFETY: the buffer has 32 readable bytes after the name; the hash reads at most 16 around its ends.
+    // SAFETY: the buffer has 32 readable bytes after the name.
     let hash = hash(name, len);
     _mm_prefetch::<_MM_HINT_T0>(&c.names.tags[c.names.home(hash)] as *const AtomicU8 as *const i8);
     if let Some(r) = c.region.get(region) {
         _mm_prefetch::<_MM_HINT_T0>(r as *const AtomicU8 as *const i8);
     }
     let cents = if neg { -cents } else { cents };
-    *batch.recs.get_unchecked_mut(batch.n) = Rec { id, cents, name, hash, region: region.min(u32::MAX as usize) as u32, len: len as u32, name_bytes: name_bytes as u32, note_bytes: note_len as u32, hint: 0 };
+    let (name_bytes, note_bytes) = ((len - pairs) as u32, (note_raw - note_pairs) as u32);
+    *batch.recs.get_unchecked_mut(batch.n) = Rec { id, cents, name, hash, region: region.min(u32::MAX as usize) as u32, len: len as u32, name_bytes, note_bytes, hint: 0 };
     batch.n += 1;
-    Some(())
+    Ok(lf + 1)
 }
 
 /// Looks up the countries and names of the records in `batch` and adds them to `aggs`.
@@ -396,13 +395,11 @@ fn resolve(c: &Ctx, batch: &mut Batch, aggs: &mut [Agg]) {
 struct Worker {
     buf: Vec<u8>,
     batches: [Batch; 3],
-    at: Vec<u32>,
-    quotes: Quotes,
 }
 
 /// Parses the records between `lo` and `hi`, which are record starts, into `aggs`. False if something is not as expected.
 fn parse_chunk(c: &Ctx, lo: usize, hi: usize, aggs: &mut [Agg], w: &mut Worker) -> bool {
-    let Worker { buf, batches, at, quotes } = w;
+    let Worker { buf, batches } = w;
     let (mut next, mut keep, mut now) = (lo, 0, 0);
     loop {
         let n = BLOCK.min(hi - next);
@@ -414,14 +411,14 @@ fn parse_chunk(c: &Ctx, lo: usize, hi: usize, aggs: &mut [Agg], w: &mut Worker) 
         if last && buf[end - 1] != b'\n' {
             (buf[end], end) = (b'\n', end + 1); // the last record may lack its terminator
         }
-        structure(buf, end, at, quotes);
         let mut start = 0;
-        for sep in at.chunks_exact(5) {
-            // SAFETY: the buffer has `PAD` bytes after `end`, and the separators are before `end`.
-            if unsafe { record(c, buf, quotes, start, sep, &mut batches[now]) }.is_none() {
-                return false;
+        loop {
+            // SAFETY: the buffer has `PAD` bytes after `end`.
+            match unsafe { record(c, buf, start, end, &mut batches[now]) } {
+                Ok(next) => start = next,
+                Err(more) if more => break,
+                Err(_) => return false,
             }
-            start = sep[4] as usize + 1;
             if batches[now].n == BATCH {
                 // The batch before this one has had the slots of its names prefetched while this one was parsed: look at
                 // them now, and prefetch the entries. The batch before that has had its entries prefetched: resolve it.
