@@ -102,3 +102,20 @@ ASan/UBSan clean on 6 inputs; TSan clean on 6 inputs with tiny blocks (the earli
 16-byte tag read, removed by doing it as one asm load); local T at parity or better (4 threads -1.8%, 2 threads -4.5%); RSS
 equal. **Promotion:** `speed-demon` keeps cx3 as Track C (the best verified candidate). Recovery points: `4e11c91` (Rust
 control), `6ec50ad` (first C++).
+
+## cx5: one phase and the tail removed; official result and promotion (Nov 1, 23:26 UTC)
+
+| | Commit (speed-demon) | Run | T | M | S | K |
+|---|---|---|---:|---:|---:|---:|
+| **cx5** | `66693b1`, main.cpp sha256 `e016cdf08682676b` | **run-ce3a1da5b3de** (scored, all gates) | **34.51 ms** | 14.14 MB | 432 | **31.88** |
+| cx3 | `4452f30` | run-c6a876ca3df0 | 35.47 ms | 13.95 MB | 434 | 31.51 |
+
+Changes against cx3:
+* **G1:** a (name, country) pair is counted by the one worker whose `fetch_or` sets the bit (`lock bts`; GCC emits it only when
+  the mask is one shared expression; the first form compiled to a `cmpxchg` loop, caught in the disassembly). This removes the
+  counting phase (a rescan of the 8 MB table) and its barrier.
+* **G2:** 128 KiB chunks over the last 15% of the file, so that 12 workers finish together.
+
+Local before the run: -1.6% (4 threads), -1.7% (2 threads), -10% on sample; RSS equal; 27/27 fixtures (normal, 200-byte
+blocks/3,000-byte chunks, board flags), ASan/UBSan/TSan clean on 6 inputs. Board: T -0.96 ms, M +0.19 MB (inside the board's
+spread), K +1.2%. **Promoted:** speed-demon's Track C is cx5. Recovery points: `4452f30` (cx3), `6ec50ad`, `4e11c91` (Rust).
