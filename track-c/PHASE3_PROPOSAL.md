@@ -8,6 +8,7 @@ Best official K is still 29.76 (`9fb5c93`). Labels: **board** (official runs), *
 |---|---|---:|---:|---|
 | control (3 runs) | | 35.73 / 36.59 / 36.73 ms (mean 36.35) | 13.5-13.78 MB | feed |
 | `tc6_nomask` via `9c7e08a`, run-4f92ba5b0852 | the locked mask OR (the write prefetch stays) | **34.33 ms** | 14.21 MB | feed |
+| `tc6_nomask` via `4fa0bee`, run-191a7780c05f (repeat) | same | **34.34 ms** | 13.82 MB | feed |
 | `tc6_nolookup`, run-0b3959a3cbab | name lookup and mask | 24.70 ms | 9.96 MB | other session |
 | `tc6_noresolve`, via run-c22361965e83 | name, region, totals | 21.91 ms | 7.61 MB | feed |
 | `d5_read`, run-7cc802c10d14 | everything but reading and setup | 8.52 ms | 7.64 MB | other session |
@@ -68,3 +69,10 @@ can then be taken to about half its instructions.
 2. **A1** (`docs/track-c-candidates/a1c_sequential_parser.patch` applied to R1 `7c64950`; valid output): does SMT hide the
    sequential parser's serial chain?
 3. `pool_b`, only if (1) shows setup above 2 ms.
+
+## 6. Diagnostic scheduling (recorded 16:55 UTC)
+
+`tc6_nomask` is complete, with two readings, 34.334 ms and 34.338 ms. Both runs were Track D heads that carried the diagnostic's
+Track C source. It is not to be repeated. The board never ran the diagnostic commits themselves (`9e7524d`, `f7037fd`), because
+later pushes superseded them. A script that waits for a run of its own commit therefore waits forever. Readings are taken from
+whichever run carries the source.
