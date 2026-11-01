@@ -754,6 +754,8 @@ fn main() {
         // postings begin.
         (start.clear(), start.resize(nkeys + 1, 0));
         (pairs.clear(), offs.clear(), rows.clear(), matched.clear());
+        // Room for a pair per token (a token and its separator take two bytes at least): pages never written cost nothing.
+        pairs.reserve((range.1 - range.0) / 2 + 1);
         rows.resize((ndense as usize + 1) * wl, 0);
         let mut cur = base;
         (seq.clear(), hits.clear());
@@ -785,11 +787,12 @@ fn main() {
                     // Every token sets its document's bit: in its term's bitset, or in the spare row.
                     *rows.get_unchecked_mut(d as usize * wl + local as usize / 64) |=
                         1 << (local % 64);
-                    if flags & 1 != 0 && *start.get_unchecked(id) != doc + 1 {
-                        // Any other BOOL term: a pair, once per document.
-                        *start.get_unchecked_mut(id) = doc + 1;
-                        pairs.push((id as u32) << DOC_BITS | local);
-                    }
+                    // Any other BOOL term: a pair, once per document. Without a branch: every token stamps its id
+                    // and writes a pair, which is kept only then (`pairs` has room for every token of the chunk).
+                    let fresh = (flags & 1 != 0) & (*start.get_unchecked(id) != doc + 1);
+                    *start.get_unchecked_mut(id) = doc + 1;
+                    *pairs.as_mut_ptr().add(pairs.len()) = (id as u32) << DOC_BITS | local;
+                    pairs.set_len(pairs.len() + fresh as usize);
                 }
                 // The document's term ids in order, and where its phrase triggers are.
                 if doc != cur {
