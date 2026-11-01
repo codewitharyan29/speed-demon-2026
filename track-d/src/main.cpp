@@ -295,20 +295,24 @@ int main() {
       std::sort(ovs.begin(), ovs.end());
       sort_sp(sp, spn);
     }
+    sync.arrive_and_wait();
     // Renumber by breadth-first regions of up to 8192 nodes, so a search
-    // touches nearby memory. (The spill edges are left out: only the order of
-    // the regions depends on them.)
+    // touches nearby memory. (The spill edges are left out of the traversal:
+    // only the order of the regions depends on them.) A finished region claims
+    // a range of new ids and a range of edge slots with one atomic add, and
+    // copies its rows there while they are still in cache.
     auto claim = [&](u32 v) {
       std::atomic_ref<u64> cell(vis[v / 64]);
       u64 bit = 1ULL << v % 64;
       return !(cell.load(rx) & bit) && !(cell.fetch_or(bit, rx) & bit);
     };
+    size_t nsp = spn;
     u32 qb[8192];
     for (size_t blk; (blk = seed.fetch_add(1024, rx)) < n;)
       for (u32 r = blk; r < std::min<size_t>(blk + 1024, n); r++) {
         if (!claim(r))
           continue;
-        u32 h = 0, t = 1;
+        u32 h = 0, t = 1, edges = 0;
         for (qb[0] = r; h < t && t < 8192; h++) {
           h + 4 < t && (__builtin_prefetch(e4 + 4 * (size_t)qb[h + 4]), 1);
           for (u32 c = 0, x = qb[h]; c < std::min<u32>(cnt[x], 4) && t < 8192;
@@ -317,35 +321,36 @@ int main() {
               qb[t++] = v, __builtin_prefetch(e4 + 4 * (size_t)v),
               __builtin_prefetch(cnt + v);
         }
-        size_t base = rank.fetch_add(t, rx);
         for (u32 k = 0; k < t; k++)
-          nid[qb[k]] = base + k, first[base + k + 1] = cnt[qb[k]];
+          edges += cnt[qb[k]];
+        size_t at = rank.fetch_add((size_t)t << 32 | edges, rx);
+        u32 id = at >> 32, dst = (u32)at;
+        for (u32 k = 0; k < t; k++, id++) {
+          u32 x = qb[k], cx = cnt[x];
+          nid[x] = id, first[id] = dst;
+          for (u32 c = 0; c < std::min(cx, 4u); c++, dst++) {
+            adj[dst] = e4[4 * (size_t)x + c]; // the target is still an old id
+            (adj[dst] & 2047) == 2047 &&
+                (ov1[tid].push_back({dst, heavy(ovs, 4 * x + c)}), 1);
+          }
+          if (cx > 4)
+            for (auto *a = std::lower_bound(
+                     sp, sp + nsp, x,
+                     [](const Sp &y, u32 v) { return y.u < v; });
+                 a < sp + nsp && a->u == x; a++, dst++) {
+              adj[dst] = a->e;
+              (a->e & 2047) == 2047 && (ov1[tid].push_back({dst, a->w}), 1);
+            }
+        }
       }
     sync.arrive_and_wait(); // LAP:bfs
-    tid || (std::partial_sum(first, first + n + 1, first), 1);
-    sync.arrive_and_wait(); // LAP:prefix2
-    size_t nsp = spn;
-    for (size_t u = (size_t)n * tid / T; u < (size_t)n * (tid + 1) / T; u++) {
-      u32 dst = first[nid[u]], cu = cnt[u];
-      for (u32 c = 0; c < 4; c++)
-        _mm_prefetch((const char *)(nid + (e4[4 * (u + 3) + c] >> 11)),
-                     _MM_HINT_T0);
-      for (u32 c = 0; c < std::min(cu, 4u); c++, dst++) {
-        u32 e = e4[4 * u + c];
-        adj[dst] = nid[e >> 11] << 11 | (e & 2047);
-        (e & 2047) == 2047 &&
-            (ov1[tid].push_back({dst, heavy(ovs, (u32)(4 * u + c))}), 1);
-      }
-      if (cu > 4)
-        for (auto *a = std::lower_bound(
-                 sp, sp + nsp, u,
-                 [](const Sp &x, size_t v) { return x.u < v; });
-             a < sp + nsp && a->u == u; a++, dst++) {
-          adj[dst] = nid[a->e >> 11] << 11 | (a->e & 2047);
-          (a->e & 2047) == 2047 && (ov1[tid].push_back({dst, a->w}), 1);
-        }
+    for (size_t i = (size_t)m * tid / T; i < (size_t)m * (tid + 1) / T; i++) {
+      _mm_prefetch((const char *)(nid + (adj[i + 16] >> 11)), _MM_HINT_T0);
+      u32 e = adj[i];
+      adj[i] = nid[e >> 11] << 11 | (e & 2047);
     }
   }); // LAP:build
+  first[n] = m;
   for (auto &v : ov1)
     ov.insert(ov.end(), v.begin(), v.end());
   std::sort(ov.begin(), ov.end());

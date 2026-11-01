@@ -488,3 +488,15 @@ piece is charged in whole; 12 workers cost about 35 MB. `tools`-free recipe:
 | Reverse graph as four-slot rows built in one pass (u16 in-degree counter, spill list for the rest), instead of count + prefix + fill; the backward search reads one row instead of two lines | reverse build 13.3 -> 9.9 ms, queries 44.2 -> 43.4 | kept |
 | Spill lists sorted by node with two 11-bit counting passes instead of `std::sort` | the single-threaded sort of 58k entries was 2.6 ms on the critical path (reverse spills) | kept |
 | Drop each parsed chunk's pages with `MADV_DONTNEED` + `posix_fadvise(DONTNEED)` | cold cache peak 160 -> 127 MB only, and the fadvise evicts the shared input so the next run reads cold (parse 33 -> 50 ms) | rejected |
+
+Board run 4698459 (step 30): T 0.1479 s, M 74.7 MB (was 94-97), S 381, K 26.25, 70.96 pts. The THP finding held on the board: M
+fell by ~20 MB and T improved too. A second board sample of the step 29 code gave T 0.1558 s / M 94.7 MB (first sample 0.1587 s /
+97.4 MB), so the board's run-to-run spread is about 2%.
+
+## Step 31: the BFS regions write the edge array themselves
+
+The scatter wrote the final edge array at random positions (13 ms) after a separate offset prefix (1 ms).
+
+| Change | Local result (ms, median of 15, interleaved) | Verdict |
+|---|---|---|
+| A finished BFS region reserves its range of new ids and its range of edge slots with one atomic add (node count in the high half, edge count in the low half, so the two stay consistent), writes `nid`, `first` (absolute offsets: no prefix pass) and copies the rows of its nodes (still in cache) into its slice of `adj`, with targets still in old ids; a streaming pass then maps every target through `nid` (prefetched); the spill lists and the heavy-weight table are sorted before the BFS (one more barrier) | BFS 13.5 -> 20.5, scatter + prefix 14.2 -> 3.0; total 106.9 -> 102.6, peak 72 MB unchanged | kept |
