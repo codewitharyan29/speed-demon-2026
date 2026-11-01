@@ -560,3 +560,20 @@ rejected, back to the step-25 code (48 chunks).
 
 Also tried locally and rejected: a 2^20-bit miss filter that sends tokens whose bit is clear to a spare empty bucket
 without a branch: cachegrind LL misses 28.4 -> 22.8 M but instructions 6.71 -> 7.56 G; 12 threads 144 -> 151 ms.
+
+## C++ rewrite (Nov 2 session): steps 29-33 (local = laptop in Docker, 12 CPUs, same container for Rust and C++; median of 15 alternating runs)
+
+The Rust version is kept at tag `track-b-rust-best` (da1eb37) and in the ignored `track-b/rust-backup/`. Reference point in the
+same container: Rust 125 ms (range 121-130).
+
+| Step | What | Local ms (median) | Verdict |
+|---|---|---|---|
+| 29 | Straight C++ port of the 48-chunk design with a new table: 64-byte bucket = 7 entries of (44-bit hash tag \| 17-bit id \| trigger bit) + overflow word, bucket from the hash's low bits, ids and flags in the entry (no second lookup); clmul masks the document id off every line (no per-token doc tracking); tokens looked up per flush (>= 384 tokens, whole documents), a branchless "distinct terms of this document" stamp (stamp[0] = current doc makes misses free); counts and pairs recorded once per distinct term | 105-108 | kept (correct on tiny 1-6, sample 1-3, full 1 and 2, example, hand-made 17/21/32/40-byte tokens) |
+| 30 | Terms interned concurrently by the parsing threads (CAS on the table, provisional id = table position, ids renumbered after the sample); no serial interning, no hash/id vectors | 108 -> ~107 (startup phase 8.7 -> 7.0 ms) | kept |
+| 31 | Container design (4 containers of 62.5k documents, one shared posting index per container, each query evaluated once per container) with static slices, then with dynamic sub-chunks and pairs routed to 12 owner streams | 128-136 | rejected: scan 14 ms/thread slower (routing, shared rows), 28 ms/thread of barrier waits on this noisy VM; evaluation itself fell 28 -> 15 ms/thread. Source kept in .out/main_containers_v3.cpp (not in git) |
+| 32 | Bucket-overflow handling out of the lookup loop (cachegrind --branch-sim and a diagnostic variant showed that a branch on "miss in a bucket that overflowed" costs ~10 ms/thread: it is mispredicted and each mispredict throws away the lookups in flight). The loop appends such tokens to a side list branchlessly; they are resolved after the loop. Trigger detection moved into the stamp loop | 109.7 -> 102.2 | kept |
+| 33 | `len > 8 ? 8 * (len - 8) : 0` compiled to a branch (32% mispredicts in cachegrind): replaced with a mask; `has_or` and the list of BOOL queries precomputed (the per-query phrase test and operator scan mispredicted) | 101.6 -> 96.9 | kept |
+
+Per-thread time split on the laptop after step 33 (ms): tokenise ~10, hash ~8.5, lookup ~14.5, record ~17.5, local counting sort ~5, BOOL
+evaluation ~28 (reporting ~5, size_sum ~4). Startup ~7 ms wall, output ~3 ms.
+Parameter sweeps in the noise: flush size 192/384/768 tokens, prefetch distance 8/16/24/32 (kept 384 / 16).
