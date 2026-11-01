@@ -742,8 +742,43 @@ fn main() {
         let mut cur = base;
         (seq.clear(), hits.clear());
         scan(docs, range, base, true, offs, |batch| {
-            // DIAGNOSTIC: tokenise only, to read the cost of the tokeniser from the board.
-            std::hint::black_box(batch.len());
+            // Look every token of the batch up first: the loads are independent, so their cache misses overlap.
+            // First every token's key and home slot, asking for the slot's cache line straight away, so the misses
+            // of the whole batch overlap instead of being waited for one at a time.
+            let (mut found, mut keys) = ([miss; BATCH + 33], [(0, 0); BATCH + 33]);
+            for (k, t) in keys.iter_mut().zip(batch) {
+                *k = short_key(docs, t.at as usize, t.len as usize);
+                probe.prefetch(*k);
+            }
+            for ((m, t), &k) in found.iter_mut().zip(batch).zip(&keys) {
+                *m = probe.find(k, miss);
+                // A token over 16 bytes (none in the generated data) is looked up in full.
+                if t.len > 16 {
+                    *m = long_id(t).map_or(miss, |id| meta(id as usize));
+                }
+            }
+            // Then act on them.
+            for (m, t) in found.iter().zip(batch) {
+                let (id, flags, d) = ((m & 0x3FFFF) as usize, m >> 18 & 3, m >> 20);
+                let (doc, local) = (t.doc, t.doc - base);
+                if flags & 1 != 0 && d != NO_BITS {
+                    // A term with a bitset: set the document's bit.
+                    rows[d as usize * wl + local as usize / 64] |= 1 << (local % 64);
+                } else if flags & 1 != 0 && start[id] != doc + 1 {
+                    // Any other BOOL term: a pair, once per document.
+                    start[id] = doc + 1;
+                    pairs.push((id as u32) << DOC_BITS | local);
+                }
+                // The document's term ids in order, and where its phrase triggers are.
+                if doc != cur {
+                    check(seq, hits, cur - base, matched);
+                    (seq.clear(), hits.clear(), cur = doc);
+                }
+                if flags & 2 != 0 {
+                    hits.push(seq.len() as u32);
+                }
+                seq.push(id as u32);
+            }
             true
         });
         check(seq, hits, cur - base, matched);
@@ -795,6 +830,7 @@ fn main() {
         }
         // Every BOOL query, on this chunk's documents.
         for (q, query) in queries.iter().enumerate().filter(|(_, q)| !q.phrase) {
+            // DIAGNOSTIC: no BOOL evaluation, to read its cost from the board.
             if std::hint::black_box(true) { continue; }
             let start = operand(query.terms[0]);
             if matches!(start, Operand::List(l) if l.is_empty()) && !query.ops.contains(&b'O') {
