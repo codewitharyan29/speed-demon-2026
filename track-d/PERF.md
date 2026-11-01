@@ -523,3 +523,19 @@ Board run db9072a (step 32): T 0.1370 s, M 74.4 MB, S 397, K 27.13, 71.67 pts, t
 |---|---|---|
 | Grow the side with the smaller live frontier instead of the side whose lowest distance is smaller; or a hybrid of the two | queries 40.3 / 41.3 vs 39.9 ms | no effect, kept the original |
 | Queue pool 65536 -> 262144 entries per direction (the real data needs ~6000 live entries; an overflow would corrupt memory, and the untouched pages cost nothing) | total 100.5 vs 101.2 ms, peak 72 MB both | kept as insurance |
+
+Board run 4fa0bee (step 33): T 0.1351 s, M 74.4 MB, S 397, K 27.32, 71.82 pts (12th of 107; Lex 29.68 / 73.62).
+
+## Step 34: no `has_in` bitset
+
+A probe that simply deleted the per-line `has_in` update made the parse lap 28.3 -> 23.6 ms: every thread tests the same 218 KB
+bitset on every line and the first setter of each bit does an atomic OR, so those lines move between cores.
+
+| Change | Result (local, interleaved) | Verdict |
+|---|---|---|
+| Drop `has_in`: a target has an incoming edge exactly when its reverse row is not empty, so the queries are parsed after the reverse build and pruned with `rcnt[nid[t]]`; the build arrays are freed in pieces (`e4`, then `cnt`; `nid` after the queries) so the peak does not rise | parse 25.8 -> 22.4 (THP madvise), 23.7 -> 22.1 (always); total 110.7 -> 106.5 and 110.3 -> 109.1; peak 72-73 MB | kept |
+| Hoist the loop bounds in the BFS expansion | BFS 23.9 -> 21.3 in one run, but the parse moved the other way: tied | kept (free) |
+| Merge the reverse build into the translate pass | not built: it needs `e4` freed first and raises the peak by ~3 MB (-0.8% K) for ~2 ms (+1% K) | skipped |
+
+The first version of this change crashed: freeing the old block in pieces left holes that the reverse arrays were then mapped
+into, and a later whole-block `munmap` unmapped them. Only the pages of `nid` itself are freed at that point now.

@@ -278,7 +278,7 @@ int main() {
   auto e4 = anon(cells), nid = e4 + 4 * (size_t)n + 16;
   auto cnt = (u16 *)(nid + n + 16);
   auto sp = anon<Sp>(m + 16);
-  auto vis = anon<u64>(2 * (n / 64 + 1)), has_in = vis + n / 64 + 1;
+  auto vis = anon<u64>(n / 64 + 1);
   first = anon(n + 2), adj = anon(m);
   std::atomic<size_t> job = 0, seed = 0, rank = 0, spn = 0;
   std::barrier sync(T);
@@ -300,8 +300,6 @@ int main() {
                                    (ov0[tid].push_back({4 * u + slot, w}), 1);
           else
             sp[spn.fetch_add(1, rx)] = {u, e, w};
-          if (!(has_in[v / 64] >> v % 64 & 1))
-            std::atomic_ref<u64>(has_in[v / 64]).fetch_or(1ULL << v % 64, rx);
         }
       }
     sync.arrive_and_wait(); // LAP:parse
@@ -331,8 +329,8 @@ int main() {
         u32 h = 0, t = 1, edges = 0;
         for (qb[0] = r; h < t && t < 8192; h++) {
           h + 4 < t && (__builtin_prefetch(e4 + 4 * (size_t)qb[h + 4]), 1);
-          for (u32 c = 0, x = qb[h]; c < std::min<u32>(cnt[x], 4) && t < 8192;
-               c++)
+          for (u32 c = 0, x = qb[h], lim = std::min<u32>(cnt[x], 4);
+               c < lim && t < 8192; c++)
             if (u32 v = e4[4 * (size_t)x + c] >> 11; claim(v))
               qb[t++] = v, __builtin_prefetch(e4 + 4 * (size_t)v),
               __builtin_prefetch(cnt + v);
@@ -371,18 +369,11 @@ int main() {
     ov.insert(ov.end(), v.begin(), v.end());
   std::sort(ov.begin(), ov.end());
 
-  // Answer what needs no search; the rest become (source, target, index)
-  // triples in the new ids, sorted by source.
-  std::vector<std::array<u32, 3>> work;
-  std::vector<long> ans;
-  const char *qp = map("/data/queries.txt", qlen), *qe = qp + qlen;
-  while (qp < qe) {
-    u32 s = num(qp), t = num(qp), a = nid[s], b = nid[t];
-    ans.push_back(s == t ? 0 : -1);
-    if (s != t && (has_in[t / 64] >> t % 64 & 1) && first[a + 1] > first[a])
-      work.push_back({a, b, (u32)ans.size() - 1});
-  }
-  munmap(e4, cells * 4 + 4096);
+  // Free what the build no longer needs (nid stays for the queries).
+  uintptr_t cs = ((uintptr_t)cnt + 4095) & ~4095ULL,
+            ce = (uintptr_t)e4 + ((cells * 4 + 4096 + 4095) & ~4095ULL);
+  munmap(e4, (4 * (size_t)n + 16) * 4 & ~4095ULL);
+  ce > cs &&munmap((void *)cs, ce - cs);
   // The reverse graph in the final ids, four slots per node like the input.
   re4 = anon(4 * (size_t)n + 64), rcnt = anon<u16>(n + 8);
   rsp = anon<Sp>(m + 16);
@@ -411,6 +402,20 @@ int main() {
   for (auto &v : rov1)
     rov.insert(rov.end(), v.begin(), v.end());
   std::sort(rov.begin(), rov.end());
+  // Answer what needs no search; the rest become (source, target, index)
+  // triples in the new ids, sorted by source.
+  std::vector<std::array<u32, 3>> work;
+  std::vector<long> ans;
+  const char *qp = map("/data/queries.txt", qlen), *qe = qp + qlen;
+  while (qp < qe) {
+    u32 s = num(qp), t = num(qp), a = nid[s], b = nid[t];
+    ans.push_back(s == t ? 0 : -1);
+    if (s != t && rcnt[b] && first[a + 1] > first[a])
+      work.push_back({a, b, (u32)ans.size() - 1});
+  }
+  uintptr_t ns = ((uintptr_t)nid + 4095) & ~4095ULL,
+            ne = (uintptr_t)cnt & ~4095ULL; // the pages of nid itself
+  ne > ns &&munmap((void *)ns, ne - ns);
   std::sort(work.begin(), work.end()); // LAP:prep
 
   // Each thread starts on its own slice of the queries, then helps with the
