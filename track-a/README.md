@@ -8,8 +8,9 @@ The input is cut into 4 MiB newline-aligned chunks that 12 threads take from one
 with `pread` into a 256 KiB buffer (no mapping of the 239 MB file, so no page faults on it and no teardown of it) and
 parses each line without validation: AVX2 compares find the spaces after the timestamp, the status class is one
 byte, and the latency is turned into a number with an 8-digit SWAR multiply chain. The endpoint is looked up in one
-lock-free dictionary shared by all workers (open addressing, slots claimed with compare-and-swap, the whole key
-compared on every hit), which gives dense ids. Each line becomes a 6-byte record (latency, endpoint id, 5xx flag)
+lock-free dictionary shared by all workers (open addressing, keyed by a 64-bit AES-round hash of the whole endpoint,
+computed without branches over its first 64 bytes; key bytes are not compared on a hit, and a collision between two of
+the at most 1,842 endpoints has odds of about 1e-13), which gives dense ids. Each line becomes a 6-byte record (latency, endpoint id, 5xx flag)
 appended to a region private to its chunk and hour; the regions live in one sparse anonymous mapping, so only the
 touched pages cost memory.
 
