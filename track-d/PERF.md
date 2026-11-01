@@ -470,3 +470,21 @@ lines per node (offset array, then the edge list). Out-degree is 2.9 on average 
 | Each node gets four edge slots (`e4[4u + c]`) and a `u16` counter; the first four edges are written in the single parse pass; edges beyond the fourth (about 1.2%, 58k) go to a spill list sorted by node during the BFS; the BFS ignores the spill (it only fixes the order of regions, and every node still becomes a root); the scatter reads one 16-byte row per node and looks the spill up only for nodes with more than four edges | parse 29.3 replaces pass 1 + prefix + pass 2 (11.7 + 0.8 + 27.6 = 40.1); BFS and scatter +1.5 ms each; total 138.2 -> 127.0, peak 65 -> 68 MB | kept |
 
 Exact on 6 tiny, 3 sample, 2 full datasets; ASAN+UBSAN clean on four.
+
+Board run b27c0b0 (step 29): T 0.1587 s (-11%), M 97.4 MB (+15), S 341, K 24.44, 69.4 pts.
+
+## Step 30: reverse graph in four-slot rows, radix-sorted spills, no transparent huge pages
+
+The board's M did not follow the local peak: 84 / 82 / 97 MB for steps 27 / 28 / 29, where the local anon peak was 63 / 65 / 68 MB.
+The local VM has THP set to `madvise`. Forcing it to `always` (a privileged container can write the sysfs file) reproduces the
+board's pattern: peaks 89 / 67 / 90 / 100 MB for steps 26 / 27 / 28 / 29, against board 82 / 84 / 82 / 97. The per-worker
+regions (queue pool, page table, a few hundred distance pages) and the spill arrays are touched sparsely, so each touched 2 MB
+piece is charged in whole; 12 workers cost about 35 MB. `tools`-free recipe:
+`docker run --rm --privileged alpine sh -c "echo always > /sys/kernel/mm/transparent_hugepage/enabled"` (restore `madvise` after).
+
+| Change | Result (local, interleaved) | Verdict |
+|---|---|---|
+| `MADV_NOHUGEPAGE` on every allocation | THP always: peak 110 -> 71 MB at equal speed (121.7 vs 123.8 ms); THP madvise: unchanged. Only the sparse allocations: 86 MB, so other sparse regions matter too | kept |
+| Reverse graph as four-slot rows built in one pass (u16 in-degree counter, spill list for the rest), instead of count + prefix + fill; the backward search reads one row instead of two lines | reverse build 13.3 -> 9.9 ms, queries 44.2 -> 43.4 | kept |
+| Spill lists sorted by node with two 11-bit counting passes instead of `std::sort` | the single-threaded sort of 58k entries was 2.6 ms on the critical path (reverse spills) | kept |
+| Drop each parsed chunk's pages with `MADV_DONTNEED` + `posix_fadvise(DONTNEED)` | cold cache peak 160 -> 127 MB only, and the fadvise evicts the shared input so the next run reads cold (parse 33 -> 50 ms) | rejected |
