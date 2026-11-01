@@ -34,6 +34,7 @@ D = 1 throughout (no dependencies). Output hash on every row below: the board's 
 | 18 | c0a86ae | source of row 12 once more (final HEAD) | run-df1808806b72 | 55.77 | 16.4 | 604 | 23.14 |
 | 19 | 5586502 | name slots as u32 (tag above the id bits): 1 MB instead of 2 MB | run-8836fdcebdbb | 55.81 | 15.3 | 606 | 23.44 |
 | 20 | 95582d0 | branch-free name comparison (`word`), entry found while warming used as a hint | run-c30f1d80a49f | 52.85 | 15.5 | 605 | **24.05** |
+| 21 | 647e26f | region table of bytes holding the country's index in the totals (1 MB, one lookup instead of two) | run-10dbb3692f36 | 47.56 | 14.4 | 606 | **25.70** |
 
 Kept: 1, 3, 4, 7, 8, 10, 12 (13-15 reverted: 64 KiB blocks and eagerly written zeros are the best measured). Rejected or reverted: 2 (equal to 1 within noise, kept for the instruction counts it enabled), 6 (alone: M
 37.5 MB until THP was disabled, then kept as part of 7), 9 (fewer instructions but 2.1 ms slower on the board, cause not found), 11. Rows 5 and 16 show the board's run-to-run noise: 0.04% on one pair, 6% (52.6, 52.9 and 55.8 ms for the same source, rows 12, 16, 18) on the other, so differences below about 3 ms are not distinguishable.
