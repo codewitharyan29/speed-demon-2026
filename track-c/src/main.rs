@@ -311,7 +311,6 @@ fn resolve(c: &Ctx, batch: &mut Batch, aggs: &mut [Agg]) {
         let country = c.dense[c.region.get(r.region).map_or(0, |x| x.load(Relaxed)) as usize] as usize;
         // SAFETY: the name has 32 readable bytes after it, as `record` ensured.
         let name = unsafe { c.names.entry(r.name, r.len, r.hash) };
-        name.mask[country / 64].fetch_or(1 << (country % 64), Relaxed);
         let a = &mut aggs[country];
         a.count += 1;
         a.id_sum += r.id;
