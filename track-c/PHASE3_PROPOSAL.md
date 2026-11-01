@@ -91,3 +91,18 @@ The board ran `80abb30` itself, and Track C did not change during the run. Resto
 control's slowest run, even with 14% fewer instructions. No more board runs on variants of it. This also refines section 3:
 the parse stage is not plainly throughput-bound, because a 230 M-instruction cut with a longer dependency chain made it slower.
 Latency and dependency structure matter at least as much as instruction count.
+
+## 8. P1: home-entry prefetch (approved; local stage only, no board run)
+
+Patch: `docs/track-c-candidates/p1_home_prefetch.patch` against `9fb5c93` (one `_mm_prefetch::<_MM_HINT_ET0>` of
+`entries[home(hash)]` in `record()`; `home` masks the hash to the table size, so the address is always inside the table).
+Source sha256 `<see commit>`, S 630.
+
+* At-home fraction (instrumented build, full seed 1): 2,022,519 of 3,169,025 records with a hint = **63.8%** (60.9% of all
+  3.32 M records). The 40% gate passes.
+* Correctness: 27/27 (9 fixtures x normal, 200-byte blocks with 3,000-byte chunks, overflow checks); memcheck 0 errors on 5
+  inputs; full seed-1 output identical to the control (d8088b1c...).
+* Local timing (4 threads, 60 interleaved runs, twice): +2.1% and +3.5% vs the control; 2 threads +3.4%. The cost of the extra
+  prefetch is consistent; the latency gain it targets cannot show without SMT.
+* **Stopped before the board run**: the approved conditions say to reject a meaningful local regression; the board run needs a
+  separate decision.
