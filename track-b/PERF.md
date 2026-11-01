@@ -32,7 +32,7 @@ They are only used to compare variants, never reported as results.
 | 21 | Leaner scan callback: each bucket index computed once, batch arrays made once per chunk, unchecked indexing where bounds are provable | 23093fe | 0.192 | 41 | 71.850 (K 27.36, 742 lines) |
 | 22 | Spare bitset row (every token sets a bit; one condition left in the bookkeeping) and a tokeniser with one step per token | b8b05c6 | 0.182 | 41 | 72.380 (K 28.03, 749 lines) |
 | 23 | A list term's pair written without a branch (every token stamps and writes; the count moves by 0 or 1) | 84edbf2 | 0.182 | 62 | 70.904 (K 26.19, 750 lines); reverted |
-| 25 | Bitset rows stored in BOOL queries (one random read less per operand in the evaluation) | 7341f08, 90ca9fe | 0.185, 0.180 | 40 | 72.499 (K 28.18, 758 lines) |
+| 25 | Bitset rows stored in BOOL queries (one random read less per operand in the evaluation) | 7341f08, 90ca9fe, 809b213 | 0.185, 0.180, 0.186 | 40 | 72.499 (K 28.18, 758 lines) |
 | 26 | Evaluation operands prefetched a few queries ahead | c274b3a, a24571d | 0.187, 0.193 | 40 | 71.70 (K 27.53, 772 lines); reverted |
 
 ## Local measurements behind step 2 (in-process ms, median)
@@ -516,3 +516,23 @@ noise (12 threads 147 -> 161, +14 lines); judged on the board over two runs agai
 Run 1 (c274b3a, run-919e05d93317): 0.1872 s, 40 MB, K 27.53.
 Run 2 (a24571d, run-2f094248e91e): 0.1925 s. Both runs slower than step 25's (0.185, 0.180) for +14 lines: reverted to the
 step-25 code.
+The reverted code (809b213, the step-25 code again, run-57b9eab683e7): 0.1861 s, 41 MB. Step 25 over three runs: 0.185, 0.180,
+0.186 s (median 0.185), against the step-22 code's 0.182 and 0.208 s.
+
+## Step 27: an outside research report, checked against the measurements (local; cachegrind on the full data)
+
+A long research report (Gemini) ranked five redesigns. Checked against this log: its in-register tokeniser and edge
+masks are step 22; its account of why the fused loop and branch-free bookkeeping failed (register pressure, dummy
+stores) agrees with steps 23-24; its 2 MB arena repeats the experiment that cost +20 MB on the box (step 23); its "hot
+word" L1 cache assumes the frequent words' buckets come from L2/L3, but they stay in L1/L2, and a 40/60 hot-or-not
+branch would add mispredicts. Its largest idea, evaluating each query once over postings kept for every chunk (with
+per-term chunk-presence masks), needs every chunk's postings, their offsets and the threads' pair buffers at once:
+~55-65 MB by this log's counts (the report's 35 MB leaves those out), against at most ~15% of the time.
+
+The two cheap, new items, tested:
+
+| Change | Ir | Mispredicts | 1 thread (median of 7) | 12 threads (median of 11) | Verdict |
+|---|---|---|---|---|---|
+| Step 25 code | 6.711 G | 56.4 M | 785 | 154 | |
+| Miss sentinel: lane 3's metadata is `miss` once the table is final, read as meta[(hit or 8).trailing_zeros()] | 6.661 G | 56.5 M | | | rejected: no change |
+| Lookups 32 at a time instead of 48 | | | 807 | 151 | rejected |
