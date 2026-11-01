@@ -5,12 +5,14 @@
 * **Control:** `9fb5c93` (tag `tc-good-6`). Board: run-99e4e3237a66 K 29.52 (T 36.59 ms, M 13.5 MB, S 629); same source
   run-ec41ba8a226a K 29.76 (T 35.73) and run-a829e7350f95 K 29.40 (T 36.73). `speed-demon`'s `track-c/src/main.rs` is
   byte-identical to `9fb5c93`.
-* **Best candidate: R1** (this branch, `track-c/src/main.rs`): the control with a new name key. A 32-byte key block (length + 1 in
-  byte 0, then up to 31 name bytes) is compared with one AVX2 compare and hashed from the same vector.
-* **Best local result (full seed 1, rustc 1.99.1, `target-cpu=raptorlake`, 50 interleaved runs, 4 threads):** 68.66 ms vs
-  73.12 ms for the control (-6.1%); one thread 210.0 vs 222.2 ms (-5.5%); instructions 1,616 M vs 1,785 M (-9.5%); mispredicts
-  1.71 M vs 2.13 M (-20%); max RSS equal (11.6 MB); S 636 (+7); D 1.
-* **Official result: none yet.** Projected if the local ratio holds: T ≈ 34.4 ms, K ≈ 30.4.
+* **Best candidate: R2** (this branch, `track-c/src/main.rs`) = R1 + R2:
+  * R1: the control with a new name key. A 32-byte key block (length + 1 in byte 0, then up to 31 name bytes) is compared
+    with one AVX2 compare and hashed from the same vector.
+  * R2: the id, region id and amount converted together in one AVX2 pass.
+* **Best local result (full seed 1, rustc 1.99.1, `target-cpu=raptorlake`, 80 interleaved runs, 4 threads):** R2 66.22 ms,
+  R1 68.29, control 72.00 (R2 -8.0%); 2 threads R2 -5.0% vs R1; instructions 1,530 M vs 1,785 M (-14%); max RSS equal; S 656
+  (+27); D 1.
+* **Official result: none yet.** Projected if the local ratio holds: R2 T ≈ 33.7 ms, K ≈ 30.6 (R1 ≈ 30.4).
 
 ## Formula (verified in the organisers' `harness/scoring.py`)
 
@@ -38,7 +40,8 @@ stream instead.
 | Candidate | Language | Architecture | T local (4 thr) | M (RSS) | S | D | Local K estimate | Official K |
 |---|---|---|---:|---:|---:|---:|---:|---:|
 | control `9fb5c93` | Rust | direct hash-indexed entries, 24-byte inline name compared as 3 masked words, u128 hash | 73.12 ms | 11.6 MB | 629 | 1 | 29.52 (board) | 29.40-29.76 |
-| **R1** | Rust | same, 32-byte key block: one-vector compare and hash | **68.66 ms** | 11.6 MB | 636 | 1 | **30.4** | N/A |
+| R1 | Rust | same, 32-byte key block: one-vector compare and hash | 68.29 ms | 11.6 MB | 636 | 1 | 30.4 | N/A |
+| **R2** | Rust | R1 + id, region and amount converted together with AVX2 (`maddubs`, `madd`, `mul_epu32`) | **66.22 ms** | 11.6 MB | 656 | 1 | **30.6** | N/A |
 
 ## Experiment history (this session and the one before, against the control)
 
@@ -49,6 +52,7 @@ stream instead.
 | huge pages for the entry table only (`PR_THP_DISABLE_EXCEPT_ADVISED`) | 69.95 vs 69.83 ms over 80 runs | rejected |
 | separators popped directly from the bitmasks instead of the `at` array | analysis: the branch-free form costs the same ~40 instructions per record, the branchy form mispredicts at irregular word boundaries | not built |
 | **R1: 32-byte key block, vector compare, vector hash** | -9.5% instructions, -20% mispredicts, -6.1% T | **kept** |
+| R2: the three numbers in one AVX2 pass (one branch for a number over 8 digits) | -5.3% instructions; 80 runs: -3.0% vs R1 at 4 threads, -5.0% at 2 | kept (+20 lines, net about +1% K over R1) |
 | R1 with `_mm256_blend_epi16` to set byte 0 (first version) | **wrong**: that blend works per 128-bit lane, so name bytes 15-16 were not compared; caught by the new twins fixture | fixed with `_mm256_insert_epi8` |
 
 ## Technical explanation
@@ -67,7 +71,7 @@ access, though it is well defined at the instruction level on x86.
 
 ## Correctness
 
-R1 is identical to an independent reference (`tools/c_ref.py`, which reproduces the published sha256 of full and sample seed 1) on
+R1 and R2 are each identical to an independent reference (`tools/c_ref.py`, which reproduces the published sha256 of full and sample seed 1) on
 tiny, sample and full seed 1, adversarial, hostile-LF, three stress files, and the new **twins** file (`tools/c_twins_gen.py`:
 names that differ from one another in exactly one byte at every position 0-40, with `""` pairs and trailing spaces). It also matches
 with 200-byte blocks and 3,000-byte chunks, and with overflow checks and debug assertions: 27 of 27 runs. Memcheck reports 0
@@ -98,7 +102,7 @@ python3 -I tools/c_local_bench.py 50 tc6 r1
 
 ## Final recommendation
 
-Submit R1 to the board twice against the control's three runs (29.40-29.76). It is the only candidate here with a measured gain on
-both instructions and time, it costs no memory, and S grows by 7 lines (-0.17% K). The gap to K 47.5 (T about 18 ms) is not closed by
+Submit R2 (this branch's head) to the board twice against the control's three runs (29.40-29.76). If its board T is not at least
+about 1% better than R1's would be, R1 (`7c64950`) is the fallback: 7 lines more than the control instead of 27. The gap to K 47.5 (T about 18 ms) is not closed by
 this; the profiles say the remaining time is the stage-2 record parse (about 220 instructions per record) and the lookup and mask
 write (about 130), with no single dominant term left.

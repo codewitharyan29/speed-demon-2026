@@ -273,13 +273,22 @@ fn digits8(w: u64) -> u64 {
 // The functions that read the buffer without bounds checks rely on one fact: the buffer extends 64 bytes past the data
 // (`PAD`), and every index they use is at most a separator position plus 8.
 
-/// The decimal number of `n` digits (1 or more) at `b[i..]`. Up to 8 digits are converted at once, without a branch.
+/// The decimal numbers of `n` digits (1 or more) at `b[i..]` for each `(i, n)`: up to 8 digits each in one AVX2 pass, longer
+/// ones digit by digit.
 #[inline(always)]
-unsafe fn digits(b: &[u8], i: usize, n: usize) -> u64 {
-    if n > 8 {
-        return (i..i + n).fold(0, |v, k| v * 10 + (*b.get_unchecked(k) - b'0') as u64);
+unsafe fn numbers(b: &[u8], f: [(usize, usize); 3]) -> [u64; 3] {
+    if f.iter().any(|&(_, n)| n > 8) {
+        return f.map(|(i, n)| (i..i + n).fold(0, |v, k| v * 10 + (*b.get_unchecked(k) - b'0') as u64));
     }
-    digits8((b.as_ptr().add(i) as *const u64).read_unaligned() << (8 * (8 - n)))
+    // Each number's digits go to the high bytes of a word, most significant digit first, zeros before them.
+    let w = f.map(|(i, n)| ((b.as_ptr().add(i) as *const u64).read_unaligned() << (8 * (8 - n))) as i64);
+    let x = _mm256_and_si256(_mm256_setr_epi64x(w[0], w[1], w[2], 0), _mm256_set1_epi8(0x0F));
+    let x = _mm256_maddubs_epi16(x, _mm256_set1_epi16(0x010A)); // pairs of digits
+    let x = _mm256_madd_epi16(x, _mm256_set1_epi32(0x0001_0064)); // groups of four
+    let x = _mm256_add_epi64(_mm256_mul_epu32(x, _mm256_set1_epi64x(10000)), _mm256_srli_epi64::<32>(x));
+    let mut out = [0u64; 4];
+    _mm256_storeu_si256(out.as_mut_ptr() as _, x);
+    [out[0], out[1], out[2]]
 }
 
 /// Where the quotes are in a buffer: bit i of word w is set if byte 64 w + i is a `"`, and `before[w]` quotes precede word w.
@@ -355,8 +364,9 @@ unsafe fn record(c: &Ctx, b: &[u8], q: &Quotes, start: usize, sep: &[u32], batch
     (sep_bad == 0 && (!bom || (b.as_ptr().add(start + 1) as *const u16).read_unaligned() == 0xBFBB)).then_some(())?;
     let (neg, cr) = (at(e4 + 1) == b'-', (at(e5 - 1) == b'\r') as usize);
     let (whole_at, dot) = (e4 + 1 + neg as usize, e5 - cr - 3); // the amount ends in ".dd"
-    let cents = (digits(b, whole_at, dot - whole_at) * 100 + (at(dot + 1) - b'0') as u64 * 10 + (at(dot + 2) - b'0') as u64) as i64;
-    let (id, region) = (digits(b, p, e1 - p), digits(b, e3 + 1, e4 - e3 - 1) as usize);
+    // The id, the region id and the whole part of the amount, converted together.
+    let [id, region, whole] = numbers(b, [(p, e1 - p), (e3 + 1, e4 - e3 - 1), (whole_at, dot - whole_at)]);
+    let (region, cents) = (region as usize, (whole * 100 + (at(dot + 1) - b'0') as u64 * 10 + (at(dot + 2) - b'0') as u64) as i64);
     // An unquoted text field has no quotes; a quoted one has its two delimiters and two more for every `""` pair inside.
     let (qname, qnote) = ((q.before(e2) - q.before(e1)) as usize, (q.before(e3) - q.before(e2)) as usize);
     let (name_quoted, note_quoted) = ((qname != 0) as usize, (qnote != 0) as usize);
