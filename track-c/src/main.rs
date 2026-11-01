@@ -18,6 +18,10 @@ use std::io::Write;
 use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering::*};
 
+extern "C" {
+    fn prctl(option: i32, ...) -> i32;
+}
+
 const BLOCK: usize = 64 << 10; // bytes read at a time
 const PAD: usize = 64; // zero bytes after the data in a buffer, which the parser may read
 const BATCH: usize = 16; // records looked up together
@@ -524,6 +528,8 @@ fn run(regions: &File, file: &File, len: usize, bits: u32, chunk: usize) -> Opti
 }
 
 fn main() {
+    // PR_SET_THP_DISABLE: with transparent huge pages every sparsely touched 2 MiB of the big tables would be backed in full.
+    unsafe { prctl(41, 1u64, 0u64, 0u64, 0u64) };
     let regions = File::open("/data/regions.csv").unwrap();
     let file = File::open("/data/records.csv").unwrap();
     let len = file.metadata().unwrap().len() as usize;
