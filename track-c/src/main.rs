@@ -90,7 +90,7 @@ impl Names {
             }
             if v >> 32 == h >> 32 {
                 // SAFETY: prefetching has no effect on correctness, whatever the address.
-                return unsafe { _mm_prefetch::<_MM_HINT_ET0>(&self.entries[(v & 0xFFFF_FFFF) as usize - 1] as *const Entry as *const i8) };
+                return unsafe { _mm_prefetch::<_MM_HINT_T0>(&self.entries[(v & 0xFFFF_FFFF) as usize - 1] as *const Entry as *const i8) };
             }
             i = (i + 1) & (self.slots.len() - 1);
         }
@@ -348,6 +348,7 @@ unsafe fn record(c: &Ctx, b: &[u8], q: &Quotes, start: usize, sep: &[u32], batch
     batch.owned.extend(owned);
     // SAFETY: both buffers have 32 readable bytes after the name; the hash reads at most 16 around its ends.
     let hash = hash(name, len);
+    _mm_prefetch::<_MM_HINT_T0>(c.names.slot(hash) as *const AtomicU64 as *const i8);
     if let Some(r) = c.region.get(region) {
         _mm_prefetch::<_MM_HINT_T0>(r as *const AtomicU16 as *const i8);
     }
@@ -358,10 +359,12 @@ unsafe fn record(c: &Ctx, b: &[u8], q: &Quotes, start: usize, sep: &[u32], batch
 
 /// Looks up the countries and names of the records in `batch` and adds them to `aggs`.
 fn resolve(c: &Ctx, batch: &mut Batch, aggs: &mut [Agg]) {
+    batch.recs.iter().for_each(|r| c.names.warm(r.hash));
     for r in batch.recs.iter() {
         let country = c.dense[c.region.get(r.region).map_or(0, |x| x.load(Relaxed)) as usize] as usize;
         // SAFETY: the name has 32 readable bytes after it, as `record` ensured.
-        let _ = (r.name, r.hash); // DIAGNOSTIC: no name lookups
+        let name = unsafe { c.names.entry(r.name, r.len, r.hash) };
+        let _ = (name, country); // DIAGNOSTIC: entries are only read
         let a = &mut aggs[country];
         a.count += 1;
         a.id_sum += r.id;
