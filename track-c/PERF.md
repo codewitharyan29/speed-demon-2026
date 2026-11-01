@@ -126,3 +126,14 @@ sharing the table costs something, but not through the mask writes.
 
 Both candidates need board runs (two each, given the board's 6% noise). Projected K if the 4-thread ratios carried over (they did
 not always, see above): A 28.8, B 29.5.
+
+## Session 6 (branch `cloud/track-c-extreme-rewrite`, local only)
+
+| Candidate | Change on top of 9fb5c93 | 4 threads, 80 runs | Instructions (full) | S | Board |
+|---|---|---:|---:|---:|---|
+| control 9fb5c93 | | 72.00 ms | 1,785 M | 629 | K 29.40-29.76 (three runs) |
+| R1 `7c64950` | 32-byte name key block: one AVX2 compare, hash from the same vector | 68.29 ms (-5.1%) | 1,616 M | 636 | not run |
+| **R2 `736e57a`** | R1 + id, region id and amount converted in one AVX2 pass | **66.22 ms (-8.0%)** | **1,530 M** | 656 | not run |
+
+New fixture `tools/c_twins_gen.py` (names differing in exactly one byte at every position 0-40). It caught a lane-wise blend that
+left name bytes 15-16 uncompared in the first R1 draft. Details: [EXTREME_REWRITE_REPORT.md](EXTREME_REWRITE_REPORT.md).
