@@ -12,13 +12,37 @@ constexpr u32 NIL = ~0u, RING = 4096, POOL = 65536, T = 12;
 constexpr u32 CHUNKS = 48;
 constexpr auto rx = std::memory_order_relaxed;
 static u32 n, m, *first, *adj; // CSR (renumbered): offsets and packed edges
-static Ov ov;                  // true weights of edges packed as 2047
-static u32 *rfirst, *radj;     // the same graph with every edge reversed
-static Ov rov;                 // true weights of reversed edges packed as 2047
+struct Sp {                    // an edge beyond the fourth of its node
+  u32 u, e;
+  u64 w;
+};
+static Sp *rsp;
 
+// Sorts spilled edges by node: two counting passes over 11 bits each.
+static void sort_sp(Sp *a, size_t k) {
+  std::vector<Sp> t(k);
+  for (int sh = 0; sh < 22; sh += 11) {
+    u32 c[2049] = {};
+    for (size_t i = 0; i < k; i++)
+      c[(a[i].u >> sh & 2047) + 1]++;
+    std::partial_sum(c, c + 2049, c);
+    for (size_t i = 0; i < k; i++)
+      t[c[a[i].u >> sh & 2047]++] = a[i];
+    std::copy(t.begin(), t.end(), a);
+  }
+}
+static Ov ov;     // true weights of edges packed as 2047
+static u32 *re4;  // the graph with every edge reversed, four slots
+static u16 *rcnt; // per node, like the input; here: edges per node
+static size_t rn; // and the reversed edges beyond the fourth
+static Ov rov;    // true weights of reversed edges packed as 2047
+
+// Zeroed memory. Transparent huge pages are off: the sparse structures would
+// be charged in whole 2 MB pieces.
 template <class P = u32> static P *anon(size_t count) {
-  return (P *)mmap(0, count * sizeof(P) + 4096, 3, MAP_PRIVATE | MAP_ANONYMOUS,
-                   -1, 0);
+  void *p =
+      mmap(0, count * sizeof(P) + 4096, 3, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  return madvise(p, count * sizeof(P) + 4096, MADV_NOHUGEPAGE), (P *)p;
 }
 
 static const char *map(const char *path, size_t &len) {
@@ -142,9 +166,14 @@ struct Dist {
   }
 };
 
-// One direction of the search: its own CSR, queue and lower bound.
+// One direction of the search: its own graph, queue and lower bound. The
+// forward graph is a CSR (first, adj); the reverse one has four slots per node
+// (adj, cnt) and the edges beyond the fourth in sp.
 struct Side {
   const u32 *first, *adj;
+  const u16 *cnt;
+  const Sp *sp;
+  size_t nsp;
   const Ov *ov;
   Dial q;
   u32 low = 0; // no node with a smaller distance is left to settle
@@ -154,23 +183,44 @@ struct Side {
 // with the other direction in mu. SH is 0 for the forward half of a word.
 template <int SH>
 static void expand(Side &S, Dist &D, u32 u, u32 d, u32 &mu, bool &big) {
-  u64 r;
-  memcpy(&r, S.first + u, 8);
-  for (u32 i = (u32)r; i < r >> 32; i++) {
-    u32 e = S.adj[i], v = e >> 11, w = e & 2047, x = D.get(v);
-    u64 nd = d + (w == 2047 ? heavy(*S.ov, i) : w);
+  auto relax = [&](u32 e, u64 wt) {
+    u32 v = e >> 11, x = D.get(v);
+    u64 nd = d + wt;
     if (__builtin_expect(nd >= 60000, 0)) {
       big = 1; // too long for 16 bits
-      continue;
+      return;
     }
     u16 inv = ~(u16)nd, mine = x >> SH, other = x >> (16 - SH);
     if (inv > mine) {
       D.set(v, x & ~(0xFFFFu << SH) | inv << SH);
       S.q.push(nd >> 4, v);
       other && (mu = std::min(mu, (u32)nd + (u16)~other), 1);
-      _mm_prefetch((const char *)(S.first + v), _MM_HINT_T0);
+      if constexpr (SH)
+        _mm_prefetch((const char *)(S.adj + 4 * (size_t)v), _MM_HINT_T0),
+            _mm_prefetch((const char *)(S.cnt + v), _MM_HINT_T0);
+      else
+        _mm_prefetch((const char *)(S.first + v), _MM_HINT_T0);
     }
+  };
+  u32 lo, hi;
+  if constexpr (SH)
+    lo = 4 * u, hi = lo + std::min<u32>(S.cnt[u], 4);
+  else {
+    u64 r;
+    memcpy(&r, S.first + u, 8);
+    lo = r, hi = r >> 32;
   }
+  for (u32 i = lo; i < hi; i++) {
+    u32 e = S.adj[i], w = e & 2047;
+    relax(e, w == 2047 ? heavy(*S.ov, i) : w);
+  }
+  if constexpr (SH)
+    if (S.cnt[u] > 4)
+      for (auto *a =
+               std::lower_bound(S.sp, S.sp + S.nsp, u,
+                                [](const Sp &x, u32 v) { return x.u < v; });
+           a < S.sp + S.nsp && a->u == u; a++)
+        relax(a->e, a->w);
 }
 
 static long fast(u32 s, u32 t, Dist &D, Side &F, Side &R) {
@@ -208,10 +258,6 @@ int main() {
   // e4: the first four edges of every node (target << 11 | weight), cnt: how
   // many edges every node has, nid: the new id of every node. Edges beyond the
   // fourth (about 1%) go to a spill list.
-  struct Sp {
-    u32 u, e;
-    u64 w;
-  };
   size_t cells = 5 * (size_t)n + n / 2 + 64;
   auto e4 = anon(cells), nid = e4 + 4 * (size_t)n + 16;
   auto cnt = (u16 *)(nid + n + 16);
@@ -247,8 +293,7 @@ int main() {
       for (auto &v : ov0)
         ovs.insert(ovs.end(), v.begin(), v.end());
       std::sort(ovs.begin(), ovs.end());
-      std::sort(sp, sp + spn,
-                [](const Sp &a, const Sp &b) { return a.u < b.u; });
+      sort_sp(sp, spn);
     }
     // Renumber by breadth-first regions of up to 8192 nodes, so a search
     // touches nearby memory. (The spill edges are left out: only the order of
@@ -317,30 +362,31 @@ int main() {
       work.push_back({a, b, (u32)ans.size() - 1});
   }
   munmap(e4, cells * 4 + 4096);
-  // The reverse graph, in the final ids: count in-degrees, prefix, fill.
-  rfirst = anon(n + 2), radj = anon(m);
-  std::barrier rsync(T);
+  // The reverse graph in the final ids, four slots per node like the input.
+  re4 = anon(4 * (size_t)n + 64), rcnt = anon<u16>(n + 8);
+  rsp = anon<Sp>(m + 16);
+  std::atomic<size_t> rcount = 0;
   Ov rov1[T];
   par([&](u32 tid) {
     size_t lo = (size_t)n * tid / T, hi = (size_t)n * (tid + 1) / T;
-    for (u32 i = first[lo]; i < first[hi]; i++) {
-      _mm_prefetch((const char *)(rfirst + (adj[i + 16] >> 11) + 2),
-                   _MM_HINT_T0);
-      std::atomic_ref<u32>(rfirst[(adj[i] >> 11) + 2]).fetch_add(1, rx);
-    }
-    rsync.arrive_and_wait();
-    tid || (std::partial_sum(rfirst + 1, rfirst + n + 2, rfirst + 1), 1);
-    rsync.arrive_and_wait();
     for (size_t u = lo; u < hi; u++)
       for (u32 i = first[u]; i < first[u + 1]; i++) {
-        _mm_prefetch((const char *)(rfirst + (adj[i + 16] >> 11) + 1),
-                     _MM_HINT_T0);
-        u32 e = adj[i];
-        u32 pos = std::atomic_ref<u32>(rfirst[(e >> 11) + 1]).fetch_add(1, rx);
-        radj[pos] = u << 11 | (e & 2047);
-        (e & 2047) == 2047 && (rov1[tid].push_back({pos, heavy(ov, i)}), 1);
+        u32 pv = adj[i + 16] >> 11;
+        __builtin_prefetch(rcnt + pv, 1),
+            __builtin_prefetch(re4 + 4 * (size_t)pv, 1);
+        u32 e = adj[i], v = e >> 11, w = e & 2047, r = u << 11 | w;
+        u32 slot = std::atomic_ref<u16>(rcnt[v]).fetch_add(1, rx);
+        u64 hw = w == 2047 ? heavy(ov, i) : w;
+        if (slot < 4)
+          re4[4 * (size_t)v + slot] = r,
+                              w == 2047 &&
+                                  (rov1[tid].push_back({4 * v + slot, hw}), 1);
+        else
+          rsp[rcount.fetch_add(1, rx)] = {v, r, hw};
       }
   }); // LAP:reverse
+  rn = rcount;
+  sort_sp(rsp, rn);
   for (auto &v : rov1)
     rov.insert(rov.end(), v.begin(), v.end());
   std::sort(rov.begin(), rov.end());
@@ -356,8 +402,8 @@ int main() {
     auto pool = anon<u64>(2 * POOL + 257 * (size_t)P + 2); // queues | pages
     auto pt = (u32 *)(pool + 2 * POOL);
     Dist D{pt, pt + P, 1, pt + 2 * P};
-    Side F{first, adj, &ov, Dial(pool)},
-        R{rfirst, radj, &rov, Dial(pool + POOL)};
+    Side F{first, adj, 0, 0, 0, &ov, Dial(pool)},
+        R{0, re4, rcnt, rsp, rn, &rov, Dial(pool + POOL)};
     for (u32 k = 0; k < T; k++)
       for (size_t j, who = (tid + k) % T, end = (who + 1) * work.size() / T;
            (j = cur[who * 8].fetch_add(1, rx)) < end;)
