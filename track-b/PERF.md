@@ -511,3 +511,5 @@ Run 2 (90ca9fe, run-f1da6792f609): 0.1797 s, 40 MB, K 28.18. Against the step-22
 For the BOOL query 16 places on, the posting starts of its list terms are prefetched, and for the one 8 places on (whose
 starts are in cache by then) its postings, so the evaluation's dependent random reads overlap. Locally slower within
 noise (12 threads 147 -> 161, +14 lines); judged on the board over two runs against step 25's 0.185 and 0.180 s.
+
+Run 1 (c274b3a, run-919e05d93317): 0.1872 s, 40 MB, K 27.53.
