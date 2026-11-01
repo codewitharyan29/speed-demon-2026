@@ -261,3 +261,11 @@ cache sizes differ, so this one needs the board's word.
 Full seed-1 output sha256 495ca096...: identical on 5 consecutive runs. Byte-identical to the original implementation on
 the tiny and sample data and on four stress inputs from `tools/stress_a.py` (endpoints of 1..125 bytes with shared
 heads and tails, 1..10 digit latencies up to 4294967295, 1,800 endpoints, shuffled and sorted timestamps).
+
+## Hash-keyed dictionary (from the former track-a1)
+
+The endpoint dictionary is keyed by a 64-bit AES-round hash of the whole endpoint and never compares key bytes on a hit
+(odds of a collision among at most 1,842 endpoints: about 1e-13; stated in README.md). Local A/B, 25 interleaved runs, 8 threads,
+full seed 1: median wall 72 ms against 79 ms for the exact-comparison dictionary (user CPU 181 against 217 ms); memory.peak
+15.5-15.8 MB for both; S 508 against 496 (predicted). Output identical to the reference on tiny, sample, full and the stress and
+edge sets (tools/stress_check.sh, 16 directories). Local numbers only: no board run yet.

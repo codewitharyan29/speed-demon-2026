@@ -41,40 +41,36 @@ fn zeros<T: Default>(n: usize) -> Vec<T> {
     (0..n).map(|_| T::default()).collect()
 }
 
-/// True if the first `len` bytes at `a` and `b` are equal. Both may be read up to 128 bytes past their start.
-#[inline(always)]
-unsafe fn key_eq(a: *const u8, b: *const u8, len: usize) -> bool {
-    let block = |o: usize| {
-        let (x, y) = (_mm256_loadu_si256(a.add(o) as _), _mm256_loadu_si256(b.add(o) as _));
-        _mm256_movemask_epi8(_mm256_cmpeq_epi8(x, y)) as u32 as u64
-    };
-    let need = u64::MAX >> (64 - len.min(64));
-    if (block(0) | block(32) << 32) & need != need {
-        return false;
-    }
-    (64..len).step_by(32).all(|o| {
-        let need = u32::MAX >> (32 - (len - o).min(32));
-        block(o) as u32 & need == need
-    })
-}
-
-/// Hash of an endpoint from its first and last 16 bytes and its length; `key_eq` settles collisions.
+/// 64-bit hash of all `len` bytes at `s` (nonzero); `s` must have 128 readable bytes. The first 64 bytes are always
+/// hashed as four independent AES blocks, so short and long endpoints take the same branch-free path.
 #[inline(always)]
 unsafe fn hash(s: *const u8, len: usize) -> u64 {
-    let read = |p: *const u8| (p as *const u128).read_unaligned();
-    let mix = |x: u128, k: u128| {
-        let r = (x as u64 ^ k as u64) as u128 * ((x >> 64) as u64 ^ (k >> 64) as u64) as u128;
-        r as u64 ^ (r >> 64) as u64
+    let iota = _mm256_set_epi8(31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
+    let block = |o: usize| {
+        let live = _mm256_cmpgt_epi8(_mm256_set1_epi8(len as i32 as i8 - o as i8), iota);
+        _mm256_and_si256(_mm256_loadu_si256(s.add(o) as _), live)
     };
-    let head = read(s) & (!0u128 >> (128 - 8 * len.min(16)));
-    let tail = if len > 16 { read(s.add(len - 16)) } else { 0 };
-    mix(head, 0x9E37_79B9_7F4A_7C15_D6E8_FEB8_6659_FD93) ^ mix(tail, 0xA076_1D64_78BD_642F_E703_7ED1_A0B4_28DB ^ len as u128)
+    let key = |i: i64| _mm_set_epi64x(0x9E37_79B9_7F4A_7C15u64 as i64 ^ i, 0xD6E8_FEB8_6659_FD93u64 as i64 ^ i * 0x517C_C1B7);
+    let (v0, v1) = (block(0), block(32));
+    let t = |x, i| _mm_aesenc_si128(x, key(i));
+    let p = _mm_aesenc_si128(_mm_xor_si128(t(_mm256_castsi256_si128(v0), 1), t(_mm256_extracti128_si256(v0, 1), 2)), key(5));
+    let q = _mm_aesenc_si128(_mm_xor_si128(t(_mm256_castsi256_si128(v1), 3), t(_mm256_extracti128_si256(v1, 1), 4)), key(6));
+    let mut r = _mm_aesenc_si128(_mm_xor_si128(p, q), key(7));
+    let mut o = 64;
+    while o < len {
+        let x = _mm_and_si128(_mm_loadu_si128(s.add(o) as _), _mm_cmpgt_epi8(_mm_set1_epi8(len as i32 as i8 - o as i8), _mm256_castsi256_si128(iota)));
+        r = _mm_aesenc_si128(_mm_xor_si128(r, x), key(8));
+        o += 16;
+    }
+    let r = _mm_aesenc_si128(_mm_xor_si128(r, _mm_set1_epi64x(len as i64)), key(9));
+    (_mm_cvtsi128_si64(r) ^ _mm_extract_epi64(r, 1)) as u64 | 1
 }
 
-/// Endpoint dictionary shared by all workers: open addressing, lock-free lookups, inserts under a lock.
-/// A slot holds `hash tag << 32 | id + 1`; the key bytes live in `keys`, `STRIDE` per id, the length in the last one.
+/// Endpoint dictionary shared by all workers: open addressing keyed by the full 64-bit hash of the endpoint.
+/// Lookups are lock-free and never touch the key bytes; inserts run under a lock.
 struct Dict {
-    slots: Vec<AtomicU64>,
+    hashes: Vec<AtomicU64>,
+    ids: Vec<AtomicU32>,
     keys: usize,
     count: Mutex<usize>,
 }
@@ -82,7 +78,7 @@ struct Dict {
 impl Dict {
     fn new() -> Self {
         let keys = vec![0u8; SLOTS * STRIDE].leak().as_ptr() as usize;
-        Dict { slots: zeros(SLOTS), keys, count: Mutex::new(0) }
+        Dict { hashes: zeros(SLOTS), ids: zeros(SLOTS), keys, count: Mutex::new(0) }
     }
 
     fn ptr(&self, id: usize) -> *mut u8 {
@@ -94,41 +90,37 @@ impl Dict {
         unsafe { std::slice::from_raw_parts(self.ptr(id), *self.ptr(id).add(STRIDE - 1) as usize) }
     }
 
-    /// The id of the endpoint at `s` (`len` bytes, hash `h`) if it is in the probe sequence from `slot`, which is left at
-    /// the empty slot that ends the sequence otherwise.
-    #[inline(always)]
-    unsafe fn find(&self, s: *const u8, len: usize, h: u64, slot: &mut usize) -> Option<u32> {
-        loop {
-            let v = self.slots[*slot].load(Acquire);
-            let id = (v & 0xFFFF) as usize;
-            if v == 0 {
-                return None;
-            }
-            if v >> 32 == h >> 32 && self.key(id - 1).len() == len && key_eq(s, self.ptr(id - 1), len) {
-                return Some(id as u32 - 1);
-            }
-            *slot = (*slot + 1) % SLOTS;
-        }
-    }
-
     /// Id of the endpoint at `s` (`len` bytes, hash `h`), adding it if it is new.
     #[inline(always)]
     unsafe fn lookup(&self, s: *const u8, len: usize, h: u64) -> u32 {
-        let mut slot = h as usize % SLOTS;
-        self.find(s, len, h, &mut slot).unwrap_or_else(|| self.insert(s, len, h, slot))
+        let mut slot = (h >> 40) as usize % SLOTS;
+        loop {
+            let v = self.hashes[slot].load(Acquire);
+            if v == h {
+                return self.ids[slot].load(Relaxed);
+            }
+            if v == 0 {
+                return self.insert(s, len, h, slot);
+            }
+            slot = (slot + 1) % SLOTS;
+        }
     }
 
     #[cold]
     #[inline(never)]
     unsafe fn insert(&self, s: *const u8, len: usize, h: u64, mut slot: usize) -> u32 {
         let mut count = self.count.lock().unwrap();
-        if let Some(id) = self.find(s, len, h, &mut slot) {
-            return id; // another worker added it first
+        while self.hashes[slot].load(Acquire) != 0 {
+            if self.hashes[slot].load(Acquire) == h {
+                return self.ids[slot].load(Relaxed); // another worker added it first
+            }
+            slot = (slot + 1) % SLOTS;
         }
         let id = *count;
         std::ptr::copy_nonoverlapping(s, self.ptr(id), len);
         *self.ptr(id).add(STRIDE - 1) = len as u8;
-        self.slots[slot].store(h & !0xFFFF_FFFF | (id as u64 + 1), Release);
+        self.ids[slot].store(id as u32, Relaxed);
+        self.hashes[slot].store(h, Release);
         *count += 1;
         id as u32
     }
