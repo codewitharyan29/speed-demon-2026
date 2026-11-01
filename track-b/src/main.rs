@@ -115,8 +115,8 @@ fn masks(b: &[u8], at: usize, to: usize) -> (u64, u64) {
 /// Splits b[from..to] into tokens (maximal runs of letters and digits), 64 bytes at a time, and hands them to `f`
 /// in batches until `f` returns false. If `line_start`, `from` begins a line, whose first token (the document id)
 /// is skipped, as is the first token of every later line; `doc` numbers the lines from `first_doc`, and the offset
-/// of every line start goes to `lines`. Token edges are where the letter-or-digit mask flips between neighbouring
-/// bytes; they alternate start, end, start, ...
+/// of every line start goes to `lines`. A token starts at a letter or digit after anything else and ends at anything
+/// else after a letter or digit: the k-th end of a block closes its k-th start (or a token still open from before).
 fn scan(
     b: &[u8],
     (from, to): (usize, usize),
@@ -134,26 +134,32 @@ fn scan(
     for at in (from..to).step_by(64) {
         let (m, nl) = masks(b, at, to);
         let after_nl = nl << 1 | prev_nl;
-        let mut edges = m ^ (m << 1 | prev_alnum);
+        let before = m << 1 | prev_alnum;
+        let (mut starts, mut ends) = (m & !before, !m & before);
         (prev_alnum, prev_nl) = (m >> 63, nl >> 63);
-        while edges != 0 {
-            let p = edges.trailing_zeros();
-            edges &= edges - 1;
+        loop {
             if open {
-                let len = at + p as usize - start;
+                if ends == 0 {
+                    break;
+                }
+                let len = at + ends.trailing_zeros() as usize - start;
+                ends &= ends - 1;
                 // SAFETY: n < BATCH + 32: the batch is handed over once it holds BATCH, and a block adds at most 32.
                 *unsafe { batch.get_unchecked_mut(n) } = Tok {
                     doc: start_doc,
                     at: start as u32,
                     len: len as u32,
                 };
-                n += !skip as usize;
-            } else {
-                start = at + p as usize;
-                start_doc = doc + (nl & ((1u64 << p) - 1)).count_ones();
-                skip = after_nl >> p & 1 == 1;
+                (n, open) = (n + !skip as usize, false);
             }
-            open = !open;
+            if starts == 0 {
+                break;
+            }
+            let p = starts.trailing_zeros();
+            starts &= starts - 1;
+            start = at + p as usize;
+            start_doc = doc + (nl & ((1u64 << p) - 1)).count_ones();
+            (skip, open) = (after_nl >> p & 1 == 1, true);
         }
         let mut newlines = nl;
         while newlines != 0 {
@@ -705,8 +711,10 @@ fn main() {
     // What the scan probes. Per term: its id, whether BOOL queries use it, whether it triggers phrase checks, and its
     // bitset if it has one.
     assert!(ndense < NO_BITS && nkeys + 1 < 1 << 18);
-    let meta = |t: usize| t as u32 | (used[t] as u32 & 3) << 18 | dense_of[t].min(NO_BITS) << 20;
-    let miss = nkeys as u32 | NO_BITS << 20;
+    let list = |t: usize| (used[t] & 1 != 0 && dense_of[t] == u32::MAX) as u32;
+    let meta =
+        |t: usize| t as u32 | (list(t) | used[t] as u32 & 2) << 18 | dense_of[t].min(ndense) << 20;
+    let miss = nkeys as u32 | ndense << 20;
     for b in probe.buckets.iter_mut() {
         for lane in (0..3).filter(|&lane| b.k0[lane] != 0) {
             b.meta[lane] = meta(b.meta[lane] as usize);
@@ -746,7 +754,7 @@ fn main() {
         // postings begin.
         (start.clear(), start.resize(nkeys + 1, 0));
         (pairs.clear(), offs.clear(), rows.clear(), matched.clear());
-        rows.resize(ndense as usize * wl, 0);
+        rows.resize((ndense as usize + 1) * wl, 0);
         let mut cur = base;
         (seq.clear(), hits.clear());
         // A batch's keys (with their home bucket) and what they look up, made once per chunk.
@@ -771,14 +779,13 @@ fn main() {
             for (m, t) in found.iter().zip(batch) {
                 let (id, flags, d) = ((m & 0x3FFFF) as usize, m >> 18 & 3, m >> 20);
                 let (doc, local) = (t.doc, t.doc - base);
-                // SAFETY: a term with a bitset has d < ndense, and local < the chunk's documents <= 64 * wl; every
-                // id is at most nkeys, and `start` has nkeys + 1 entries.
+                // SAFETY: d <= ndense (row ndense is the spare one), and local < the chunk's documents <= 64 * wl;
+                // every id is at most nkeys, and `start` has nkeys + 1 entries.
                 unsafe {
-                    if flags & 1 != 0 && d != NO_BITS {
-                        // A term with a bitset: set the document's bit.
-                        *rows.get_unchecked_mut(d as usize * wl + local as usize / 64) |=
-                            1 << (local % 64);
-                    } else if flags & 1 != 0 && *start.get_unchecked(id) != doc + 1 {
+                    // Every token sets its document's bit: in its term's bitset, or in the spare row.
+                    *rows.get_unchecked_mut(d as usize * wl + local as usize / 64) |=
+                        1 << (local % 64);
+                    if flags & 1 != 0 && *start.get_unchecked(id) != doc + 1 {
                         // Any other BOOL term: a pair, once per document.
                         *start.get_unchecked_mut(id) = doc + 1;
                         pairs.push((id as u32) << DOC_BITS | local);
