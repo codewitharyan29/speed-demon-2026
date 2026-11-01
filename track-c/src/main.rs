@@ -476,6 +476,7 @@ fn run(regions: &File, file: &File, len: usize, bits: u32, chunk: usize) -> Opti
         (p == len).then_some(())
     });
     parsed.iter().all(|r| r.is_some()).then_some(())?;
+    std::process::exit(0); // DIAGNOSTIC: regions only
     // Countries get indices in the order of their packed codes, which is the byte order of the codes; _UNMATCHED is last.
     let (mut dense, mut keys) = (vec![0u16; seen.len()], vec![]);
     for code in (1..seen.len()).filter(|&c| seen[c].load(Relaxed)) {
@@ -547,7 +548,6 @@ fn run(regions: &File, file: &File, len: usize, bits: u32, chunk: usize) -> Opti
 }
 
 fn main() {
-    std::process::exit(0); // DIAGNOSTIC: process start and exit only
     // PR_SET_THP_DISABLE: with transparent huge pages every sparsely touched 2 MiB of the big tables would be backed in full.
     unsafe { prctl(41, 1u64, 0u64, 0u64, 0u64) };
     let regions = File::open("/data/regions.csv").unwrap();
