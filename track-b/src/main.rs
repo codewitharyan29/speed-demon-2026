@@ -12,10 +12,9 @@ const THREADS: usize = 12;
 const CHUNKS: usize = 64;
 const ONES: u64 = 0x0101010101010101;
 const DOC_BITS: u32 = 14;
-const BLOOM_BITS: u32 = 20;
 const NO_BITS: u32 = 0xFFF;
 /// Tokens handed over at a time: enough independent table lookups to keep many cache misses in flight.
-const BATCH: usize = 16;
+const BATCH: usize = 48;
 
 /// Maps a file read-only. The mapping is never unmapped, so the slice is 'static.
 fn map(path: &str) -> &'static [u8] {
@@ -346,20 +345,14 @@ impl<K: PartialEq + Copy> Table<K> {
     }
 }
 
-/// An adjacent pair of terms, as one key.
-fn pair(a: u32, b: u32) -> u64 {
-    (a as u64) << 32 | b as u64
-}
-
-/// A parsed query: term ids, and the operator byte (b'A', b'O' or b'N') between each neighbouring pair. A phrase has
-/// no operators but the id of each adjacent pair of its terms.
+/// A parsed query: term ids, and the operator byte (b'A', b'O' or b'N') between each neighbouring pair (none for a
+/// phrase).
 /// Everything is stored inline (a query has at most 8 terms), so the per-chunk pass over all queries reads memory in
 /// order instead of chasing a pointer per query.
 struct Query {
     phrase: bool,
     terms: Few<u32, 8>,
     ops: Few<u8, 8>,
-    pairs: Few<u32, 7>,
 }
 
 /// A list of at most N items, stored inline.
@@ -415,32 +408,6 @@ fn combine<T: Copy + Ord>(op: u8, a: &[T], b: &[T], out: &mut Vec<T>) {
     if op == b'O' {
         out.extend_from_slice(&b[j..]);
     }
-}
-
-/// True if the tokens of b[from..to] contain `words` at consecutive positions. Bit-parallel (shift-and) matching:
-/// bit j of `state` says "the last tokens match words[0..=j]", so one pass finds the phrase, repeated words included.
-fn has_phrase(b: &[u8], range: (usize, usize), words: &[[u64; 4]]) -> bool {
-    let (mut state, mut found) = (0u8, false);
-    scan(b, range, 0, false, &mut Vec::new(), |batch| {
-        for t in batch {
-            let k = if t.len <= 32 {
-                key(b, t.at as usize, t.len as usize)
-            } else {
-                [u64::MAX; 4]
-            };
-            let here = words
-                .iter()
-                .enumerate()
-                .fold(0u8, |m, (j, w)| m | ((*w == k) as u8) << j);
-            state = (state << 1 | 1) & here;
-            found = state >> (words.len() - 1) & 1 == 1;
-            if found {
-                return false;
-            }
-        }
-        true
-    });
-    found
 }
 
 /// What a query operator combines the running set with, within one chunk: a term's list of chunk-local ids, or its
@@ -576,6 +543,9 @@ impl Run {
 /// One thread's buffers for a chunk, reused from chunk to chunk.
 #[derive(Default)]
 struct Chunk {
+    seq: Vec<u32>,
+    hits: Vec<u32>,
+    matched: Vec<u32>,
     pairs: Vec<u32>,
     offs: Vec<u32>,
     start: Vec<u32>,
@@ -626,15 +596,14 @@ fn main() {
 
     // Number the terms, sixteen at a time: the table slots of a batch are fetched together, so their cache misses
     // overlap. `used` says how a term is used: bit 0 in a BOOL query (needs a posting list), bit 2 in a phrase; bit 1,
-    // set later, if the scan tracks pairs it starts or ends.
-    let (mut terms, mut grams, mut ids) =
-        (Table::new(keys.len()), Table::new(keys.len()), Vec::new());
+    // set later, if it triggers phrase checks.
+    let (mut terms, mut ids) = (Table::new(keys.len()), Vec::new());
     for batch in keys.chunks(16) {
         batch.iter().for_each(|k| terms.prefetch(hash(k)));
         ids.extend(batch.iter().map(|&k| terms.intern(hash(&k), k)));
     }
     let (mut used, mut at) = (vec![0u8; terms.keys.len()], 0);
-    let mut queries: Vec<Query> = (shapes.into_iter())
+    let queries: Vec<Query> = (shapes.into_iter())
         .map(|(phrase, n, ops)| {
             let t = &ids[at..at + n];
             at += n;
@@ -644,7 +613,6 @@ fn main() {
                 phrase,
                 terms: Few::new(t),
                 ops,
-                pairs: Few::new(&[]),
             }
         })
         .collect();
@@ -711,48 +679,50 @@ fn main() {
         }
     }
 
-    // The adjacent pairs each phrase needs postings for. A phrase with a rare term (in under 1/200 of the sampled
-    // documents) needs just one: that term with its rarer neighbour, as its few candidates are verified anyway. A
-    // phrase of common words keeps all its pairs, as only their intersection is short. The terms of those pairs are
-    // the ones the scan tracks pairs for, so most common words never get looked at as half of a pair.
+    // Each phrase is checked where its rarest term occurs: the scan keeps each document's term ids in order, and at the
+    // end of the document compares the phrase around every occurrence of that term. `triggers` lists, per term from
+    // `tstart[term]`, the phrases it triggers, as query << 3 | the term's place in the phrase.
     let df = |t: u32| df[t as usize];
-    for query in queries.iter_mut().filter(|q| q.phrase) {
+    let mut by_term: Vec<(u32, u32)> = Vec::new();
+    for (q, query) in queries.iter().enumerate().filter(|(_, q)| q.phrase) {
         let t = &query.terms;
-        let rare = (0..t.len()).min_by_key(|&i| df(t[i])).unwrap();
-        let near = (rare.saturating_sub(1)..=rare).filter(|&i| i + 1 < t.len());
-        let chosen: Vec<usize> = if df(t[rare]) * 200 < seen {
-            near.min_by_key(|&i| df(t[i]) + df(t[i + 1]))
-                .into_iter()
-                .collect()
-        } else {
-            (0..t.len() - 1).collect()
-        };
-        for &i in &chosen {
-            used[t[i] as usize] |= 2;
-            used[t[i + 1] as usize] |= 2;
-        }
-        let key_of = |i: usize| pair(t[i], t[i + 1]);
-        let pairs: Vec<u32> = chosen
-            .iter()
-            .map(|&i| grams.intern(key_of(i).wrapping_mul(M), key_of(i)))
-            .collect();
-        query.pairs = Few::new(&pairs);
+        let i = (0..t.len()).min_by_key(|&i| df(t[i])).unwrap();
+        used[t[i] as usize] |= 2;
+        by_term.push((t[i], (q as u32) << 3 | i as u32));
     }
-    grams.shrink(|k| k.wrapping_mul(M));
-    let nkeys = nterms + grams.keys.len();
+    by_term.sort_unstable();
+    let mut tstart = vec![0u32; nterms + 1];
+    by_term
+        .iter()
+        .for_each(|&(t, _)| tstart[t as usize + 1] += 1);
+    for t in 0..nterms {
+        tstart[t + 1] += tstart[t];
+    }
+    let triggers: Vec<u32> = by_term.iter().map(|e| e.1).collect();
+    // The phrases found in one document (`seq` its term ids, `hits` where its triggers are), as query << DOC_BITS | doc.
+    let check = |seq: &[u32], hits: &[u32], local: u32, found: &mut Vec<u32>| {
+        for &at in hits {
+            let t = seq[at as usize] as usize;
+            for &e in &triggers[tstart[t] as usize..tstart[t + 1] as usize] {
+                let (words, from) = (
+                    &queries[e as usize >> 3].terms,
+                    (at as usize).wrapping_sub(e as usize & 7),
+                );
+                if seq.get(from..from.wrapping_add(words.len())) == Some(&words[..]) {
+                    found.push((e >> 3) << DOC_BITS | local);
+                }
+            }
+        }
+    };
+    let nkeys = nterms;
     assert!(nkeys < 1 << (32 - DOC_BITS));
 
-    // What the scan probes. Per term: its id, whether BOOL and phrase queries use it, and its bitset if it has one.
-    // A bloom filter over the phrase pairs lets the scan skip most pair lookups.
+    // What the scan probes. Per term: its id, whether BOOL queries use it, whether it triggers phrase checks, and its
+    // bitset if it has one.
     assert!(ndense < NO_BITS && nkeys + 1 < 1 << 18);
     let meta = |t: usize| t as u32 | (used[t] as u32 & 3) << 18 | dense_of[t].min(NO_BITS) << 20;
     let miss = nkeys as u32 | NO_BITS << 20;
     let probe = Probe::new(&terms.keys, meta);
-    let mut bloom = vec![0u64; 1 << (BLOOM_BITS - 6)];
-    for k in &grams.keys {
-        let h = (k.wrapping_mul(M) >> (64 - BLOOM_BITS)) as usize;
-        bloom[h >> 6] |= 1 << (h & 63);
-    }
 
     // Each chunk is scanned, indexed on its own, and then answers every query for its own documents. Chunks hold
     // consecutive documents, so nothing that grows with the corpus is ever kept: per query only the running count,
@@ -772,6 +742,9 @@ fn main() {
         assert!(end - base <= 1 << DOC_BITS);
         let wl = ((end - base) as usize).div_ceil(64);
         let Chunk {
+            seq,
+            hits,
+            matched,
             pairs,
             offs,
             start,
@@ -783,9 +756,10 @@ fn main() {
         // `start` holds, per key, the last document it was recorded for during the scan (as id + 1), then where its
         // postings begin.
         (start.clear(), start.resize(nkeys + 1, 0));
-        (pairs.clear(), offs.clear(), rows.clear());
+        (pairs.clear(), offs.clear(), rows.clear(), matched.clear());
         rows.resize(ndense as usize * wl, 0);
-        let (mut prev, mut prev_doc, mut prev_phrase) = (0, 0, false);
+        let mut cur = base;
+        (seq.clear(), hits.clear());
         scan(docs, range, base, true, offs, |batch| {
             // Look every token of the batch up first: the loads are independent, so their cache misses overlap.
             // First every token's key and home slot, asking for the slot's cache line straight away, so the misses
@@ -820,27 +794,19 @@ fn main() {
                     start[id] = doc + 1;
                     pairs.push((id as u32) << DOC_BITS | local);
                 }
-                // Two phrase terms in a row: their pair, once per document, if the filter does not rule it out.
-                let phrase = flags & 2 != 0;
-                let (pk, h) = (pair(prev, id as u32), pair(prev, id as u32).wrapping_mul(M));
-                let bit = (h >> (64 - BLOOM_BITS)) as usize;
-                if phrase
-                    && prev_phrase
-                    && prev_doc == doc
-                    && bloom[bit >> 6] >> (bit & 63) & 1 == 1
-                {
-                    if let Ok(g) = grams.find(h, &pk) {
-                        let g = nterms + g as usize;
-                        if start[g] != doc + 1 {
-                            start[g] = doc + 1;
-                            pairs.push((g as u32) << DOC_BITS | local);
-                        }
-                    }
+                // The document's term ids in order, and where its phrase triggers are.
+                if doc != cur {
+                    check(seq, hits, cur - base, matched);
+                    (seq.clear(), hits.clear(), cur = doc);
                 }
-                (prev, prev_doc, prev_phrase) = (id as u32, doc, phrase);
+                if flags & 2 != 0 {
+                    hits.push(seq.len() as u32);
+                }
+                seq.push(id as u32);
             }
             true
         });
+        check(seq, hits, cur - base, matched);
 
         // The chunk's postings, by key, ascending: a counting sort placing pairs from the back.
         (start.clear(), start.resize(nkeys + 1, 0));
@@ -862,48 +828,8 @@ fn main() {
             d => Operand::Bits(&rows[d as usize * wl..][..wl]),
         };
 
-        // Every query, on this chunk's documents.
-        for (q, query) in queries.iter().enumerate() {
-            if query.phrase {
-                // Documents holding every tracked pair of the phrase; two terms need no more than that.
-                (
-                    order.clear(),
-                    order.extend(query.pairs.iter().map(|&g| nterms as u32 + g)),
-                );
-                order.sort_by_key(|&t| list(t).len());
-                if list(order[0]).is_empty() {
-                    continue;
-                }
-                run.start(&Operand::List(list(order[0])));
-                for &t in &order[1..] {
-                    run.apply(b'A', &Operand::List(list(t)));
-                }
-                if query.terms.len() > 2 && !run.list.is_empty() {
-                    let words: Vec<_> = query
-                        .terms
-                        .iter()
-                        .map(|&t| terms.keys[t as usize])
-                        .collect();
-                    run.list.retain(|&d| {
-                        let from = offs[d as usize] as usize;
-                        let end = offs
-                            .get(d as usize + 1)
-                            .map_or(range.1, |&next| next as usize)
-                            - 1;
-                        let tab = docs[from..].iter().position(|&c| c == b'\t').unwrap();
-                        has_phrase(docs, (from + tab + 1, end), &words)
-                    });
-                }
-            } else {
-                let start = operand(query.terms[0]);
-                if matches!(start, Operand::List(l) if l.is_empty()) && !query.ops.contains(&b'O') {
-                    continue;
-                }
-                run.start(&start);
-                for (k, &op) in query.ops.iter().enumerate() {
-                    run.apply(op, &operand(query.terms[k + 1]));
-                }
-            }
+        // A query's result on this chunk goes into its running count, sum and ten smallest ids.
+        let report = |q: usize, run: &Run, order: &mut Vec<u32>| {
             let (n, s) = run.size_sum();
             if n > 0 {
                 count[q].fetch_add(n as u32, Relaxed);
@@ -918,6 +844,26 @@ fn main() {
                     f[10] = order.len() as u32;
                 }
             }
+        };
+        // The phrases found while scanning, each document once.
+        (matched.sort_unstable(), matched.dedup());
+        for g in matched.chunk_by(|a, b| a >> DOC_BITS == b >> DOC_BITS) {
+            (run.dense, ()) = (false, run.list.clear());
+            run.list
+                .extend(g.iter().map(|&e| (e & ((1 << DOC_BITS) - 1)) as u16));
+            report((g[0] >> DOC_BITS) as usize, run, order);
+        }
+        // Every BOOL query, on this chunk's documents.
+        for (q, query) in queries.iter().enumerate().filter(|(_, q)| !q.phrase) {
+            let start = operand(query.terms[0]);
+            if matches!(start, Operand::List(l) if l.is_empty()) && !query.ops.contains(&b'O') {
+                continue;
+            }
+            run.start(&start);
+            for (k, &op) in query.ops.iter().enumerate() {
+                run.apply(op, &operand(query.terms[k + 1]));
+            }
+            report(q, run, order);
         }
     });
 
