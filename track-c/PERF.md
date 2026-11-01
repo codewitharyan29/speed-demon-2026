@@ -1,29 +1,63 @@
 # Track C: performance log
 
-Board runs are identified by the commit the board measured (the board lists runs by commit). Local numbers are the
-in-process time of the full seed-1 dataset in a Docker container pinned to 8 CPUs (the Docker VM on this laptop has
-8, not 12), reading from a Docker volume. They are noisy in absolute terms and are only used to compare variants.
+Every row that has a run ID was measured by the live board (one run, full public seed 1, on the scoring machine). Local numbers come
+from a Docker VM on a Windows laptop (Ryzen 5 3500U, 8 hardware threads, no `perf`) and are used to eliminate ideas and to count
+instructions, never as results. The VM overstates memory latency and kernel work and has a different cache hierarchy from the
+scoring i5-13500, so a local gain in a memory-bound part did not always transfer (see "lookups" below).
+
+K = (14.44 s / T)^0.5 x (367 MB / M)^0.2 x (S_ref / S)^0.15 x (1 / D)^0.15; the board's numbers imply S_ref of about 107 lines.
+D = 1 throughout (no dependencies). Output hash on every row below: the board's gate passed ("scored") unless the row says
+"diagnostic".
 
 ## Board runs
 
-| Step | Change | Run (commit) | T (s) | M (MB) | Points |
+| # | Commit | Change | Run ID | T (ms) | M (MB) | S | K |
+|---|---|---|---|---|---|---|---|
+| 0 | 767c3f5 | baseline (`tc-baseline`): mmap, quote-count pass, per-thread name tables keyed by a 64-bit hash | run-c3e9263072bb | 177.6 | 141.1 | 372 | 9.07 |
+| 1 | 339e494 | rewrite: chunk starts found from the bytes after the cut, shared name table with exact comparison, one cache line per name, batched lookups with prefetch | run-81128db24eab | 68.7 | 20.0 | 602 | 20.05 |
+| 2 | a1294ea | two-stage structural parser (SIMD separators outside quotes, records from known boundaries) | run-0878eeb5e3f6 | 71.1 | 21.4 | 532 | 19.81 |
+| 3 | 57f74f4 | name table without glibc's memset of over-aligned memory; entry's first line prefetched for writing | run-fc8293439083 | 63.0 | 21.4 | 532 | 21.04 |
+| 4 | ed50651 | regions.csv read in pieces, one set of totals and buffers per worker | run-e208486e3e44 | 69.7 | 16.1 | 552 | 21.07 |
+| 5 | b3ed76e | same code again, to measure board noise | run-fa5e80722b45 | 69.65 | 16.1 | 552 | 21.09 |
+| 6 | b285c86 | two-level name table (compact slots + one line per name by id) | run-98aaae621765 | 60.5 | 37.5 | 588 | 18.91 |
+| 7 | 66197b3 | `PR_SET_THP_DISABLE` (the board has THP `always`; whole 2 MiB pages were backed) | run-420c8153005f | 60.5 | 16.2 | 592 | 22.35 |
+| 8 | 2e630c3 | instruction diet 1: branchless separator extraction, inlined helpers, unchecked reads in the record parser | run-0a728d74e635 | 52.9 | 16.3 | 613 | 23.76 |
+| 9 | fa128ea | instruction diet 2: numbers from the separators' digit counts, one quote popcount per record, single-multiply hash | run-8167df85a65b | 55.0 | 16.3 | 636 | 23.15 |
+| 10 | 0d1a0c6 | three batches in flight (slots prefetched, then entries, then resolved) | run-67bec4623d2f | 52.5 | 16.5 | 644 | 23.62 |
+| 11 | d1bc253 | batches of 32 + lazily zeroed tables | run-0682687bde57 | 54.3 | 16.5 | 652 | 23.16 |
+| 12 | 5806282 | back to batches of 16; dead code removed | run-88a3e5416bb7 | 52.6 | 16.2 | 604 | **23.90** |
+
+Kept: 1, 3, 4, 7, 8, 10, 12. Rejected or reverted: 2 (equal to 1 within noise, kept for the instruction counts it enabled), 6 (alone: M
+37.5 MB until THP was disabled, then kept as part of 7), 9 (fewer instructions but 2.1 ms slower on the board, cause not found), 11. Row 5 shows the board's run-to-run noise on this track is under 0.1% (69.68 vs 69.65 ms), so every
+difference above 1 ms in this table is real.
+
+## Board diagnostics (labelled; they print wrong output on purpose, T and M are still reported)
+
+| Commit | What was removed | Run ID | T (ms) | M (MB) | What it says |
 |---|---|---|---|---|---|
-| 0 | The reference, unchanged | | 14.44 | 367 | 0 |
-| 1 | Rust: mmap, quote-parity chunking on 12 threads, direct-indexed region table, per-name country bitmasks | | | | |
+| 11636aa | all record parsing | run-75845de19794 | 7.8 | 17.8 | fixed cost (process, regions, tables, merge, output) is 7.8 ms; the 17.8 MB showed the 8 MB `memset` |
+| 8e07aa7 | name lookups (on a1294ea) | run-3bde9512adb1 | 44.3 | 22.0 | lookups cost 27 ms of 71 |
+| 53cf631 | the mask update | run-45ed55a80469 | 68.9 | 21.3 | not clean: the write prefetch still took ownership of the lines |
+| 236ff02 | name lookups (on fa128ea) | run-ccda7465c22a | 31.5 | 8.9 | parse + join + aggregate is 31.5 ms; the name table is 7.4 MB of M |
+| 95c2f57 | mask update and write prefetch | run-cadd19375f0c | 48.9 | 16.3 | reading the table costs 17 ms, the mask writes 6 ms |
+| 7449bd5 | sharing (a private table per worker) | run-7ff6ee6007c5 | 64.1 | 105.9 | inconclusive: 12 table builds dominate; no sign of a large sharing penalty |
 
-## Local measurements
+## What the measurements say
 
-| Variant | Result | Verdict |
-|---|---|---|
-| Rust version, 96 chunks | 670-990 ms (median about 770), `memory.peak` 135 MB | kept as step 1 |
+* The first rewrite took T from 177.6 to 68.7 ms and M from 141 to 20 MB: no quote-count pass over 202 MB, no 12 per-thread name
+  tables of 10 MB each, no serial merge over 12 x 262,144 slots, and exact name comparison instead of a 64-bit hash.
+* Instructions per record (valgrind cachegrind on the sample, `tools/cg_c.sh`): 576 for the first structural parser, about 340 after
+  the two diets. T followed the first diet (60.5 to 52.9 ms) and not the second (52.9 to 55.0 ms, noise-free), so below about 350
+  instructions the run is limited by memory behaviour and branch mispredicts, which cachegrind models only roughly.
+* The name lookups still cost about 20 ms of the 52 on the board although they are 40 instructions: 3.3 million random accesses to a
+  7.4 MB structure that does not fit a core's 2 MB L2. A deeper prefetch pipeline gave 2.5 ms; two-level layout 9 ms (row 6 vs 3).
+* Local (VM) measurements misled twice: batch size and prefetch distance made no difference there but the table layout did on the
+  board; and the VM's THP setting hid a 20 MB peak that the board's `always` setting produced (rows 6 and 7).
 
-Tiny, sample and full outputs match the reference byte for byte (full sha256 d8088b1c...).
+## Not done / ideas with their expected value
 
-A bug found on the way: scanning for the first record start of a chunk from the byte before the cut counted that
-byte's quote twice, so chunks could start inside a quoted field with a newline (277 k of the 3.3 M records have one).
-Tiny and sample outputs caught it as wrong id sums; counts and amounts stayed right.
-
-## Ideas not done yet
-
-- 16 % of records have an unquoted name or note; a SWAR search for the closing quote instead of a byte loop.
-- Smaller `Names` tables per thread (they start at 2^18 slots each).
+* Partition the name space by hash across workers so that each owns a table of about 0.5 MB that fits in L2 and is never shared;
+  needs a record exchange between workers (about 32 bytes per record, in bounded rounds). Estimated -10 ms; the private-table
+  diagnostic above did not isolate it.
+* One persistent thread pool and barriers instead of three `thread::scope`s (36 spawns): about 1 ms.
+* A region table of bytes instead of 16-bit codes: 1 MB of M.
