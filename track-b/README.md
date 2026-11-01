@@ -4,7 +4,7 @@ The task, the input files and the exact output format are in the [spec](https://
 
 ## Approach
 
-The queries are read first and every distinct term is numbered. A 2% sample of the corpus estimates each term's
+The queries are parsed in 12 pieces at once and every distinct term is numbered. A 1% sample of the corpus estimates each term's
 document frequency: BOOL terms in over 1/32 of the documents become bitsets, the rest sorted lists. Each phrase is
 assigned its rarest term as its trigger.
 
