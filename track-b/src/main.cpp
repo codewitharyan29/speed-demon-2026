@@ -38,8 +38,20 @@ using u64 = uint64_t;
 constexpr int kThreads = 12, kChunks = 48, kSamples = 12, kDocBits = 14;
 constexpr u32 kCap = 1 << 15, kFlush = 384, kAhead = 16, kLines = 1 << 14;
 constexpr u64 kTag = ~0xFFFFFULL, kPay = 0x3FFFF, kTop = 1ULL << 63;
-constexpr bool kDiagDC = true;
 constexpr u64 kOnes = 0x0101010101010101ULL;
+
+// The bytes of a token's first and second word that belong to it, by its length (all of them from 16 on).
+struct Masks {
+  u64 m[32][2];
+  constexpr Masks() : m() {
+    for (int len = 0; len < 32; len++) {
+      m[len][0] = len >= 8 ? ~0ULL : (1ULL << 8 * len) - 1;
+      m[len][1] = len >= 16 ? ~0ULL : len <= 8 ? 0 : (1ULL << 8 * (len - 8)) - 1;
+    }
+  }
+};
+constexpr Masks kMasks;
+#define kMask kMasks.m
 
 #ifdef SD_PHASES
 double now() { timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec * 1e-6; }
@@ -448,9 +460,7 @@ void scan(Worker& w, u64 from, u64 to, u32 first_doc, u32 base, u32 wl) {
   };
   auto emit = [&](u64 s, u32 len) {
     const char* q = d + s;
-    u64 w0 = (load64(q) | kOnes * 0x20), w1 = (load64(q + 8) | kOnes * 0x20);
-    w0 = _bzhi_u64(w0, 8 * len);
-    w1 = _bzhi_u64(w1 & -(u64)(len > 8), 8 * (len - 8));
+    u64 w0 = (load64(q) | kOnes * 0x20) & kMask[len & 31][0], w1 = (load64(q + 8) | kOnes * 0x20) & kMask[len & 31][1];
     w.h[nt++] = len > 16 ? hash_bytes(q, len, true) : hash16(w0, w1);
   };
   const __m256i k20 = _mm256_set1_epi8(0x20), k60 = _mm256_set1_epi8(0x60), k7B = _mm256_set1_epi8(0x7B),
@@ -706,7 +716,6 @@ void worker(int tid) {
     }
     // Every BOOL query, on this chunk's documents.
     for (u32 q : g_bool) {
-      if (kDiagDC) break;  // DIAGNOSTIC DC: no BOOL evaluation
       const Query& qq = g_queries[q];
       Opnd x = operand(qq.t[0]);
       if (x.b == nullptr && x.n == 0 && !qq.has_or) continue;
