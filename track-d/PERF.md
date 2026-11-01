@@ -407,3 +407,14 @@ Docker run on T (260 vs 190 ms) and counts 341 lines where `scc` on the raw file
 
 cachegrind (sample, P-core cache model): the search workers are 62% of instructions and 78% of branch mispredicts, ~119 instructions
 and ~2.3 mispredicts per settled node.
+
+## Step 26: batched prefetch in the two parse passes and the BFS
+
+Board run ddfe81a (step 25, 265 lines): T 0.2445 s, M 86.0 MB, S 265 (equal to my local `clang-format --style=LLVM` count),
+K 20.96, 66.07 pts. Local A/B differences carry over to the board (local 193 vs 204 ms, board 0.2445 vs 0.2606 s).
+
+| Change | Local result (ms, median of 11) | Verdict |
+|---|---|---|
+| Each pass parses 16 lines into small arrays and issues a write-prefetch for every counter, then does the atomic increments (the passes were one cache miss per edge, one after the other) | pass 2 34.1 -> 24.5, pass 1 15.0 -> 13.1; total 192 -> 177 | kept; batch 32 is the same, 16 is smaller |
+| BFS: prefetch `s0[v]` when a node is queued, and `e0` for the node four places ahead in the queue | BFS 22.1 -> 19.1 | kept |
+| Prefetch `dist[v]` of every edge of a node before relaxing them | queries 111.7 vs 111.7 | rejected: no effect |
