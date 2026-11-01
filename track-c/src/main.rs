@@ -90,7 +90,7 @@ impl Names {
             }
             if v >> 32 == h >> 32 {
                 // SAFETY: prefetching has no effect on correctness, whatever the address.
-                return unsafe { _mm_prefetch::<_MM_HINT_T0>(&self.entries[(v & 0xFFFF_FFFF) as usize - 1] as *const Entry as *const i8) };
+                return unsafe { _mm_prefetch::<_MM_HINT_ET0>(&self.entries[(v & 0xFFFF_FFFF) as usize - 1] as *const Entry as *const i8) };
             }
             i = (i + 1) & (self.slots.len() - 1);
         }
@@ -359,12 +359,11 @@ unsafe fn record(c: &Ctx, b: &[u8], q: &Quotes, start: usize, sep: &[u32], batch
 
 /// Looks up the countries and names of the records in `batch` and adds them to `aggs`.
 fn resolve(c: &Ctx, batch: &mut Batch, aggs: &mut [Agg]) {
-    batch.recs.iter().for_each(|r| c.names.warm(r.hash));
     for r in batch.recs.iter() {
         let country = c.dense[c.region.get(r.region).map_or(0, |x| x.load(Relaxed)) as usize] as usize;
         // SAFETY: the name has 32 readable bytes after it, as `record` ensured.
         let name = unsafe { c.names.entry(r.name, r.len, r.hash) };
-        let _ = (name, country); // DIAGNOSTIC: entries are only read
+        name.mask[country / 64].fetch_or(1 << (country % 64), Relaxed);
         let a = &mut aggs[country];
         a.count += 1;
         a.id_sum += r.id;
@@ -381,15 +380,15 @@ fn resolve(c: &Ctx, batch: &mut Batch, aggs: &mut [Agg]) {
 #[derive(Default)]
 struct Worker {
     buf: Vec<u8>,
-    batch: Batch,
+    batches: [Batch; 3],
     at: Vec<u32>,
     quotes: Quotes,
 }
 
 /// Parses the records between `lo` and `hi`, which are record starts, into `aggs`. False if something is not as expected.
 fn parse_chunk(c: &Ctx, lo: usize, hi: usize, aggs: &mut [Agg], w: &mut Worker) -> bool {
-    let Worker { buf, batch, at, quotes } = w;
-    let (mut next, mut keep) = (lo, 0);
+    let Worker { buf, batches, at, quotes } = w;
+    let (mut next, mut keep, mut now) = (lo, 0, 0);
     loop {
         let n = BLOCK.min(hi - next);
         buf.resize(keep + n + PAD, 0);
@@ -404,15 +403,24 @@ fn parse_chunk(c: &Ctx, lo: usize, hi: usize, aggs: &mut [Agg], w: &mut Worker) 
         let mut start = 0;
         for sep in at.chunks_exact(5) {
             // SAFETY: the buffer has `PAD` bytes after `end`, and the separators are before `end`.
-            if unsafe { record(c, buf, quotes, start, sep, batch) }.is_none() {
+            if unsafe { record(c, buf, quotes, start, sep, &mut batches[now]) }.is_none() {
                 return false;
             }
             start = sep[4] as usize + 1;
-            if batch.recs.len() == BATCH {
-                resolve(c, batch, aggs);
+            if batches[now].recs.len() == BATCH {
+                // The batch before this one has had the slots of its names prefetched while this one was parsed: look at
+                // them now, and prefetch the entries. The batch before that has had its entries prefetched: resolve it.
+                batches[(now + 2) % 3].recs.iter().for_each(|r| c.names.warm(r.hash));
+                resolve(c, &mut batches[(now + 1) % 3], aggs);
+                now = (now + 1) % 3;
             }
         }
-        resolve(c, batch, aggs); // before the buffer changes
+        for k in [1, 2, 0] {
+            // before the buffer changes
+            let b = &mut batches[(now + k) % 3];
+            b.recs.iter().for_each(|r| c.names.warm(r.hash));
+            resolve(c, b, aggs);
+        }
         if last {
             return start == end;
         }
