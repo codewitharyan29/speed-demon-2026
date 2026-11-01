@@ -30,7 +30,8 @@ They are only used to compare variants, never reported as results.
 | 19 | Terms numbered straight into the scan's probe table (no separate term table, no second build) | 0dd42d9 | 0.206 | 38 | 71.142 (K 26.48, 734 lines) |
 | 20 | 48 chunks instead of 60 (four per thread; the per-chunk BOOL evaluation is a fixed cost per chunk) | 8f752f8 | 0.205 | 42 | 71.193 (K 26.54, 734 lines) |
 | 21 | Leaner scan callback: each bucket index computed once, batch arrays made once per chunk, unchecked indexing where bounds are provable | 23093fe | 0.192 | 41 | 71.850 (K 27.36, 742 lines) |
-| 22 | Spare bitset row (every token sets a bit; one condition left in the bookkeeping) and a tokeniser with one step per token | pending | | | |
+| 22 | Spare bitset row (every token sets a bit; one condition left in the bookkeeping) and a tokeniser with one step per token | b8b05c6 | 0.182 | 41 | 72.380 (K 28.03, 749 lines) |
+| 23 | A list term's pair written without a branch (every token stamps and writes; the count moves by 0 or 1) | pending | | | |
 
 ## Local measurements behind step 2 (in-process ms, median)
 
@@ -460,3 +461,16 @@ Board: 0.2046 -> 0.1919 s (-6.2%) for -14% instructions: on the box the instruct
 | Both | | | 756 | 140 | 742 |
 
 Verified on full seeds 1 and 2, sample seeds 1-3, tiny seeds 1-6, the worked example and the long-token case.
+
+Board: 0.1919 -> 0.1822 s for step 22.
+
+## Step 23: the last bookkeeping branch (cachegrind on the full data; local in-process ms)
+
+| Change | Ir | Mispredicts | 1 thread (median of 7) | 12 threads | `memory.peak` | Verdict |
+|---|---|---|---|---|---|---|
+| Step 22 | 6.75 G | 58.0 M | 777 / 825 | 149 / 133 | 39-40 MB | |
+| Probe: test the (rarely set) spill bit before the hit, then a select | 6.83 G | 57.2 M | | | | rejected: the probe's mispredicts are not that branch |
+| Pair without a branch: every token stamps its id and writes a pair; the count moves by `fresh` (pairs reserved per batch) | 7.20 G | 43.8 M | 733 / 789 | 147 | 43-44 MB | memory: the per-batch `reserve` grew the buffer differently |
+| Same, with room for a pair per token reserved once per chunk (unwritten pages cost nothing) | | | 792 (min 702) | 127 (from 133) | 39-41 MB | kept |
+
+Verified on full seeds 1 and 2, sample seeds 1-3, tiny seeds 1-6, the worked example and the long-token case; +1 line.
