@@ -17,48 +17,31 @@ const WINDOW: usize = 1 << 12;
 #[cfg(unix)]
 extern "C" {
     fn mmap(a: *mut u8, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
-    fn munmap(a: *mut u8, l: usize) -> i32;
-    fn madvise(a: *mut u8, l: usize, adv: i32) -> i32;
-    fn posix_fadvise(fd: i32, o: i64, l: i64, adv: i32) -> i32;
-    fn close(fd: i32) -> i32;
     fn malloc_trim(pad: usize) -> i32;
 }
 
 #[cfg(unix)]
-fn map_file(path: &str) -> (&'static [u8], usize, i32) {
+fn map_file(path: &str) -> &'static [u8] {
     use std::os::unix::io::AsRawFd;
     let f = std::fs::File::open(path).expect("open");
-    let (len, fd) = (f.metadata().unwrap().len() as usize, f.as_raw_fd());
-    std::mem::forget(f);
-    let ptr = unsafe { mmap(std::ptr::null_mut(), len, 1, 2, fd, 0) };
-    (unsafe { std::slice::from_raw_parts(ptr, len) }, len, fd)
-}
-
-#[cfg(unix)]
-unsafe fn unmap_file(s: &[u8], len: usize, fd: i32) {
-    madvise(s.as_ptr() as *mut u8, len, 4);
-    munmap(s.as_ptr() as *mut u8, len);
-    posix_fadvise(fd, 0, len as i64, 4);
-    close(fd);
+    let len = f.metadata().unwrap().len() as usize;
+    let ptr = unsafe { mmap(std::ptr::null_mut(), len, 1, 2, f.as_raw_fd(), 0) };
+    unsafe { std::slice::from_raw_parts(ptr, len) }
 }
 
 #[cfg(not(unix))]
-fn map_file(path: &str) -> (&'static [u8], usize, i32) {
+fn map_file(path: &str) -> &'static [u8] {
     let b = std::fs::read(path).expect("read");
-    let len = b.len();
-    (Box::leak(b.into_boxed_slice()), len, -1)
+    Box::leak(b.into_boxed_slice())
 }
-
-#[cfg(not(unix))]
-unsafe fn unmap_file(_s: &[u8], _l: usize, _f: i32) {}
 
 fn num(b: &[u8], p: &mut usize) -> u64 {
-    while *p < b.len() && b[*p] < b'0' {
+    while *p < b.len() && unsafe { *b.get_unchecked(*p) } < b'0' {
         *p += 1;
     }
     let mut x = 0u64;
-    while *p < b.len() && b[*p] >= b'0' {
-        x = x * 10 + (b[*p] - b'0') as u64;
+    while *p < b.len() && unsafe { *b.get_unchecked(*p) } >= b'0' {
+        x = x * 10 + (unsafe { *b.get_unchecked(*p) } - b'0') as u64;
         *p += 1;
     }
     x
@@ -74,7 +57,7 @@ unsafe fn parse_swar(p: *const u8, len: usize) -> u32 {
 
 #[inline(always)]
 unsafe fn parse_line(chunk: &[u8], p: &mut usize) -> (u32, u32, u32) {
-    while *p < chunk.len() && chunk[*p] < b'0' {
+    while *p < chunk.len() && unsafe { *chunk.get_unchecked(*p) } < b'0' {
         *p += 1;
     }
     #[cfg(target_arch = "x86_64")]
@@ -280,11 +263,6 @@ unsafe fn search_fast(g: &Graph, s: u32, t: u32, w: &mut Worker) -> i64 {
         let pair = (g.start.as_ptr().add(u as usize) as *const u64).read_unaligned();
         let (es, ee) = (pair as u32 as usize, (pair >> 32) as usize);
         for ei in es..ee {
-            #[cfg(target_arch = "x86_64")]
-            if ei + 1 < ee {
-                let nv = (*g.adj.get_unchecked(ei + 1) >> 11) as usize;
-                _mm_prefetch(w.dist.as_ptr().add(nv) as *const i8, _MM_HINT_T0);
-            }
             let entry = *g.adj.get_unchecked(ei);
             let (v, mut wt) = ((entry >> 11) as usize, entry & 0x7FF);
             if wt == 0x7FF {
@@ -336,11 +314,6 @@ unsafe fn search_wide(g: &Graph, s: u32, t: u32, w: &mut Worker) -> i64 {
         let pair = (g.start.as_ptr().add(u as usize) as *const u64).read_unaligned();
         let (es, ee) = (pair as u32 as usize, (pair >> 32) as usize);
         for ei in es..ee {
-            #[cfg(target_arch = "x86_64")]
-            if ei + 1 < ee {
-                let nv = (*g.adj.get_unchecked(ei + 1) >> 11) as usize;
-                _mm_prefetch(w.dist.as_ptr().add(nv) as *const i8, _MM_HINT_T0);
-            }
             let entry = *g.adj.get_unchecked(ei);
             let (v, mut wt) = ((entry >> 11) as usize, (entry & 0x7FF) as u64);
             if wt == 0x7FF {
@@ -363,7 +336,7 @@ unsafe fn search_wide(g: &Graph, s: u32, t: u32, w: &mut Worker) -> i64 {
 }
 
 fn main() {
-    let (g, g_len, g_fd) = map_file("/data/graph.txt");
+    let g = map_file("/data/graph.txt");
     let mut p = 0;
     let n = num(g, &mut p) as usize;
     num(g, &mut p);
@@ -396,9 +369,12 @@ fn main() {
     });
 
     let (mut start0, mut cur) = (vec![0u32; n + 1], 0u32);
-    for (d, s) in degree.iter().zip(&mut start0[..n]) {
+    let deg_raw = unsafe { std::slice::from_raw_parts_mut(degree.as_ptr() as *mut u32, n) };
+    for (d, s) in deg_raw.iter_mut().zip(&mut start0[..n]) {
+        let cnt = *d;
         *s = cur;
-        cur += d.swap(cur, Relaxed);
+        *d = cur;
+        cur += cnt;
     }
     start0[n] = cur;
     let m = cur as usize;
@@ -421,9 +397,6 @@ fn main() {
         local_of
     });
     drop(degree);
-    unsafe {
-        unmap_file(g, g_len, g_fd);
-    }
 
     let mut overflow0: Vec<(u32, u64)> = of0_threads.into_iter().flatten().collect();
     overflow0.sort_unstable_by_key(|&(i, _)| i);
@@ -547,7 +520,7 @@ fn main() {
         overflow: &overflow,
     };
 
-    let (q, q_len, q_fd) = map_file("/data/queries.txt");
+    let q = map_file("/data/queries.txt");
     let (mut p, num_queries) = (0, q.iter().filter(|&&c| c == b'\n').count());
     let mut answers = vec![-1i64; num_queries];
     let mut active_queries = Vec::with_capacity(num_queries);
@@ -561,9 +534,6 @@ fn main() {
                 active_queries.push((s_new, t_new, orig_idx as u32));
             }
         }
-    }
-    unsafe {
-        unmap_file(q, q_len, q_fd);
     }
     drop(has_in);
     drop(new_id);
