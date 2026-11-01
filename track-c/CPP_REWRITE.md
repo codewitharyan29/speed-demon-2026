@@ -63,3 +63,15 @@ g++ -std=c++23 -O3 -march=x86-64-v3 -mpclmul -flto=auto -fno-exceptions -fno-rtt
 ```bash
 clang-format --style=LLVM track-c/src/main.cpp | grep -vcE '^\s*(//|$)'
 ```
+
+## Official board result (one authorized run, Nov 1 22:59 UTC)
+
+| | Commit | Run | T | M | S | K |
+|---|---|---|---:|---:|---:|---:|
+| **C++ rewrite** | `6ec50ad` (main.cpp sha256 `c16f9f128a47134d...`) | **run-50cc84be09bb** (scored, all gates) | 36.34 ms | 13.92 MB | 494 | **30.54** |
+| control (Rust, `9fb5c93`) | | three runs | 35.73-36.73 ms | 13.5-13.78 MB | 629 | 29.40-29.76 |
+
+T at parity, as predicted locally (inside the control's range); M +0.1-0.4 MB; S -135 lines. K +2.6% over the control's best: the
+gain is the source size, as estimated (+3.7% at equal M; the slightly higher M costs about 0.5%). Production was restored to the
+control's Track C at `4e11c91` (track-c/ identical to `669e396`; src/main.rs sha256 `27c953167c289741`). The board's "best" for
+Track C now records this run.
