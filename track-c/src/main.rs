@@ -414,7 +414,6 @@ fn parse_chunk(c: &Ctx, lo: usize, hi: usize, aggs: &mut [Agg], w: &mut Worker) 
         if last && buf[end - 1] != b'\n' {
             (buf[end], end) = (b'\n', end + 1); // the last record may lack its terminator
         }
-        if std::hint::black_box(true) { at.clear(); if last { return true; } keep = 0; continue; }
         structure(buf, end, at, quotes);
         let mut start = 0;
         for sep in at.chunks_exact(5) {
