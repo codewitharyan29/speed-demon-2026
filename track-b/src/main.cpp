@@ -38,6 +38,7 @@ using u64 = uint64_t;
 constexpr int kThreads = 12, kChunks = 48, kSamples = 12, kDocBits = 14;
 constexpr u32 kCap = 1 << 15, kFlush = 384, kAhead = 16, kLines = 1 << 14;
 constexpr u64 kTag = ~0xFFFFFULL, kPay = 0x3FFFF, kTop = 1ULL << 63;
+constexpr bool kDiagDC = true;
 constexpr u64 kOnes = 0x0101010101010101ULL;
 
 #ifdef SD_PHASES
@@ -385,13 +386,6 @@ void scan(Worker& w, u64 from, u64 to, u32 first_doc, u32 base, u32 wl) {
   u64 carry_a = 0, carry_nl = 1, in_id = 0, open = ~0ULL;
   auto flush = [&]() {
     CYTS(2) u32 end = w.dend[nd - 1], nslow = 0;
-    if (!kSample) {  // DIAGNOSTIC DB: tokenise and hash only
-      memmove(w.h, w.h + end, (nt - end) * 8);
-      nt -= end;
-      done += nd;
-      nd = 0;
-      return;
-    }
     // Look up every token (id, and bit 17 if the term triggers phrases); the lines are prefetched a few tokens ahead.
     for (u32 i = 0; i < end; i++) {
       __builtin_prefetch(g_tab + (w.h[i + kAhead] & (kLines - 1)) * 8);
@@ -712,6 +706,7 @@ void worker(int tid) {
     }
     // Every BOOL query, on this chunk's documents.
     for (u32 q : g_bool) {
+      if (kDiagDC) break;  // DIAGNOSTIC DC: no BOOL evaluation
       const Query& qq = g_queries[q];
       Opnd x = operand(qq.t[0]);
       if (x.b == nullptr && x.n == 0 && !qq.has_or) continue;
