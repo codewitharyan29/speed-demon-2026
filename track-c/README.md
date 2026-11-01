@@ -42,7 +42,7 @@ The task, the input files and the exact output format are in the
 
 `tools/` (outside this folder) has the scripts: `c_check.sh` (a binary against a reference output), `c_multiseed.sh` (official
 generator and reference, any seed and scale), `c_adversarial.py` and `c_hostile_lf.py` (valid-by-grammar inputs outside the
-generator's distribution), `cg_c.sh` (instruction and miss counts per source line with valgrind).
+generator's distribution), `cg_c.sh` (instruction and miss counts per source line with valgrind), `c_memcheck.sh` (debug assertions and overflow checks under valgrind memcheck; real sanitizers need a nightly compiler) and `c_ab.sh` (interleaved timing and memory.peak).
 
 ## With another 24 hours
 
