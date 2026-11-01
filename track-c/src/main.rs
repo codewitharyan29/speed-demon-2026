@@ -24,11 +24,20 @@ extern "C" {
 
 const BLOCK: usize = 64 << 10; // bytes read at a time
 const PAD: usize = 64; // zero bytes after the data in a buffer, which the parser may read
-const BATCH: usize = 16; // records looked up together
+const BATCH: usize = 32; // records looked up together
 const COUNTRIES: usize = 256; // room in a name's mask (the spec has 240, plus _UNMATCHED)
 
 fn zeros<T: Default>(n: usize) -> Vec<T> {
     (0..n).map(|_| T::default()).collect()
+}
+
+/// `n` atomics that are zero. Zeroed memory from the allocator is fresh pages that are not touched until used, which
+/// is cheaper for a big array than writing the zeros (`zeros`).
+fn zeroed<A, T>(zeros: Vec<T>) -> Vec<A> {
+    assert!(std::mem::size_of::<A>() == std::mem::size_of::<T>() && std::mem::align_of::<A>() == std::mem::align_of::<T>());
+    let mut zeros = std::mem::ManuallyDrop::new(zeros);
+    // SAFETY: an atomic has the layout of its integer; the allocation is handed over unchanged.
+    unsafe { Vec::from_raw_parts(zeros.as_mut_ptr() as *mut A, zeros.len(), zeros.capacity()) }
 }
 
 /// Runs `f(0..jobs)` on all available threads, which take jobs from one counter; returns the results in any order.
@@ -72,7 +81,7 @@ impl Names {
         let base = (unsafe { std::alloc::alloc_zeroed(layout) } as usize + 63) & !63;
         let entries = unsafe { std::slice::from_raw_parts(base as *const Entry, 1 << (bits - 1)) };
         let spill = Box::leak(vec![0u8; 32 << bits].into_boxed_slice());
-        Names { slots: zeros(1 << bits), entries, spill, spilled: AtomicUsize::new(0), next: AtomicUsize::new(0), full: AtomicBool::new(false) }
+        Names { slots: zeroed(vec![0u64; 1 << bits]), entries, spill, spilled: AtomicUsize::new(0), next: AtomicUsize::new(0), full: AtomicBool::new(false) }
     }
 
     /// The slot where the search for a name with hash `h` starts.
@@ -200,12 +209,6 @@ struct Rec {
 struct Batch {
     recs: Vec<Rec>,
     owned: Vec<Vec<u8>>,
-}
-
-thread_local! { static MINE: std::cell::OnceCell<&'static Names> = const { std::cell::OnceCell::new() }; }
-/// DIAGNOSTIC: a private name table per worker.
-fn my(_c: &Ctx) -> &'static Names {
-    MINE.with(|m| *m.get_or_init(|| Box::leak(Box::new(Names::new(18)))))
 }
 
 /// What the workers share.
@@ -354,7 +357,7 @@ unsafe fn record(c: &Ctx, b: &[u8], q: &Quotes, start: usize, sep: &[u32], batch
     batch.owned.extend(owned);
     // SAFETY: both buffers have 32 readable bytes after the name; the hash reads at most 16 around its ends.
     let hash = hash(name, len);
-    _mm_prefetch::<_MM_HINT_T0>(my(c).slot(hash) as *const AtomicU64 as *const i8);
+    _mm_prefetch::<_MM_HINT_T0>(c.names.slot(hash) as *const AtomicU64 as *const i8);
     if let Some(r) = c.region.get(region) {
         _mm_prefetch::<_MM_HINT_T0>(r as *const AtomicU16 as *const i8);
     }
@@ -368,7 +371,7 @@ fn resolve(c: &Ctx, batch: &mut Batch, aggs: &mut [Agg]) {
     for r in batch.recs.iter() {
         let country = c.dense[c.region.get(r.region).map_or(0, |x| x.load(Relaxed)) as usize] as usize;
         // SAFETY: the name has 32 readable bytes after it, as `record` ensured.
-        let name = unsafe { my(c).entry(r.name, r.len, r.hash) };
+        let name = unsafe { c.names.entry(r.name, r.len, r.hash) };
         name.mask[country / 64].fetch_or(1 << (country % 64), Relaxed);
         let a = &mut aggs[country];
         a.count += 1;
@@ -416,7 +419,7 @@ fn parse_chunk(c: &Ctx, lo: usize, hi: usize, aggs: &mut [Agg], w: &mut Worker) 
             if batches[now].recs.len() == BATCH {
                 // The batch before this one has had the slots of its names prefetched while this one was parsed: look at
                 // them now, and prefetch the entries. The batch before that has had its entries prefetched: resolve it.
-                batches[(now + 2) % 3].recs.iter().for_each(|r| my(c).warm(r.hash));
+                batches[(now + 2) % 3].recs.iter().for_each(|r| c.names.warm(r.hash));
                 resolve(c, &mut batches[(now + 1) % 3], aggs);
                 now = (now + 1) % 3;
             }
@@ -424,7 +427,7 @@ fn parse_chunk(c: &Ctx, lo: usize, hi: usize, aggs: &mut [Agg], w: &mut Worker) 
         for k in [1, 2, 0] {
             // before the buffer changes
             let b = &mut batches[(now + k) % 3];
-            b.recs.iter().for_each(|r| my(c).warm(r.hash));
+            b.recs.iter().for_each(|r| c.names.warm(r.hash));
             resolve(c, b, aggs);
         }
         if last {
@@ -472,7 +475,7 @@ fn run(regions: &File, file: &File, len: usize, bits: u32, chunk: usize) -> Opti
     let first = head.iter().position(|&c| c == b'\n')? + 1;
     let last = tail[..63].iter().rposition(|&c| c == b'\n')? + 1;
     let max_id = tail[last..].iter().take_while(|c| c.is_ascii_digit()).fold(0, |v, &c| v * 10 + (c - b'0') as usize);
-    let (region, seen): (Vec<AtomicU16>, Vec<AtomicBool>) = (zeros(max_id + 1), zeros(26 * 26 * 26 + 1));
+    let (region, seen): (Vec<AtomicU16>, Vec<AtomicBool>) = (zeroed(vec![0u16; max_id + 1]), zeros(26 * 26 * 26 + 1));
     let pieces = 16;
     let cut = |j: usize| match j {
         0 => first,
