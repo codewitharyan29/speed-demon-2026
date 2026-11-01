@@ -1,8 +1,8 @@
 # Track C status
 
-Updated: 2026-11-01 ~02:20 UTC (code freeze: 2026-11-02 15:00 UTC).
+Updated: 2026-11-01 (after run-2a43e35c614d) (code freeze: 2026-11-02 15:00 UTC).
 
-* Best verified commit: **5806282** (HEAD of `speed-demon`), board run **run-88a3e5416bb7**: T 52.6 ms, M 16.2 MB, S 604, D 1, **K 23.90**.
+* Best verified commit: **5806282** (source of HEAD of `speed-demon`; later commits only repeat or revert; 704be8c, K 23.70, was not better), board run **run-88a3e5416bb7**: T 52.6 ms, M 16.2 MB, S 604, D 1, **K 23.90**.
   The tracked baseline was K 9.07 (`tc-baseline`, run-c3e9263072bb). Leaders: K 41-47 (docs/COMPETITORS.md).
 * Correctness evidence for this commit (local, Docker; reference = the official `reference/c_join.py`): full seeds 1, 2, 3 (seed 1 also
   through `check.py c`, sha256 d8088b1cd42ba1338b1345b107b55db7b96ef1f5066f3ff64fd26a8912a0f536), sample seeds 2-10, tiny seeds 1-30,

@@ -12,3 +12,5 @@ board,fa128ea,run-8167df85a65b,55.0,16.3,636,23.15,"instruction diet 2: numbers 
 board,0d1a0c6,run-67bec4623d2f,52.5,16.5,644,23.62,"three batches in flight (slots prefetched, then entries, the"
 board,d1bc253,run-0682687bde57,54.3,16.5,652,23.16,"batches of 32 + lazily zeroed tables"
 board,5806282,run-88a3e5416bb7,52.6,16.2,604,23.90,"back to batches of 16; dead code removed"
+board,f8c5b1c,run-7d972f222c6a,52.9,16.2,604,23.73,"same source as 5806282 (repeat)"
+board,704be8c,run-2a43e35c614d,53.16,16.3,608,23.70,"lazy region table, 48 pieces: not better, reverted"

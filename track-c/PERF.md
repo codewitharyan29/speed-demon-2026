@@ -29,10 +29,12 @@ D = 1 throughout (no dependencies). Output hash on every row below: the board's 
 | 13 | c9c09c8 | 16 KiB blocks (a block and its separators in L1) | run-b11384dacf43 | 56.0 | 14.6 | 604 | 23.66 |
 | 14 | cb4a342 | 128 KiB blocks | run-de6e49033d9e | 61.2 | 18.9 | 604 | 21.50 |
 | 15 | 33ea307 | region table and name slots as lazily zeroed pages, alone | run-e1b6b13c4d77 | 54.9 | 16.2 | 612 | 23.34 |
+| 16 | f8c5b1c | source of row 12 again (repeat) | run-7d972f222c6a | 52.9 | 16.2 | 604 | 23.73 |
+| 17 | 704be8c | region table only as lazily zeroed pages, 48 pieces | run-2a43e35c614d | 53.16 | 16.3 | 608 | 23.70 |
 
 Kept: 1, 3, 4, 7, 8, 10, 12 (13-15 reverted: 64 KiB blocks and eagerly written zeros are the best measured). Rejected or reverted: 2 (equal to 1 within noise, kept for the instruction counts it enabled), 6 (alone: M
-37.5 MB until THP was disabled, then kept as part of 7), 9 (fewer instructions but 2.1 ms slower on the board, cause not found), 11. Row 5 shows the board's run-to-run noise on this track is under 0.1% (69.68 vs 69.65 ms), so every
-difference above 1 ms in this table is real.
+37.5 MB until THP was disabled, then kept as part of 7), 9 (fewer instructions but 2.1 ms slower on the board, cause not found), 11. Rows 5 and 16 show the board's run-to-run noise: 0.04% on one pair, 0.6% (52.6 vs 52.9 ms) on the other, so differences below about 0.5 ms are not distinguishable.
+Rows 16-17 are not improvements; the final source is the one of row 12.
 
 ## Board diagnostics (labelled; they print wrong output on purpose, T and M are still reported)
 
@@ -43,6 +45,8 @@ difference above 1 ms in this table is real.
 | 53cf631 | the mask update | run-45ed55a80469 | 68.9 | 21.3 | not clean: the write prefetch still took ownership of the lines |
 | 236ff02 | name lookups (on fa128ea) | run-ccda7465c22a | 31.5 | 8.9 | parse + join + aggregate is 31.5 ms; the name table is 7.4 MB of M |
 | 95c2f57 | mask update and write prefetch | run-cadd19375f0c | 48.9 | 16.3 | reading the table costs 17 ms, the mask writes 6 ms |
+| 0e5fb19 | everything after process start (exit at top of main) | run-8c4eea5206b0 | 0.72 | 8.14 | process floor: an empty process already has M = 8.1 MB |
+| a8fcb8f | everything after the region table | run-914f499201c3 | 3.54 | 8.63 | regions.csv costs about 2.8 ms |
 | 7449bd5 | sharing (a private table per worker) | run-7ff6ee6007c5 | 64.1 | 105.9 | inconclusive: 12 table builds dominate; no sign of a large sharing penalty |
 
 ## What the measurements say
