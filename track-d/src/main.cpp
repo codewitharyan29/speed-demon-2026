@@ -188,19 +188,29 @@ int main() {
           f(q, e);
     };
     lines(0, [&](auto &q, auto e) {
-      std::atomic_ref<u32>(s0[num(q) + 2]).fetch_add(1, rx);
-      q = next_line(q, e);
+      u32 U[16], k = 0;
+      for (; k < 16 && q < e; k++)
+        U[k] = num(q), q = next_line(q, e),
+        __builtin_prefetch(s0 + U[k] + 2, 1);
+      while (k--)
+        std::atomic_ref<u32>(s0[U[k] + 2]).fetch_add(1, rx);
     });
     sync.arrive_and_wait(); // LAP:pass1
     tid || (std::partial_sum(s0 + 1, s0 + n + 2, s0 + 1), 1);
     sync.arrive_and_wait(); // LAP:prefix1
-    lines(1, [&](auto &q, auto) {
-      u32 u = num(q), v = num(q), w = num(q);
-      u32 slot = std::atomic_ref<u32>(s0[u + 1]).fetch_add(1, rx);
-      e0[slot] = v << 11 | std::min(w, 2047u);
-      w >= 2047 && (ov0[tid].push_back({slot, w}), 1);
-      if (!(has_in[v / 64] >> v % 64 & 1))
-        std::atomic_ref<u64>(has_in[v / 64]).fetch_or(1ULL << v % 64, rx);
+    lines(1, [&](auto &q, auto e) {
+      u32 U[16], V[16], W[16], k = 0;
+      for (; k < 16 && q < e; k++)
+        U[k] = num(q), V[k] = num(q), W[k] = num(q),
+        __builtin_prefetch(s0 + U[k] + 1, 1);
+      for (u32 j = 0; j < k; j++) {
+        u32 u = U[j], v = V[j], w = W[j];
+        u32 slot = std::atomic_ref<u32>(s0[u + 1]).fetch_add(1, rx);
+        e0[slot] = v << 11 | std::min(w, 2047u);
+        w >= 2047 && (ov0[tid].push_back({slot, w}), 1);
+        if (!(has_in[v / 64] >> v % 64 & 1))
+          std::atomic_ref<u64>(has_in[v / 64]).fetch_or(1ULL << v % 64, rx);
+      }
     });
     sync.arrive_and_wait(); // LAP:pass2
     if (!tid) {
@@ -221,10 +231,12 @@ int main() {
         if (!claim(r))
           continue;
         u32 h = 0, t = 1;
-        for (qb[0] = r; h < t && t < 8192; h++)
+        for (qb[0] = r; h < t && t < 8192; h++) {
+          h + 4 < t && (__builtin_prefetch(e0 + s0[qb[h + 4]]), 1);
           for (u32 i = s0[qb[h]]; i < s0[qb[h] + 1] && t < 8192; i++)
             if (u32 v = e0[i] >> 11; claim(v))
-              qb[t++] = v;
+              qb[t++] = v, __builtin_prefetch(s0 + v);
+        }
         size_t base = rank.fetch_add(t, rx);
         for (u32 k = 0; k < t; k++)
           nid[qb[k]] = base + k,
