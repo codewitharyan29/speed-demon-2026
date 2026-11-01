@@ -8,7 +8,7 @@ using u16 = uint16_t;
 using u32 = uint32_t;
 using u64 = uint64_t;
 using Ov = std::vector<std::pair<u32, u64>>; // (edge index, weight) if >= 2047
-constexpr u32 NIL = ~0u, RING = 4096, POOL = 65536, T = 12;
+constexpr u32 NIL = ~0u, RING = 4096, POOL = 1 << 18, T = 12;
 constexpr u32 CHUNKS = 48;
 constexpr auto rx = std::memory_order_relaxed;
 static u32 n, m, *first, *adj; // CSR (renumbered): offsets and packed edges

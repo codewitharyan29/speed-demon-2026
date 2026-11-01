@@ -514,3 +514,12 @@ Each number was parsed with a digit loop whose exit (3-7 digits) is unpredictabl
 | BFS region size 4096 / 16384, prefetch lookahead 2 / 8 (default 8192 / 4) | BFS 24.5 / 25.1 / 24.4 / 24.5 vs 25.9 | no effect, kept |
 | Threads 8 / 16 / 24 instead of 12 | total 131 / 123 / 127 vs 116 ms | 12 kept |
 | Bucket widths 16 / 32 / 64 with the bidirectional search | queries 42.5 / 43.2 / 43.2 | no effect |
+
+Board run db9072a (step 32): T 0.1370 s, M 74.4 MB, S 397, K 27.13, 71.67 pts, the best so far (Lex: K 29.68, 73.62 pts).
+
+## Step 33: margin on the queue pools
+
+| Change | Result | Verdict |
+|---|---|---|
+| Grow the side with the smaller live frontier instead of the side whose lowest distance is smaller; or a hybrid of the two | queries 40.3 / 41.3 vs 39.9 ms | no effect, kept the original |
+| Queue pool 65536 -> 262144 entries per direction (the real data needs ~6000 live entries; an overflow would corrupt memory, and the untouched pages cost nothing) | total 100.5 vs 101.2 ms, peak 72 MB both | kept as insurance |
