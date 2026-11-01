@@ -554,3 +554,9 @@ table), recording 51, BOOL evaluation ~40 (memory-bound). Recording plus evaluat
 Smaller chunks halve the per-thread buffers (pairs, postings, bitset rows), so two threads' share fits the box's L2
 better, and a rare term is absent from more chunks, so more queries exit early; the cost is twice the per-chunk
 query loop. Locally `memory.peak` 40 -> 31 MB. Verified on all seeds and the worked example.
+
+Board for 96 chunks (scored as b119cd3, run-2d101af3061e): 0.197 s, 34 MB, K 26.90, against 0.180-0.186 s with 48:
+rejected, back to the step-25 code (48 chunks).
+
+Also tried locally and rejected: a 2^20-bit miss filter that sends tokens whose bit is clear to a spare empty bucket
+without a branch: cachegrind LL misses 28.4 -> 22.8 M but instructions 6.71 -> 7.56 G; 12 threads 144 -> 151 ms.
