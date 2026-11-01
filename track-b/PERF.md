@@ -28,6 +28,7 @@ They are only used to compare variants, never reported as results.
 | 17 | 60 chunks instead of 64: five per thread, no idle tail | 6921432 | 0.242 | 43 | 69.285 (K 24.31, 755 lines) |
 | 18 | Less single-threaded work: queries parsed in 12 pieces at once, no rebuild of the term table, a 1% sample | d324374 | 0.207 | 44 | 70.947 (K 26.24, 756 lines) |
 | 19 | Terms numbered straight into the scan's probe table (no separate term table, no second build) | 0dd42d9 | 0.206 | 38 | 71.142 (K 26.48, 734 lines) |
+| 20 | 48 chunks instead of 60 (four per thread; the per-chunk BOOL evaluation is a fixed cost per chunk) | pending | | | |
 
 ## Local measurements behind step 2 (in-process ms, median)
 
@@ -410,5 +411,15 @@ cannot say where the box spends its time. Each diagnostic is the step-19 code wi
 |---|---|---|---|---|
 | D1 | everything up to the chunk pass, then exit (821a000, run-de2e8ed01946) | ~15 | 0.0198 | 18.9 |
 | D2 | + the chunk pass tokenising only (no lookups, no BOOL evaluation), + output (686f5be, run-69335a86c2b0) | 37 | 0.0519 | 21.4 |
-| D3 | everything but the per-chunk BOOL evaluation | ~115 | pending | |
+| D3 | everything but the per-chunk BOOL evaluation (7c40ec8, run-c5bb84f9f9d1) | ~115 | 0.1641 | 36.8 |
 | (full) | step 19 | 144 | 0.206 | 38 |
+
+So on the box (205 ms): startup 20 (10%), tokenising and output 32 (15%), lookups + bookkeeping + phrase checks +
+counting sort 112 (55%), the per-chunk BOOL evaluation 41 (20%). The box/laptop ratio is ~1.4 for the scan and ~1.6
+for the evaluation. The code was restored to 0dd42d9 after D3.
+
+## Step 20: fewer chunks again
+
+The BOOL evaluation (41 ms on the box) is a fixed cost per (query, chunk). After step 19 the code uses 3 MB less, so
+48 chunks (four per thread, still an even split) now costs little memory: `memory.peak` 37 -> 39-40 MB local (36
+chunks would be 51 MB). Verified on all seeds and the worked example. Board: pending.
