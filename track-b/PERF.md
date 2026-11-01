@@ -31,7 +31,7 @@ They are only used to compare variants, never reported as results.
 | 20 | 48 chunks instead of 60 (four per thread; the per-chunk BOOL evaluation is a fixed cost per chunk) | 8f752f8 | 0.205 | 42 | 71.193 (K 26.54, 734 lines) |
 | 21 | Leaner scan callback: each bucket index computed once, batch arrays made once per chunk, unchecked indexing where bounds are provable | 23093fe | 0.192 | 41 | 71.850 (K 27.36, 742 lines) |
 | 22 | Spare bitset row (every token sets a bit; one condition left in the bookkeeping) and a tokeniser with one step per token | b8b05c6 | 0.182 | 41 | 72.380 (K 28.03, 749 lines) |
-| 23 | A list term's pair written without a branch (every token stamps and writes; the count moves by 0 or 1) | pending | | | |
+| 23 | A list term's pair written without a branch (every token stamps and writes; the count moves by 0 or 1) | 84edbf2 | 0.182 | 62 | 70.904 (K 26.19, 750 lines); reverted |
 
 ## Local measurements behind step 2 (in-process ms, median)
 
@@ -474,3 +474,9 @@ Board: 0.1919 -> 0.1822 s for step 22.
 | Same, with room for a pair per token reserved once per chunk (unwritten pages cost nothing) | | | 792 (min 702) | 127 (from 133) | 39-41 MB | kept |
 
 Verified on full seeds 1 and 2, sample seeds 1-3, tiny seeds 1-6, the worked example and the long-token case; +1 line.
+
+Board: 0.1822 -> 0.1825 s and 41 -> 62 MB, reverted. Two lessons. The box has transparent huge pages `always`: a
+large reservation (here room for a pair per token, ~5 MB virtual per thread) is mmap'd 2 MB-aligned, and the first
+write into each 2 MB range charges all of it, so each thread's pair buffer was rounded up in 2 MB steps (this laptop
+uses huge pages only when asked, so `memory.peak` here could not show it). And -14 M mispredicts for +0.4 G
+instructions bought no time on the box.
