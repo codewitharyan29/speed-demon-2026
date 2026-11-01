@@ -59,20 +59,6 @@ unsafe fn parse_u32(b: &[u8], i: &mut usize) -> u32 {
     x
 }
 
-#[inline(always)]
-unsafe fn skip_line(b: &[u8], mut i: usize) -> usize {
-    while i + 8 <= b.len() {
-        let w = (b.as_ptr().add(i) as *const u64).read_unaligned() ^ 0x0A0A_0A0A_0A0A_0A0A;
-        let m = w.wrapping_sub(0x0101_0101_0101_0101) & !w & 0x8080_8080_8080_8080;
-        if m != 0 {
-            return i + (m.trailing_zeros() >> 3) as usize + 1;
-        }
-        i += 8;
-    }
-    while i < b.len() && *b.get_unchecked(i) != b'\n' { i += 1; }
-    i + 1
-}
-
 const WINDOW: usize = 4096;
 
 #[repr(align(64))]
@@ -295,15 +281,16 @@ fn main() {
         let m = parse_u32(g_bytes, &mut pos) as usize;
         let body = &g_bytes[pos..];
 
-        const T: usize = 12;
-        let mut bounds = [0usize; T + 1];
-        bounds[T] = body.len();
-        for t in 1..T {
-            let mut p = (body.len() * t) / T;
+        const CHUNKS: usize = 48;
+        let mut cuts = [0usize; CHUNKS + 1];
+        cuts[CHUNKS] = body.len();
+        for c in 1..CHUNKS {
+            let mut p = (body.len() * c) / CHUNKS;
             while p < body.len() && *body.get_unchecked(p) != b'\n' { p += 1; }
-            bounds[t] = (p + 1).min(body.len());
+            cuts[c] = (p + 1).min(body.len());
         }
 
+        const T: usize = 12;
         let s0_bytes = (n + 2) * 4;
         let e0_bytes = m * 4;
         let nid_bytes = n * 4;
@@ -321,6 +308,8 @@ fn main() {
         let adj_p = alloc_anon(adj_bytes) as *mut u32;
 
         let mut t_sums = [0u32; T + 1];
+        let p1_job = AtomicUsize::new(0);
+        let p2_job = AtomicUsize::new(0);
         let bfs_seed = AtomicUsize::new(0);
         let bfs_rank = AtomicUsize::new(0);
         let barrier = std::sync::Barrier::new(T);
@@ -349,6 +338,8 @@ fn main() {
         std::thread::scope(|s| {
             for tid in 0..T {
                 let bar = &barrier;
+                let p1_ref = &p1_job;
+                let p2_ref = &p2_job;
                 let seed_ref = &bfs_seed;
                 let rank_ref = &bfs_rank;
                 let of0_p = of_ptrs_ref[tid];
@@ -367,15 +358,27 @@ fn main() {
                         let adj_ptr = adj_addr as *mut u32;
                         let ts = ts_addr as *mut u32;
 
-                        // Pass 1: Parse u and skip line
-                        let chunk = &body[bounds[tid]..bounds[tid + 1]];
-                        let mut i = 0;
-                        while i < chunk.len() {
-                            while i < chunk.len() && *chunk.get_unchecked(i) < b'0' { i += 1; }
-                            if i >= chunk.len() { break; }
-                            let u = parse_u32(chunk, &mut i) as usize;
-                            (*s0_at.add(u + 2)).fetch_add(1, Relaxed);
-                            i = skip_line(chunk, i);
+                        // Pass 1: Dynamic 48-chunk parsing
+                        loop {
+                            let c = p1_ref.fetch_add(1, Relaxed);
+                            if c >= CHUNKS { break; }
+                            let chunk = &body[cuts[c]..cuts[c + 1]];
+                            let mut i = 0;
+                            while i < chunk.len() {
+                                while i < chunk.len() && *chunk.get_unchecked(i) < b'0' { i += 1; }
+                                if i >= chunk.len() { break; }
+                                let u = parse_u32(chunk, &mut i) as usize;
+                                let v = parse_u32(chunk, &mut i);
+                                if u != (v as usize) {
+                                    (*s0_at.add(u + 2)).fetch_add(1, Relaxed);
+                                    let (bit, idx) = (1u64 << (v & 63), (v >> 6) as usize);
+                                    if ((*has_in.add(idx)).load(Relaxed) & bit) == 0 {
+                                        (*has_in.add(idx)).fetch_or(bit, Relaxed);
+                                    }
+                                }
+                                while i < chunk.len() && *chunk.get_unchecked(i) != b'\n' { i += 1; }
+                                i += 1;
+                            }
                         }
                         bar.wait();
 
@@ -397,29 +400,32 @@ fn main() {
                         }
                         bar.wait();
 
-                        // Pass 2: Parse u, v, w into edges0 and track has_in
-                        let mut i = 0;
+                        // Pass 2: Dynamic 48-chunk parse into edges0
                         let of0_vec = &mut *(of0_p as *mut Vec<(u32, u64)>);
-                        while i < chunk.len() {
-                            while i < chunk.len() && *chunk.get_unchecked(i) < b'0' { i += 1; }
-                            if i >= chunk.len() { break; }
-                            let u = parse_u32(chunk, &mut i) as usize;
-                            let v = parse_u32(chunk, &mut i);
-                            let w = parse_u32(chunk, &mut i) as u64;
-                            let (bit, idx) = (1u64 << (v & 63), (v >> 6) as usize);
-                            if ((*has_in.add(idx)).load(Relaxed) & bit) == 0 {
-                                (*has_in.add(idx)).fetch_or(bit, Relaxed);
-                            }
-                            let w_clamped = (w.min(2047)) as u32;
-                            let slot = (*s0_at.add(u + 1)).fetch_add(1, Relaxed) as usize;
-                            *e0.add(slot) = (v << 11) | w_clamped;
-                            if w >= 2047 {
-                                of0_vec.push((slot as u32, w));
+                        loop {
+                            let c = p2_ref.fetch_add(1, Relaxed);
+                            if c >= CHUNKS { break; }
+                            let chunk = &body[cuts[c]..cuts[c + 1]];
+                            let mut i = 0;
+                            while i < chunk.len() {
+                                while i < chunk.len() && *chunk.get_unchecked(i) < b'0' { i += 1; }
+                                if i >= chunk.len() { break; }
+                                let u = parse_u32(chunk, &mut i) as usize;
+                                let v = parse_u32(chunk, &mut i);
+                                let w = parse_u32(chunk, &mut i) as u64;
+                                if u != (v as usize) {
+                                    let slot = (*s0_at.add(u + 1)).fetch_add(1, Relaxed) as usize;
+                                    let w_clamped = (w.min(2047)) as u32;
+                                    *e0.add(slot) = (v << 11) | w_clamped;
+                                    if w >= 2047 {
+                                        of0_vec.push((slot as u32, w));
+                                    }
+                                }
                             }
                         }
                         bar.wait();
 
-                        // Combine of0 on thread 0
+                        // Combine of0 on thread 0 & drop graph.txt page cache immediately
                         if tid == 0 {
                             let of0_target = &mut *(of0_all_ptr as *mut Vec<(u32, u64)>);
                             for &p in of_ptrs_ref {
@@ -427,6 +433,9 @@ fn main() {
                                 of0_target.extend_from_slice(v);
                             }
                             of0_target.sort_unstable_by_key(|&(idx, _)| idx);
+
+                            #[cfg(unix)]
+                            madvise(g_bytes.as_ptr() as *mut u8, g_bytes.len(), 4);
                         }
                         bar.wait();
 
@@ -532,10 +541,6 @@ fn main() {
             }
         });
 
-        // Drop graph.txt page cache immediately
-        #[cfg(unix)]
-        madvise(g_bytes.as_ptr() as *mut u8, g_bytes.len(), 4);
-
         // Free build-only buffers
         free_anon(edges0_p as *mut u8, e0_bytes);
         free_anon(start0_p as *mut u8, s0_bytes);
@@ -578,8 +583,8 @@ fn main() {
 
         active_queries.sort_unstable_by_key(|&(s_new, _, _)| s_new);
 
-        // Execute queries with 8 worker threads
-        const QT: usize = 8;
+        // Execute queries with 9 worker threads
+        const QT: usize = 9;
         let total_active = active_queries.len();
         let share = |t: usize| t * total_active / QT;
         let next: Vec<AtomicUsize> = (0..QT).map(|t| AtomicUsize::new(share(t))).collect();
