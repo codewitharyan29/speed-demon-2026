@@ -37,6 +37,7 @@ D = 1 throughout (no dependencies). Output hash on every row below: the board's 
 | 21 | 647e26f | region table of bytes holding the country's index in the totals (1 MB, one lookup instead of two) | run-10dbb3692f36 | 47.56 | 14.4 | 606 | **25.70** |
 | 22 | 75bd0cd | candidate A (cloud session 4): raw-byte name keys, leaner stage 2, SWAR regions parse, 32 KiB blocks | run-f0c4b3883b10 | 40.23 | 13.1 | 624 | 28.36 |
 | 23 | 9fb5c93 | candidate B: direct table of entries indexed by hash, 128 KB tag array, 16-wide tag compare | run-99e4e3237a66 | 36.59 | 13.5 | 629 | **29.52** |
+| 24 | 46829d6 | R2 (cloud session 6): 32-byte name key block compared and hashed from one AVX2 vector, id/region/amount converted in one AVX2 pass | run-a3e9f05bd3dc | 36.09 | 13.3 | 656 | 29.63 |
 
 Kept: 1, 3, 4, 7, 8, 10, 12 (13-15 reverted: 64 KiB blocks and eagerly written zeros are the best measured). Rejected or reverted: 2 (equal to 1 within noise, kept for the instruction counts it enabled), 6 (alone: M
 37.5 MB until THP was disabled, then kept as part of 7), 9 (fewer instructions but 2.1 ms slower on the board, cause not found), 11. Rows 5 and 16 show the board's run-to-run noise: 0.04% on one pair, 6% (52.6, 52.9 and 55.8 ms for the same source, rows 12, 16, 18) on the other, so differences below about 3 ms are not distinguishable.
@@ -137,3 +138,5 @@ not always, see above): A 28.8, B 29.5.
 
 New fixture `tools/c_twins_gen.py` (names differing in exactly one byte at every position 0-40). It caught a lane-wise blend that
 left name bytes 15-16 uncompared in the first R1 draft. Details: [EXTREME_REWRITE_REPORT.md](EXTREME_REWRITE_REPORT.md).
+
+* R2 (row 24) gave -8% on the cloud VM but T 36.09 ms on the board against 35.7-36.7 ms for B (K 29.63 against 29.40-29.76), with S +27: no gain. Source reverted to B (9fb5c93); R2 is kept as tag `tc-r2-experiment`.
