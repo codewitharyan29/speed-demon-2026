@@ -261,8 +261,8 @@ byte-identical to this report's candidate B, except for one unused import that B
 
 | # | Hypothesis | Correctness | Local median (B same run) | Memory | S | Board K | Decision |
 |---|---|---|---:|---:|---:|---:|---|
-| F1 | name table of 15/16 of 2^17 entries (multiply-shift home), load 0.82: -0.5 MB | pass + stress1 | 73.9 (72.5) | -0.5 MB | 633 | N/A | rejected: about 0 net K |
-| F2 | 14/16 of 2^17 (load 0.87): -1.0 MB | pass + stress1 | 76.7 (72.5) +5.7% | -1.0 MB | 633 | N/A | rejected: about -1.3% K net |
+| F1 | name table of 15/16 of 2^17 entries (multiply-shift home), load 0.82: -0.5 MB | pass + stress1 | 73.9 (72.5) | -0.5 MB | 637 | N/A | rejected: about 0 net K |
+| F2 | 14/16 of 2^17 (load 0.87): -1.0 MB | pass + stress1 | 76.7 (72.5) +5.7% | -1.0 MB | 637 | N/A | rejected: about -1.3% K net |
 | F3 | 13/16 | over capacity, so it **correctly fell back** to the single-chunk run (490 ms) | | | | N/A | shows the cliff: a table under about 107 k names makes every run slow |
 | P1 | partitioning names by hash across threads: upper bound by having each thread look up only the names it would own | diag | 67.5 (76.6) with a quarter of the lookups | | | N/A | rejected: a quarter of the lookups on a private quarter of the table still cost 17 of 26 ms; sharing is not the dominant cost, and the exchange plus about 100 lines would cost more |
 | H1 | huge pages for the 8 MB entry table only (`PR_THP_DISABLE_EXCEPT_ADVISED`, Linux 6.18, falls back to disabling everywhere; table aligned to 2 MiB, `MADV_HUGEPAGE`): fewer TLB misses, no memory cost because every page of it is used | pass; AnonHugePages 8,192 kB confirmed | 69.95 (69.83), 80 runs | = | 633 | N/A | rejected: neutral locally; the board's kernel version is unknown |
