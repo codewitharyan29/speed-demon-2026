@@ -23,7 +23,8 @@ They are only used to compare variants, never reported as results.
 | 11 | One bounds check per token key (`u128` + `bzhi`) | 4e0a5a9 | 0.260 | 45 | 68.068 (K 22.98, 822 lines) |
 | 12 | No binary-search probing in `combine`; `par` without job order (-17 lines) | 9158a69 (scored as c4904b3) | 0.245 | 45 | 68.831 (K 23.80, 805 lines) |
 | 13 | Board experiment: scan table on 2 MB pages (2 MB-aligned, `MADV_HUGEPAGE`, exactly 4 MB with wrap-around spills) | 1e99e80 | 0.253 | 45 | 68.421 (K 23.36, 812 lines); reverted |
-| 14 | Board experiment: tokens looked up 16 at a time instead of 48 (the box has 16 L1D fill buffers per core, shared by two threads) | pending | | | |
+| 14 | Board experiment: tokens looked up 16 at a time instead of 48 (the box has 16 L1D fill buffers per core, shared by two threads) | 6f0f6e7 | 0.262 | 45 | 68.055 (K 22.97, 805 lines); reverted to 48 |
+| 15 | Phrases checked on each document's term-id sequence at their rarest term (no pair postings, bloom filter or re-tokenising) | pending | | | |
 
 ## Local measurements behind step 2 (in-process ms, median)
 
@@ -292,4 +293,21 @@ each candidate goes to the board on its own.
 - Board noise: step 12 changed no work but scored 0.245 s against 0.260 s for step 11, so one board run moves by
   about +-3% (Track C saw up to 6%). A single board run only settles a change of about 5% or more.
 - Lookup batch of 16 instead of 48, on the step-12 code (locally 24 was 224 ms against 213 for 48 in step 8, but
-  the laptop's caches differ). Verified on all seeds; `memory.peak` 43 MB local. Board: pending.
+  the laptop's caches differ). Verified on all seeds; `memory.peak` 43 MB local. Board: 0.262 s against 0.245 s
+  with 48, so the fill buffers were not the limit; back to 48.
+
+## Step 15: redesign, part 1: phrases at their trigger term (local, in-process ms, median)
+
+The scan already looks up every token, so it can keep the current document's term ids in order (misses and
+non-phrase terms keep their own ids, which no phrase holds). Each phrase is assigned its rarest term (by the sampled
+df); when that term occurs, its position is noted, and at the end of the document every noted position is compared with
+the phrases that term triggers. Matches go to a per-chunk list (query << 14 | document), sorted and deduplicated at the
+end of the chunk, and reported like any other result. This replaces the adjacent-pair selection, the pair table, the
+bloom filter, the pair postings and the re-tokenising of candidates, and the phrase branch of the per-chunk pass.
+
+| Version | 1 thread | 12 threads | `memory.peak` | Lines |
+|---|---|---|---|---|
+| Step 12 code (9158a69) | 992 | 195 (min 177) | 42 MB | 798 |
+| Phrases at their trigger term | 918 | 179 (min 158) | 40 MB | 748 |
+
+Verified on full seeds 1 and 2, sample seeds 1-3, tiny seeds 1-6 and the worked example.
