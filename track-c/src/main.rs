@@ -218,9 +218,13 @@ fn digits8(w: u64) -> u64 {
     (w & 0x0000_FFFF_0000_FFFF).wrapping_mul(42949672960001) >> 32
 }
 
+// The functions that read the buffer without bounds checks rely on one fact: the buffer extends 64 bytes past the data
+// (`PAD`), and every index they use is at most a separator position plus 8.
+
 /// The decimal number at `b[i..]` and the index after it. Up to 8 digits are converted at once, without a branch.
-fn number(b: &[u8], i: usize) -> (u64, usize) {
-    let w = u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
+#[inline(always)]
+unsafe fn number(b: &[u8], i: usize) -> (u64, usize) {
+    let w = (b.as_ptr().add(i) as *const u64).read_unaligned();
     let t = w ^ 0x3030_3030_3030_3030; // a digit byte becomes 0..=9
     let not_digit = ((t & 0x7F7F_7F7F_7F7F_7F7F) + 0x7676_7676_7676_7676 | t) & 0x8080_8080_8080_8080;
     let n = (not_digit.trailing_zeros() / 8) as usize;
@@ -228,8 +232,8 @@ fn number(b: &[u8], i: usize) -> (u64, usize) {
         return (digits8(w << (8 * (8 - n))), i + n);
     }
     let (mut v, mut j) = (digits8(w), i + 8); // longer than 8 digits: the rest one by one
-    while b[j].is_ascii_digit() {
-        (v, j) = (v * 10 + (b[j] - b'0') as u64, j + 1);
+    while (*b.get_unchecked(j)).is_ascii_digit() {
+        (v, j) = (v * 10 + (*b.get_unchecked(j) - b'0') as u64, j + 1);
     }
     (v, j)
 }
@@ -243,8 +247,9 @@ struct Quotes {
 
 impl Quotes {
     /// The number of quotes among the bytes before `pos`.
-    fn before(&self, pos: usize) -> u32 {
-        self.before[pos / 64] + (self.words[pos / 64] & ((1u64 << (pos % 64)) - 1)).count_ones()
+    #[inline(always)]
+    unsafe fn before(&self, pos: usize) -> u32 {
+        *self.before.get_unchecked(pos / 64) + (*self.words.get_unchecked(pos / 64) & ((1u64 << (pos % 64)) - 1)).count_ones()
     }
 }
 
@@ -268,11 +273,16 @@ fn structure(b: &[u8], end: usize, at: &mut Vec<u32>, quotes: &mut Quotes) {
             (quote, bits(b',') | bits(b'\n'), _mm_cvtsi128_si64(prefix_xor) as u64 ^ inside)
         };
         inside = ((in_quotes as i64) >> 63) as u64; // all ones if the next 64 bytes start inside quotes
-        let mut outside = separators & !in_quotes;
-        while outside != 0 {
-            at.push((base + outside.trailing_zeros() as usize) as u32);
-            outside &= outside - 1;
+        // Eight positions are written whether or not there are that many, and the length advances by the real number: a
+        // branch per block would be mispredicted about as often as it is taken. More than eight are rare.
+        let (mut outside, count) = (separators & !in_quotes, (separators & !in_quotes).count_ones() as usize);
+        at.reserve(64);
+        for k in 0..count.max(8) {
+            // SAFETY: 64 elements of spare capacity were reserved, and a block has at most 64 separators.
+            unsafe { at.as_mut_ptr().add(at.len() + k).write((base + outside.trailing_zeros() as usize) as u32) };
+            outside &= outside.wrapping_sub(1);
         }
+        unsafe { at.set_len(at.len() + count) };
         (quotes.words.push(quote), quotes.before.push(seen));
         seen += quote.count_ones();
     }
@@ -280,11 +290,12 @@ fn structure(b: &[u8], end: usize, at: &mut Vec<u32>, quotes: &mut Quotes) {
 }
 
 /// The text field `b[from..to]`: where its content starts and ends, and how many `""` pairs are in it.
-fn text(b: &[u8], q: &Quotes, from: usize, to: usize) -> Option<(usize, usize, usize)> {
-    if to == from || b[from] != b'"' {
+#[inline(always)]
+unsafe fn text(b: &[u8], q: &Quotes, from: usize, to: usize) -> Option<(usize, usize, usize)> {
+    if to == from || *b.get_unchecked(from) != b'"' {
         return Some((from, to, 0)); // unquoted
     }
-    if to - from < 2 || b[to - 1] != b'"' {
+    if to - from < 2 || *b.get_unchecked(to - 1) != b'"' {
         return None;
     }
     // Two delimiting quotes, and two more for every pair inside.
@@ -292,26 +303,26 @@ fn text(b: &[u8], q: &Quotes, from: usize, to: usize) -> Option<(usize, usize, u
 }
 
 /// Stage 2: the record that starts at `start` and whose four commas and LF are at `sep` goes into `batch`.
-fn record(c: &Ctx, b: &[u8], q: &Quotes, start: usize, sep: &[u32], batch: &mut Batch) -> Option<()> {
+unsafe fn record(c: &Ctx, b: &[u8], q: &Quotes, start: usize, sep: &[u32], batch: &mut Batch) -> Option<()> {
     let [e1, e2, e3, e4, e5] = [0, 1, 2, 3, 4].map(|k| sep[k] as usize);
-    let sep_ok = b[e1] == b',' && b[e2] == b',' && b[e3] == b',' && b[e4] == b',' && b[e5] == b'\n';
-    let p = start + 3 * (b[start] == 0xEF) as usize; // a BOM in front of the record
+    let sep_ok = *b.get_unchecked(e1) == b',' && *b.get_unchecked(e2) == b',' && *b.get_unchecked(e3) == b',' && *b.get_unchecked(e4) == b',' && *b.get_unchecked(e5) == b'\n';
+    let p = start + 3 * (*b.get_unchecked(start) == 0xEF) as usize; // a BOM in front of the record
     (sep_ok && (p == start || b[start + 1..start + 3] == [0xBB, 0xBF])).then_some(())?;
     let (id, i) = number(b, p);
     let (ns, ne, nd) = text(b, q, e1 + 1, e2)?;
     let (ts, te, td) = text(b, q, e2 + 1, e3)?;
     let (region, j) = number(b, e3 + 1);
-    let neg = b[e4 + 1] == b'-';
+    let neg = *b.get_unchecked(e4 + 1) == b'-';
     let (whole, k) = number(b, e4 + 1 + neg as usize);
-    let cr = (b[e5 - 1] == b'\r') as usize;
-    let fraction = b[k + 1].is_ascii_digit() && b[k + 2].is_ascii_digit();
-    (i == e1 && j == e4 && b[k] == b'.' && fraction && k + 3 + cr == e5).then_some(())?;
-    let cents = (whole * 100 + (b[k + 1] - b'0') as u64 * 10 + (b[k + 2] - b'0') as u64) as i64;
+    let cr = (*b.get_unchecked(e5 - 1) == b'\r') as usize;
+    let fraction = (*b.get_unchecked(k + 1)).is_ascii_digit() && (*b.get_unchecked(k + 2)).is_ascii_digit();
+    (i == e1 && j == e4 && *b.get_unchecked(k) == b'.' && fraction && k + 3 + cr == e5).then_some(())?;
+    let cents = (whole * 100 + (*b.get_unchecked(k + 1) - b'0') as u64 * 10 + (*b.get_unchecked(k + 2) - b'0') as u64) as i64;
     let owned = (nd > 0).then(|| {
         let (mut v, mut k) = (Vec::with_capacity(ne - ns + 32), ns);
         while k < ne {
-            v.push(b[k]);
-            k += 1 + (b[k] == b'"') as usize;
+            v.push(*b.get_unchecked(k));
+            k += 1 + (*b.get_unchecked(k) == b'"') as usize;
         }
         v.extend_from_slice(&[0; 32]); // readable padding, like the input buffer has
         v
@@ -377,7 +388,8 @@ fn parse_chunk(c: &Ctx, lo: usize, hi: usize, aggs: &mut [Agg], w: &mut Worker) 
         structure(buf, end, at, quotes);
         let mut start = 0;
         for sep in at.chunks_exact(5) {
-            if record(c, buf, quotes, start, sep, batch).is_none() {
+            // SAFETY: the buffer has `PAD` bytes after `end`, and the separators are before `end`.
+            if unsafe { record(c, buf, quotes, start, sep, batch) }.is_none() {
                 return false;
             }
             start = sep[4] as usize + 1;
