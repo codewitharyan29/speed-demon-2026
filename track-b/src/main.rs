@@ -786,8 +786,32 @@ fn main() {
                     *m = long_id(t).map_or(miss, |id| meta(id as usize));
                 }
             }
-            // DIAGNOSTIC: lookups only (no bookkeeping, no evaluation), to read their cost from the board.
-            std::hint::black_box(&found);
+            // Then act on them.
+            for (m, t) in found.iter().zip(batch) {
+                let (id, flags, d) = ((m & 0x3FFFF) as usize, m >> 18 & 3, m >> 20);
+                let (doc, local) = (t.doc, t.doc - base);
+                // SAFETY: d <= ndense (row ndense is the spare one), and local < the chunk's documents <= 64 * wl;
+                // every id is at most nkeys, and `start` has nkeys + 1 entries.
+                unsafe {
+                    // Every token sets its document's bit: in its term's bitset, or in the spare row.
+                    *rows.get_unchecked_mut(d as usize * wl + local as usize / 64) |=
+                        1 << (local % 64);
+                    if flags & 1 != 0 && *start.get_unchecked(id) != doc + 1 {
+                        // Any other BOOL term: a pair, once per document.
+                        *start.get_unchecked_mut(id) = doc + 1;
+                        pairs.push((id as u32) << DOC_BITS | local);
+                    }
+                }
+                // The document's term ids in order, and where its phrase triggers are.
+                if doc != cur {
+                    check(seq, hits, cur - base, matched);
+                    (seq.clear(), hits.clear(), cur = doc);
+                }
+                if flags & 2 != 0 {
+                    hits.push(seq.len() as u32);
+                }
+                seq.push(id as u32);
+            }
             true
         });
         check(seq, hits, cur - base, matched);
@@ -839,6 +863,7 @@ fn main() {
         }
         // Every BOOL query, on this chunk's documents.
         for (q, query) in queries.iter().enumerate().filter(|(_, q)| !q.phrase) {
+            // DIAGNOSTIC: no BOOL evaluation, to read its cost from the board.
             if std::hint::black_box(true) { continue; }
             let start = operand(query.terms[0]);
             if matches!(start, Operand::List(l) if l.is_empty()) && !query.ops.contains(&b'O') {
