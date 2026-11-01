@@ -28,7 +28,8 @@ They are only used to compare variants, never reported as results.
 | 17 | 60 chunks instead of 64: five per thread, no idle tail | 6921432 | 0.242 | 43 | 69.285 (K 24.31, 755 lines) |
 | 18 | Less single-threaded work: queries parsed in 12 pieces at once, no rebuild of the term table, a 1% sample | d324374 | 0.207 | 44 | 70.947 (K 26.24, 756 lines) |
 | 19 | Terms numbered straight into the scan's probe table (no separate term table, no second build) | 0dd42d9 | 0.206 | 38 | 71.142 (K 26.48, 734 lines) |
-| 20 | 48 chunks instead of 60 (four per thread; the per-chunk BOOL evaluation is a fixed cost per chunk) | pending | | | |
+| 20 | 48 chunks instead of 60 (four per thread; the per-chunk BOOL evaluation is a fixed cost per chunk) | 8f752f8 | 0.205 | 42 | 71.193 (K 26.54, 734 lines) |
+| 21 | Leaner scan callback: each bucket index computed once, batch arrays made once per chunk, unchecked indexing where bounds are provable | pending | | | |
 
 ## Local measurements behind step 2 (in-process ms, median)
 
@@ -422,4 +423,20 @@ for the evaluation. The code was restored to 0dd42d9 after D3.
 
 The BOOL evaluation (41 ms on the box) is a fixed cost per (query, chunk). After step 19 the code uses 3 MB less, so
 48 chunks (four per thread, still an even split) now costs little memory: `memory.peak` 37 -> 39-40 MB local (36
-chunks would be 51 MB). Verified on all seeds and the worked example. Board: pending.
+chunks would be 51 MB). Verified on all seeds and the worked example. Board: 0.2055 -> 0.2046 s, 38 -> 42 MB: within
+noise, so on the box the evaluation is not mostly a fixed cost per chunk (its merges scale with the list lengths, not
+the chunk count). Kept (K 26.48 -> 26.54).
+
+## Step 21: a leaner scan callback (the 112 ms stage on the box)
+
+Kept the separate lookup and bookkeeping loops (merging them loses overlapping misses, step 17), but: each token's
+home bucket is computed once (it was hashed again by the lookup), the batch's key and lookup arrays are made once per
+chunk instead of per batch of 48, and the tokeniser's batch slot, the probe's bucket and spill word, the bitset row
+and the stamp are indexed without bounds checks (each with its reason).
+
+| Version | Ir (cachegrind, full) | Mispredicts | 1 thread (median of 7) | 12 threads (median of 11) | Lines |
+|---|---|---|---|---|---|
+| Step 20 | 8.09 G | 66.5 M | 934 | 166 | 727 |
+| Lean callback | 6.94 G | 66.8 M | 890 | 157 | 735 |
+
+Verified on full seeds 1 and 2, sample seeds 1-3, tiny seeds 1-6, the worked example and the long-token case.

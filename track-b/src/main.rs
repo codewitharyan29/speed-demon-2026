@@ -141,7 +141,8 @@ fn scan(
             edges &= edges - 1;
             if open {
                 let len = at + p as usize - start;
-                batch[n] = Tok {
+                // SAFETY: n < BATCH + 32: the batch is handed over once it holds BATCH, and a block adds at most 32.
+                *unsafe { batch.get_unchecked_mut(n) } = Tok {
                     doc: start_doc,
                     at: start as u32,
                     len: len as u32,
@@ -257,15 +258,10 @@ impl Probe {
         *next - 1
     }
 
-    /// Asks for the cache line of the bucket where the key `k` is looked for first.
-    fn prefetch(&self, k: (u64, u64)) {
+    /// Asks for the cache line of bucket `i`.
+    fn prefetch(&self, i: usize) {
         // SAFETY: a prefetch is only a hint and never faults; the address is inside the table.
-        unsafe {
-            _mm_prefetch(
-                self.buckets.as_ptr().add(self.bucket(k)) as *const i8,
-                _MM_HINT_T0,
-            )
-        };
+        unsafe { _mm_prefetch(self.buckets.as_ptr().add(i) as *const i8, _MM_HINT_T0) };
     }
 
     fn bucket(&self, (k0, k1): (u64, u64)) -> usize {
@@ -274,9 +270,19 @@ impl Probe {
 
     /// The metadata of the term whose key words are `k`, or `miss`.
     fn find(&self, k: (u64, u64), miss: u32) -> u32 {
-        let mut i = self.bucket(k);
+        self.find_from(self.bucket(k), k, miss)
+    }
+
+    /// The same, given the key's home bucket `i`.
+    fn find_from(&self, mut i: usize, k: (u64, u64), miss: u32) -> u32 {
         loop {
-            let b = &self.buckets[i];
+            // SAFETY: bucket indexes are below the table's length (the hash's shift, and spills wrap around).
+            let (b, spilled) = unsafe {
+                (
+                    self.buckets.get_unchecked(i),
+                    *self.spilled.get_unchecked(i / 64),
+                )
+            };
             // SAFETY: AVX2 is enabled for this build. Each load reads 32 bytes inside the 64-byte bucket: three key
             // words and one word after them, whose lane the mask drops.
             let hit = unsafe {
@@ -288,7 +294,7 @@ impl Probe {
                 _mm256_movemask_pd(_mm256_castsi256_pd(both)) as usize & 7
             };
             let found = b.meta[hit.trailing_zeros() as usize & 3];
-            if hit != 0 || self.spilled[i / 64] >> (i % 64) & 1 == 0 {
+            if hit != 0 || spilled >> (i % 64) & 1 == 0 {
                 return if hit != 0 { found } else { miss };
             }
             i = (i + 1) % self.buckets.len();
@@ -571,7 +577,9 @@ fn main() {
     let all = pieces.iter().map(|piece| piece.1.len()).sum();
     let (mut probe, mut long, mut ids, mut next) = (Probe::new(all), Vec::new(), Vec::new(), 0);
     for batch in pieces.iter().flat_map(|piece| piece.1.chunks(16)) {
-        batch.iter().for_each(|k| probe.prefetch((k[0], k[1])));
+        batch
+            .iter()
+            .for_each(|k| probe.prefetch(probe.bucket((k[0], k[1]))));
         for k in batch {
             ids.push(match long.iter().position(|(l, _)| l == k) {
                 _ if k[2] == 0 => probe.intern((k[0], k[1]), &mut next),
@@ -741,17 +749,19 @@ fn main() {
         rows.resize(ndense as usize * wl, 0);
         let mut cur = base;
         (seq.clear(), hits.clear());
+        // A batch's keys (with their home bucket) and what they look up, made once per chunk.
+        let (mut found, mut keys) = ([miss; BATCH + 33], [((0, 0), 0); BATCH + 33]);
         scan(docs, range, base, true, offs, |batch| {
             // Look every token of the batch up first: the loads are independent, so their cache misses overlap.
             // First every token's key and home slot, asking for the slot's cache line straight away, so the misses
             // of the whole batch overlap instead of being waited for one at a time.
-            let (mut found, mut keys) = ([miss; BATCH + 33], [(0, 0); BATCH + 33]);
             for (k, t) in keys.iter_mut().zip(batch) {
-                *k = short_key(docs, t.at as usize, t.len as usize);
-                probe.prefetch(*k);
+                let k2 = short_key(docs, t.at as usize, t.len as usize);
+                *k = (k2, probe.bucket(k2));
+                probe.prefetch(k.1);
             }
-            for ((m, t), &k) in found.iter_mut().zip(batch).zip(&keys) {
-                *m = probe.find(k, miss);
+            for ((m, t), &k) in found.iter_mut().zip(batch).zip(keys.iter()) {
+                *m = probe.find_from(k.1, k.0, miss);
                 // A token over 16 bytes (none in the generated data) is looked up in full.
                 if t.len > 16 {
                     *m = long_id(t).map_or(miss, |id| meta(id as usize));
@@ -761,13 +771,18 @@ fn main() {
             for (m, t) in found.iter().zip(batch) {
                 let (id, flags, d) = ((m & 0x3FFFF) as usize, m >> 18 & 3, m >> 20);
                 let (doc, local) = (t.doc, t.doc - base);
-                if flags & 1 != 0 && d != NO_BITS {
-                    // A term with a bitset: set the document's bit.
-                    rows[d as usize * wl + local as usize / 64] |= 1 << (local % 64);
-                } else if flags & 1 != 0 && start[id] != doc + 1 {
-                    // Any other BOOL term: a pair, once per document.
-                    start[id] = doc + 1;
-                    pairs.push((id as u32) << DOC_BITS | local);
+                // SAFETY: a term with a bitset has d < ndense, and local < the chunk's documents <= 64 * wl; every
+                // id is at most nkeys, and `start` has nkeys + 1 entries.
+                unsafe {
+                    if flags & 1 != 0 && d != NO_BITS {
+                        // A term with a bitset: set the document's bit.
+                        *rows.get_unchecked_mut(d as usize * wl + local as usize / 64) |=
+                            1 << (local % 64);
+                    } else if flags & 1 != 0 && *start.get_unchecked(id) != doc + 1 {
+                        // Any other BOOL term: a pair, once per document.
+                        *start.get_unchecked_mut(id) = doc + 1;
+                        pairs.push((id as u32) << DOC_BITS | local);
+                    }
                 }
                 // The document's term ids in order, and where its phrase triggers are.
                 if doc != cur {
