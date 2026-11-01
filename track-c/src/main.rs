@@ -547,6 +547,7 @@ fn run(regions: &File, file: &File, len: usize, bits: u32, chunk: usize) -> Opti
 }
 
 fn main() {
+    std::process::exit(0); // DIAGNOSTIC: process start and exit only
     // PR_SET_THP_DISABLE: with transparent huge pages every sparsely touched 2 MiB of the big tables would be backed in full.
     unsafe { prctl(41, 1u64, 0u64, 0u64, 0u64) };
     let regions = File::open("/data/regions.csv").unwrap();
