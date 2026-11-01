@@ -13,6 +13,8 @@ constexpr u32 CHUNKS = 48;
 constexpr auto rx = std::memory_order_relaxed;
 static u32 n, m, *first, *adj; // CSR (renumbered): offsets and packed edges
 static Ov ov;                  // true weights of edges packed as 2047
+static u32 *rfirst, *radj;     // the same graph with every edge reversed
+static Ov rov;                 // true weights of reversed edges packed as 2047
 
 template <class P = u32> static P *anon(size_t count) {
   return (P *)mmap(0, count * sizeof(P) + 4096, 3, MAP_PRIVATE | MAP_ANONYMOUS,
@@ -120,13 +122,14 @@ static long slow(u32 s, u32 t) {
   return munmap(inv, n * 8ull + 4096), ans;
 }
 
-// 16-bit distances, stored inverted (0 = unseen), in 512-entry pages that are
-// allocated on the first write; page 0 stays zero and backs every unseen page.
+// Distances of both directions, 16 bits each and stored inverted (0 = unseen):
+// the forward one in the low half of a word, the backward one in the high half.
+// Words live in 512-entry pages that are allocated on the first write; page 0
+// stays zero and backs every unseen page.
 struct Dist {
-  u32 *pt, *own, np = 1;
-  u16 *pool;
-  u16 get(u32 v) { return pool[pt[v >> 9] << 9 | v & 511]; }
-  void set(u32 v, u16 x) {
+  u32 *pt, *own, np = 1, *pool;
+  u32 get(u32 v) { return pool[pt[v >> 9] << 9 | v & 511]; }
+  void set(u32 v, u32 x) {
     u32 &p = pt[v >> 9];
     if (!p)
       own[np] = v >> 9, p = np++;
@@ -134,41 +137,61 @@ struct Dist {
   }
   void clear() {
     for (u32 i = 1; i < np; i++)
-      memset(pool + (i << 9), 0, 1024), pt[own[i]] = 0;
+      memset(pool + (i << 9), 0, 2048), pt[own[i]] = 0;
     np = 1;
   }
 };
 
-static long fast(u32 s, u32 t, Dist &D, Dial &q) {
-  u32 b, u;
-  bool big = 0;
-  D.set(s, 0xFFFF), q.push(0, s);
-  while (q.pop(b, u)) {
-    u16 dt = D.get(t);
-    if (dt && ((u16)~dt >> 4) < b)
-      break; // every bucket up to t's has been emptied: its distance is final
-    u32 d = (u16)~D.get(u);
-    if (d >> 4 != b)
+// One direction of the search: its own CSR, queue and lower bound.
+struct Side {
+  const u32 *first, *adj;
+  const Ov *ov;
+  Dial q;
+  u32 low = 0; // no node with a smaller distance is left to settle
+};
+
+// Relaxes the edges of node u, settled at distance d, and records any meeting
+// with the other direction in mu. SH is 0 for the forward half of a word.
+template <int SH>
+static void expand(Side &S, Dist &D, u32 u, u32 d, u32 &mu, bool &big) {
+  u64 r;
+  memcpy(&r, S.first + u, 8);
+  for (u32 i = (u32)r; i < r >> 32; i++) {
+    u32 e = S.adj[i], v = e >> 11, w = e & 2047, x = D.get(v);
+    u64 nd = d + (w == 2047 ? heavy(*S.ov, i) : w);
+    if (__builtin_expect(nd >= 60000, 0)) {
+      big = 1; // too long for 16 bits
       continue;
-    u64 r;
-    memcpy(&r, first + u, 8);
-    for (u32 i = (u32)r; i < r >> 32; i++) {
-      u32 e = adj[i], v = e >> 11, w = e & 2047;
-      u64 nd = d + (w == 2047 ? heavy(ov, i) : w);
-      if (__builtin_expect(nd >= 60000, 0)) {
-        big = 1; // too long for 16 bits
-        continue;
-      }
-      u16 inv = ~(u16)nd;
-      if (inv > D.get(v)) {
-        D.set(v, inv);
-        q.push(nd >> 4, v);
-        _mm_prefetch((const char *)(first + v), _MM_HINT_T0);
-      }
+    }
+    u16 inv = ~(u16)nd, mine = x >> SH, other = x >> (16 - SH);
+    if (inv > mine) {
+      D.set(v, x & ~(0xFFFFu << SH) | inv << SH);
+      S.q.push(nd >> 4, v);
+      other && (mu = std::min(mu, (u32)nd + (u16)~other), 1);
+      _mm_prefetch((const char *)(S.first + v), _MM_HINT_T0);
     }
   }
-  long ans = D.get(t) ? (u16)~D.get(t) : -1;
-  q.clear(), D.clear();
+}
+
+static long fast(u32 s, u32 t, Dist &D, Side &F, Side &R) {
+  u32 b, u, mu = ~0u;
+  bool big = 0;
+  D.set(s, 0xFFFF), D.set(t, D.get(t) | 0xFFFF0000u);
+  F.q.push(0, s), R.q.push(0, t), F.low = R.low = 0;
+  for (;;) {
+    Side &S = F.low <= R.low ? F : R; // grow the side that is behind
+    if (!S.q.pop(b, u))
+      break;
+    S.low = b << 4;
+    if (F.low + R.low >= mu)
+      break; // no path through an unsettled node can beat mu
+    u32 x = D.get(u), d = (u16) ~(&S == &F ? x : x >> 16);
+    if (d >> 4 != b)
+      continue;
+    (&S == &F ? expand<0> : expand<16>)(S, D, u, d, mu, big);
+  }
+  F.q.clear(), R.q.clear(), D.clear();
+  long ans = mu < 60000 || (mu != ~0u && !big) ? (long)mu : -1;
   return ans < 0 && big ? slow(s, t) : ans;
 }
 
@@ -280,6 +303,33 @@ int main() {
       work.push_back({a, b, (u32)ans.size() - 1});
   }
   munmap(s0, (2 * n + m + 2) * 4ull + 4096);
+  // The reverse graph, in the final ids: count in-degrees, prefix, fill.
+  rfirst = anon(n + 2), radj = anon(m);
+  std::barrier rsync(T);
+  Ov rov1[T];
+  par([&](u32 tid) {
+    size_t lo = (size_t)n * tid / T, hi = (size_t)n * (tid + 1) / T;
+    for (u32 i = first[lo]; i < first[hi]; i++) {
+      _mm_prefetch((const char *)(rfirst + (adj[i + 16] >> 11) + 2),
+                   _MM_HINT_T0);
+      std::atomic_ref<u32>(rfirst[(adj[i] >> 11) + 2]).fetch_add(1, rx);
+    }
+    rsync.arrive_and_wait();
+    tid || (std::partial_sum(rfirst + 1, rfirst + n + 2, rfirst + 1), 1);
+    rsync.arrive_and_wait();
+    for (size_t u = lo; u < hi; u++)
+      for (u32 i = first[u]; i < first[u + 1]; i++) {
+        _mm_prefetch((const char *)(rfirst + (adj[i + 16] >> 11) + 1),
+                     _MM_HINT_T0);
+        u32 e = adj[i];
+        u32 pos = std::atomic_ref<u32>(rfirst[(e >> 11) + 1]).fetch_add(1, rx);
+        radj[pos] = u << 11 | (e & 2047);
+        (e & 2047) == 2047 && (rov1[tid].push_back({pos, heavy(ov, i)}), 1);
+      }
+  }); // LAP:reverse
+  for (auto &v : rov1)
+    rov.insert(rov.end(), v.begin(), v.end());
+  std::sort(rov.begin(), rov.end());
   std::sort(work.begin(), work.end()); // LAP:prep
 
   // Each thread starts on its own slice of the queries, then helps with the
@@ -288,15 +338,16 @@ int main() {
   for (u32 k = 0; k < T; k++)
     cur[k * 8] = k * work.size() / T;
   par([&](u32 tid) {
-    u32 P = (n >> 9) + 2;                              // pages of 512 nodes
-    auto pool = anon<u64>(POOL + 129 * (size_t)P + 2); // queue | tables | pages
-    auto pt = (u32 *)(pool + POOL);
-    Dist D{pt, pt + P, 1, (u16 *)(pool + POOL + P)};
-    Dial q(pool);
+    u32 P = (n >> 9) + 2;                                  // pages of 512 nodes
+    auto pool = anon<u64>(2 * POOL + 257 * (size_t)P + 2); // queues | pages
+    auto pt = (u32 *)(pool + 2 * POOL);
+    Dist D{pt, pt + P, 1, pt + 2 * P};
+    Side F{first, adj, &ov, Dial(pool)},
+        R{rfirst, radj, &rov, Dial(pool + POOL)};
     for (u32 k = 0; k < T; k++)
       for (size_t j, who = (tid + k) % T, end = (who + 1) * work.size() / T;
            (j = cur[who * 8].fetch_add(1, rx)) < end;)
-        ans[work[j][2]] = fast(work[j][0], work[j][1], D, q);
+        ans[work[j][2]] = fast(work[j][0], work[j][1], D, F, R);
   }); // LAP:queries
 
   std::string out;

@@ -437,3 +437,22 @@ Memory by phase (cgroup `memory.current` read at each barrier): 10 MB after pass
 the scatter, 43 after it, 36 while searching. The scatter writes `adj` at random positions, so all 20 MB of it is resident within
 a few ms while `e0` can only be released gradually: the peak is the five build arrays together and cannot be lowered by
 releasing `e0` early.
+
+## Step 28: bidirectional search over a reverse CSR
+
+Board run 29e4dad (step 27): T 0.2418 s, M 84.1 MB, S 286, K 20.93, 66.04 pts. M did not move although the local query-phase
+memory fell from 74 to 36 MB: on the board the peak sits in the build.
+
+The two research reports and the graph's own numbers (the target is the r-th node settled from the source, so two balls of
+half the radius hold about half the nodes) pointed at bidirectional search, which I had rejected twice in the Rust version.
+Both earlier failures had a reverse graph of 8-byte edges next to a 40 MB forward graph, and separate distance arrays.
+
+| Change | Local result (ms, median of 11) | Verdict |
+|---|---|---|
+| Reverse CSR in the final ids (count in-degrees with prefetched atomics, prefix, fill; heavy reverse weights in their own table), built after the build arrays are unmapped, so the peak stays at the build's | +12.6 ms | needed |
+| Forward and backward distances in one 32-bit word (low and high half) in paged storage: a meeting check costs no extra cache miss | | key to the result |
+| Grow the side whose lowest possible distance is smaller; each side's bound is the bucket of its last pop; stop when the two bounds add up to the best meeting mu; a result below 60000, or an exhausted search with no skipped edge, is exact; otherwise the exact 64-bit search | queries 95.6 -> 39.5 ms (-59%) | kept |
+| Total | 166.1 -> 120.8 ms (-27%), peak 63 -> 65 MB, 286 -> 329 lines | kept |
+
+Exact on 6 tiny, 3 sample and 2 full datasets; ASAN+UBSAN clean on four of them. One bug on the way: the answer expression mixed
+`u32` and `int` in a conditional, so unreachable queries printed 4294967295.
