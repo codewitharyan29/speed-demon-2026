@@ -159,9 +159,10 @@ u8 g_used[kMaxProv + 1];  // by provisional id: bit 0 = in a BOOL query, bit 1 =
 struct Query {
   u32 t[8];
   u8 ops[8];
-  u8 n, phrase;
+  u8 n, phrase, has_or;
 };
 std::unique_ptr<Query[]> g_queries;
+std::vector<u32> g_bool;  // the numbers of the BOOL queries
 u32 g_nq;
 
 std::vector<Query> g_piece[kThreads];
@@ -192,6 +193,7 @@ void parse(int tid, std::vector<Query>& out) {
       p++;
       if (!q.phrase) {
         q.ops[q.n - 1] = *p;
+        q.has_or |= *p == 'O';
         while (*p != ' ') p++;
         p++;
       }
@@ -445,7 +447,7 @@ void scan(Worker& w, u64 from, u64 to, u32 first_doc, u32 base, u32 wl) {
     const char* q = d + s;
     u64 w0 = (load64(q) | kOnes * 0x20), w1 = (load64(q + 8) | kOnes * 0x20);
     w0 = _bzhi_u64(w0, 8 * len);
-    w1 = _bzhi_u64(w1, len > 8 ? 8 * (len - 8) : 0);
+    w1 = _bzhi_u64(w1 & -(u64)(len > 8), 8 * (len - 8));
     w.h[nt++] = len > 16 ? hash_bytes(q, len, true) : hash16(w0, w1);
   };
   const __m256i k20 = _mm256_set1_epi8(0x20), k60 = _mm256_set1_epi8(0x60), k7B = _mm256_set1_epi8(0x7B),
@@ -616,6 +618,8 @@ void worker(int tid) {
     g_trig.resize(by_term.size());
     std::vector<u32> fill(g_tstart.begin(), g_tstart.end());
     for (auto& e : by_term) g_trig[fill[e.first]++] = e.second;
+    for (u32 q = 0; q < g_nq; q++)
+      if (!g_queries[q].phrase) g_bool.push_back(q);
     g_pay.assign(kMaxProv + 1, 0);
     for (u32 p = 1; p <= kMaxProv; p++) {
       u32 f = g_fin[p];
@@ -693,13 +697,10 @@ void worker(int tid) {
       report(q, run, base);
     }
     // Every BOOL query, on this chunk's documents.
-    for (u32 q = 0; q < g_nq; q++) {
+    for (u32 q : g_bool) {
       const Query& qq = g_queries[q];
-      if (qq.phrase) continue;
       Opnd x = operand(qq.t[0]);
-      bool has_or = false;
-      for (u32 k = 0; k + 1 < qq.n; k++) has_or |= qq.ops[k] == 'O';
-      if (x.b == nullptr && x.n == 0 && !has_or) continue;
+      if (x.b == nullptr && x.n == 0 && !qq.has_or) continue;
       run.start(x);
       for (u32 k = 0; k + 1 < qq.n; k++) run.apply(qq.ops[k], operand(qq.t[k + 1]));
       report(q, run, base);
@@ -735,6 +736,12 @@ void worker(int tid) {
     }
     PH(9)
 #ifdef SD_PHASES
+    {
+      FILE* f = fopen("/proc/self/status", "r");
+      char line[256];
+      while (f && fgets(line, sizeof line, f))
+        if (!strncmp(line, "VmHWM", 5) || !strncmp(line, "VmRSS", 5) || !strncmp(line, "RssAnon", 7) || !strncmp(line, "RssFile", 7)) fputs(line, stderr);
+    }
     for (int i = 1; i < 10; i++) fprintf(stderr, "phase %d: %.2f ms (at %.2f)\n", i, g_ph[i] - g_ph[i - 1], g_ph[i] - g_ph[0]);
     double a = 0, b = 0, tpm = (g_tc[9] - g_tc[0]) / (g_ph[9] - g_ph[0]);
     for (int t = 0; t < kThreads; t++) a += g_cy[t][0], b += g_cy[t][1];
