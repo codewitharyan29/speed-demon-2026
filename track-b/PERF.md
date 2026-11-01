@@ -536,3 +536,21 @@ The two cheap, new items, tested:
 | Step 25 code | 6.711 G | 56.4 M | 785 | 154 | |
 | Miss sentinel: lane 3's metadata is `miss` once the table is final, read as meta[(hit or 8).trailing_zeros()] | 6.661 G | 56.5 M | | | rejected: no change |
 | Lookups 32 at a time instead of 48 | | | 807 | 151 | rejected |
+
+## Board diagnostics on the step-25 code (labelled DIAGNOSTIC; wrong output on purpose, T and M still reported)
+
+| Diagnostic | What runs | Local (ms) | Board T (ms) | Board M (MB) |
+|---|---|---|---|---|
+| DA (157eb3f, run-a8a081ab0529) | startup, the chunk pass tokenising only, output | 34 | 48.3 | 21.4 |
+| DB (f739003, run-8327b601ff02) | + every token looked up (nothing recorded) | 72 | 92.4 | 21.7 |
+| DC (0e16c08, run-fd184254abca) | + recording, counting sort, phrase checks (no BOOL evaluation) | 113 | 143.5 | 38.6 |
+| (full) | step 25 | 139 | 180-186 | 40 |
+
+On the box: startup ~20 ms, tokenising and output ~28, lookups 44 (box/laptop only 1.16: they wait on memory, the 4 MB
+table), recording 51, BOOL evaluation ~40 (memory-bound). Recording plus evaluation is half the run.
+
+## Step 28: board experiment, 96 chunks
+
+Smaller chunks halve the per-thread buffers (pairs, postings, bitset rows), so two threads' share fits the box's L2
+better, and a rare term is absent from more chunks, so more queries exit early; the cost is twice the per-chunk
+query loop. Locally `memory.peak` 40 -> 31 MB. Verified on all seeds and the worked example.
