@@ -311,6 +311,7 @@ fn resolve(c: &Ctx, batch: &mut Batch, aggs: &mut [Agg]) {
         let country = c.dense[c.region.get(r.region).map_or(0, |x| x.load(Relaxed)) as usize] as usize;
         // SAFETY: the name has 32 readable bytes after it, as `record` ensured.
         let name = unsafe { c.names.entry(r.name, r.len, r.hash) };
+        name.mask[country / 64].fetch_or(1 << (country % 64), Relaxed);
         let a = &mut aggs[country];
         a.count += 1;
         a.id_sum += r.id;
@@ -322,9 +323,18 @@ fn resolve(c: &Ctx, batch: &mut Batch, aggs: &mut [Agg]) {
     batch.owned.clear();
 }
 
+/// The buffers of one worker, kept from chunk to chunk.
+#[derive(Default)]
+struct Worker {
+    buf: Vec<u8>,
+    batch: Batch,
+    at: Vec<u32>,
+    quotes: Quotes,
+}
+
 /// Parses the records between `lo` and `hi`, which are record starts, into `aggs`. False if something is not as expected.
-fn parse_chunk(c: &Ctx, lo: usize, hi: usize, aggs: &mut [Agg]) -> bool {
-    let (mut buf, mut batch, mut at, mut quotes) = (vec![], Batch::default(), vec![], Quotes::default());
+fn parse_chunk(c: &Ctx, lo: usize, hi: usize, aggs: &mut [Agg], w: &mut Worker) -> bool {
+    let Worker { buf, batch, at, quotes } = w;
     let (mut next, mut keep) = (lo, 0);
     loop {
         let n = BLOCK.min(hi - next);
@@ -336,18 +346,18 @@ fn parse_chunk(c: &Ctx, lo: usize, hi: usize, aggs: &mut [Agg]) -> bool {
         if last && buf[end - 1] != b'\n' {
             (buf[end], end) = (b'\n', end + 1); // the last record may lack its terminator
         }
-        structure(&buf, end, &mut at, &mut quotes);
+        structure(buf, end, at, quotes);
         let mut start = 0;
         for sep in at.chunks_exact(5) {
-            if record(c, &buf, &quotes, start, sep, &mut batch).is_none() {
+            if record(c, buf, quotes, start, sep, batch).is_none() {
                 return false;
             }
             start = sep[4] as usize + 1;
             if batch.recs.len() == BATCH {
-                resolve(c, &mut batch, aggs);
+                resolve(c, batch, aggs);
             }
         }
-        resolve(c, &mut batch, aggs); // before the buffer changes
+        resolve(c, batch, aggs); // before the buffer changes
         if last {
             return start == end;
         }
@@ -375,25 +385,35 @@ fn money(v: i64) -> String {
     format!("{}{}.{:02}", if v < 0 { "-" } else { "" }, v.abs() / 100, v.abs() % 100)
 }
 
+/// The start of the first line of `file` (`len` bytes) at or after `at`, where lines are at most 64 bytes long.
+fn line_start(file: &File, len: usize, at: usize) -> usize {
+    let (n, mut buf) = ((len - (at - 1)).min(64), [0u8; 64]);
+    file.read_exact_at(&mut buf[..n], at as u64 - 1).unwrap();
+    buf[..n].iter().position(|&c| c == b'\n').map_or(len, |k| at + k)
+}
+
 /// The aggregates of `file` (`len` bytes); `None` if the fast path gives up: `chunk` is the size of the pieces it is
 /// parsed in, and `bits` the size of the name table.
-fn run(regions: &[u8], file: &File, len: usize, bits: u32, chunk: usize) -> Option<Vec<u8>> {
+fn run(regions: &File, file: &File, len: usize, bits: u32, chunk: usize) -> Option<Vec<u8>> {
     // regions.csv: a header, then "region_id,CCC\n" lines in ascending order, so the last line has the largest id.
-    let first = regions.iter().position(|&c| c == b'\n')? + 1;
-    let last = regions[..regions.len() - 1].iter().rposition(|&c| c == b'\n').map_or(first, |k| k + 1);
-    let max_id = regions[last..].iter().take_while(|c| c.is_ascii_digit()).fold(0, |v, &c| v * 10 + (c - b'0') as usize);
+    let rlen = regions.metadata().ok()?.len() as usize;
+    let (mut head, mut tail) = ([0u8; 64], [0u8; 64]);
+    regions.read_exact_at(&mut head, 0).ok()?;
+    regions.read_exact_at(&mut tail, rlen as u64 - 64).ok()?;
+    let first = head.iter().position(|&c| c == b'\n')? + 1;
+    let last = tail[..63].iter().rposition(|&c| c == b'\n')? + 1;
+    let max_id = tail[last..].iter().take_while(|c| c.is_ascii_digit()).fold(0, |v, &c| v * 10 + (c - b'0') as usize);
     let (region, seen): (Vec<AtomicU16>, Vec<AtomicBool>) = (zeros(max_id + 1), zeros(26 * 26 * 26 + 1));
     let pieces = 16;
     let cut = |j: usize| match j {
         0 => first,
-        _ if j == pieces => regions.len(),
-        _ => {
-            let nominal = first + (regions.len() - first) * j / pieces;
-            nominal + regions[nominal - 1..].iter().position(|&c| c == b'\n').unwrap()
-        }
+        _ if j == pieces => rlen,
+        _ => line_start(regions, rlen, first + (rlen - first) * j / pieces),
     };
     let parsed = parallel(pieces, |j| {
-        for line in regions[cut(j)..cut(j + 1)].split(|&c| c == b'\n').filter(|l| !l.is_empty()) {
+        let mut text = vec![0u8; cut(j + 1) - cut(j)];
+        regions.read_exact_at(&mut text, cut(j) as u64).ok()?;
+        for line in text.split(|&c| c == b'\n').filter(|l| !l.is_empty()) {
             let (id, country) = line.split_at(line.iter().position(|&c| c == b',')?);
             let (id, country) = (id.iter().fold(0, |v, &c| v * 10 + (c - b'0') as usize), &country[1..]);
             if country.len() != 3 || !country.iter().all(|c| c.is_ascii_uppercase()) || id > max_id {
@@ -423,11 +443,19 @@ fn run(regions: &[u8], file: &File, len: usize, bits: u32, chunk: usize) -> Opti
     file.read_exact_at(&mut head[..len.min(256)], 0).ok()?;
     let body = head.iter().position(|&c| c == b'\n')? + 1; // the header has no quotes
     let chunks = len.div_ceil(chunk);
-    let results = parallel(chunks, |j| {
-        let lo = if j == 0 { body } else { record_start(&ctx, j * chunk) };
-        let hi = if j + 1 == chunks { len } else { record_start(&ctx, (j + 1) * chunk) };
-        let mut aggs = vec![NONE; countries];
-        (lo >= hi || parse_chunk(&ctx, lo, hi, &mut aggs)).then_some(aggs)
+    let next = AtomicUsize::new(0);
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let results = parallel(threads, |_| {
+        let (mut aggs, mut worker, mut ok) = (vec![NONE; countries], Worker::default(), true);
+        loop {
+            let j = next.fetch_add(1, Relaxed);
+            if j >= chunks {
+                return ok.then_some(aggs);
+            }
+            let lo = if j == 0 { body } else { record_start(&ctx, j * chunk) };
+            let hi = if j + 1 == chunks { len } else { record_start(&ctx, (j + 1) * chunk) };
+            ok &= lo >= hi || parse_chunk(&ctx, lo, hi, &mut aggs, &mut worker);
+        }
     });
     if names.full.load(Relaxed) || results.iter().any(|r| r.is_none()) {
         return None;
@@ -472,7 +500,7 @@ fn run(regions: &[u8], file: &File, len: usize, bits: u32, chunk: usize) -> Opti
 }
 
 fn main() {
-    let regions = std::fs::read("/data/regions.csv").unwrap();
+    let regions = File::open("/data/regions.csv").unwrap();
     let file = File::open("/data/records.csv").unwrap();
     let len = file.metadata().unwrap().len() as usize;
     // If the parallel run gives up, parse everything as one chunk, with a name table that holds a name per record.
