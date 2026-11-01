@@ -88,3 +88,4 @@ faults on the 10 MB table) is therefore untested; the memory risk made it not wo
 * The process floor was already read from the board (run-8c4eea5206b0: exit at the top of `main`, T 0.72 ms, M 8.14 MB; run-914f499201c3: after the region table 3.54 ms). A static / no_std / raw-syscall start can therefore save at most about 0.7 ms (1.4% of T) and costs lines; not pursued.
 * Not done: partitioning the name space across workers (needs a bounded-round record exchange; local VM has 4 MB of L3 against the board's 24 MB, so it cannot rank the idea); a persistent thread pool (about 1 ms).
 * Tools: `tools/c_memcheck.sh` (debug assertions + overflow checks + valgrind memcheck; Rust sanitizers need nightly, not in the offline image) and `tools/c_ab.sh` (interleaved timing + memory.peak).
+* Slot table probed in groups of 4 (one SSE compare of the tags, as in SwissTable): same median as linear probing on the VM (136.35 vs 136.52 ms), M +0.2 MB. Reverted.
