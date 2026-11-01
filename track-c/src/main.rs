@@ -180,6 +180,17 @@ struct Agg {
     note_bytes: u64,
 }
 
+impl Agg {
+    fn merge(&mut self, o: &Agg) {
+        self.count += o.count;
+        self.id_sum += o.id_sum;
+        self.sum += o.sum;
+        (self.min, self.max) = (self.min.min(o.min), self.max.max(o.max));
+        self.name_bytes += o.name_bytes;
+        self.note_bytes += o.note_bytes;
+    }
+}
+
 const NONE: Agg = Agg { count: 0, id_sum: 0, sum: 0, min: i64::MAX, max: i64::MIN, name_bytes: 0, note_bytes: 0 };
 
 #[derive(Clone, Copy)]
@@ -220,23 +231,6 @@ fn digits8(w: u64) -> u64 {
 
 // The functions that read the buffer without bounds checks rely on one fact: the buffer extends 64 bytes past the data
 // (`PAD`), and every index they use is at most a separator position plus 8.
-
-/// The decimal number at `b[i..]` and the index after it. Up to 8 digits are converted at once, without a branch.
-#[inline(always)]
-unsafe fn number(b: &[u8], i: usize) -> (u64, usize) {
-    let w = (b.as_ptr().add(i) as *const u64).read_unaligned();
-    let t = w ^ 0x3030_3030_3030_3030; // a digit byte becomes 0..=9
-    let not_digit = ((t & 0x7F7F_7F7F_7F7F_7F7F) + 0x7676_7676_7676_7676 | t) & 0x8080_8080_8080_8080;
-    let n = (not_digit.trailing_zeros() / 8) as usize;
-    if n < 8 {
-        return (digits8(w << (8 * (8 - n))), i + n);
-    }
-    let (mut v, mut j) = (digits8(w), i + 8); // longer than 8 digits: the rest one by one
-    while (*b.get_unchecked(j)).is_ascii_digit() {
-        (v, j) = (v * 10 + (*b.get_unchecked(j) - b'0') as u64, j + 1);
-    }
-    (v, j)
-}
 
 /// The decimal number of `n` digits (1 or more) at `b[i..]`. Up to 8 digits are converted at once, without a branch.
 #[inline(always)]
@@ -296,19 +290,6 @@ fn structure(b: &[u8], end: usize, at: &mut Vec<u32>, quotes: &mut Quotes) {
         seen += quote.count_ones();
     }
     (quotes.words.push(0), quotes.before.push(seen)); // so that `before` works for a position at the very end
-}
-
-/// The text field `b[from..to]`: where its content starts and ends, and how many `""` pairs are in it.
-#[inline(always)]
-unsafe fn text(b: &[u8], q: &Quotes, from: usize, to: usize) -> Option<(usize, usize, usize)> {
-    if to == from || *b.get_unchecked(from) != b'"' {
-        return Some((from, to, 0)); // unquoted
-    }
-    if to - from < 2 || *b.get_unchecked(to - 1) != b'"' {
-        return None;
-    }
-    // Two delimiting quotes, and two more for every pair inside.
-    Some((from + 1, to - 1, (q.before(to) - q.before(from) - 2) as usize / 2))
 }
 
 /// Stage 2: the record that starts at `start` and whose four commas and LF are at `sep` goes into `batch`.
@@ -481,13 +462,14 @@ fn run(regions: &File, file: &File, len: usize, bits: u32, chunk: usize) -> Opti
         while p < len {
             // A line is "region_id,CCC" and an LF.
             // SAFETY: the buffer extends `PAD` bytes past the data.
-            let (id, i) = unsafe { number(&text, p) };
+            let i = p + text[p..].iter().position(|&c| c == b',')?;
+            let id = text[p..i].iter().fold(0, |v, &c| v * 10 + (c - b'0') as usize);
             let country = &text[i + 1..i + 4];
-            if text[i] != b',' || text[i + 4] != b'\n' || id as usize > max_id || !country.iter().all(|c| c.is_ascii_uppercase()) {
+            if text[i] != b',' || text[i + 4] != b'\n' || id > max_id || !country.iter().all(|c| c.is_ascii_uppercase()) {
                 return None;
             }
             let code = country.iter().fold(0, |v, &c| v * 26 + (c - b'A') as usize) + 1;
-            region[id as usize].store(code as u16, Relaxed);
+            region[id].store(code as u16, Relaxed);
             seen[code].store(true, Relaxed);
             p = i + 5;
         }
@@ -511,6 +493,12 @@ fn run(regions: &File, file: &File, len: usize, bits: u32, chunk: usize) -> Opti
     file.read_exact_at(&mut head[..len.min(256)], 0).ok()?;
     let body = head.iter().position(|&c| c == b'\n')? + 1; // the header has no quotes
     let chunks = len.div_ceil(chunk);
+    // Where chunk j starts: the first record at or after its cut.
+    let start = |j: usize| match j {
+        0 => body,
+        _ if j == chunks => len,
+        _ => record_start(&ctx, j * chunk),
+    };
     let next = AtomicUsize::new(0);
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
     let results = parallel(threads, |_| {
@@ -520,8 +508,7 @@ fn run(regions: &File, file: &File, len: usize, bits: u32, chunk: usize) -> Opti
             if j >= chunks {
                 return ok.then_some(aggs);
             }
-            let lo = if j == 0 { body } else { record_start(&ctx, j * chunk) };
-            let hi = if j + 1 == chunks { len } else { record_start(&ctx, (j + 1) * chunk) };
+            let (lo, hi) = (start(j), start(j + 1));
             ok &= lo >= hi || parse_chunk(&ctx, lo, hi, &mut aggs, &mut worker);
         }
     });
@@ -530,23 +517,14 @@ fn run(regions: &File, file: &File, len: usize, bits: u32, chunk: usize) -> Opti
     }
     let mut total = vec![NONE; countries];
     for part in results.iter().flatten() {
-        for (t, a) in total.iter_mut().zip(part) {
-            *t = Agg {
-                count: t.count + a.count,
-                id_sum: t.id_sum + a.id_sum,
-                sum: t.sum + a.sum,
-                min: t.min.min(a.min),
-                max: t.max.max(a.max),
-                name_bytes: t.name_bytes + a.name_bytes,
-                note_bytes: t.note_bytes + a.note_bytes,
-            };
-        }
+        total.iter_mut().zip(part).for_each(|(t, a)| t.merge(a));
     }
 
     // Distinct names per country: the set bits of the masks, counted by ranges of entries in parallel.
-    let parts = parallel(names.next.load(Relaxed).min(names.entries.len()).div_ceil(4096), |j| {
+    let used = names.next.load(Relaxed).min(names.entries.len());
+    let parts = parallel(used.div_ceil(4096), |j| {
         let mut counts = vec![0u64; countries];
-        for e in &names.entries[j * 4096..((j + 1) * 4096).min(names.next.load(Relaxed).min(names.entries.len()))] {
+        for e in &names.entries[j * 4096..((j + 1) * 4096).min(used)] {
             for (w, mask) in e.mask.iter().enumerate() {
                 let mut bits = mask.load(Relaxed);
                 while bits != 0 {
@@ -562,7 +540,8 @@ fn run(regions: &File, file: &File, len: usize, bits: u32, chunk: usize) -> Opti
         let distinct: u64 = parts.iter().map(|p| p[c]).sum();
         out.extend_from_slice(key);
         let (sum, min, max) = (money(a.sum), money(a.min), money(a.max));
-        writeln!(out, " {} {} {sum} {min} {max} {distinct} {} {}", a.count, a.id_sum, a.name_bytes, a.note_bytes).unwrap();
+        let line = format!(" {} {} {sum} {min} {max} {distinct} {} {}\n", a.count, a.id_sum, a.name_bytes, a.note_bytes);
+        out.extend_from_slice(line.as_bytes());
     }
     Some(out)
 }
