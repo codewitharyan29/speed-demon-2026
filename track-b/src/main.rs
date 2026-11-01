@@ -863,6 +863,23 @@ fn main() {
         }
         // Every BOOL query, on this chunk's documents.
         for (q, query) in queries.iter().enumerate().filter(|(_, q)| !q.phrase) {
+            // Fetch ahead: the posting starts of the list terms of the query 16 places on, and the postings of the one
+            // 8 places on (whose starts are in cache by then), so the random reads of many queries overlap.
+            for (ahead, starts) in [(16, true), (8, false)] {
+                let Some(next) = queries.get(q + ahead).filter(|next| !next.phrase) else {
+                    continue;
+                };
+                for &t in next.terms.iter().filter(|&&t| t >> 31 == 0) {
+                    let at = match starts {
+                        true => start.as_ptr().wrapping_add(t as usize) as *const i8,
+                        false => {
+                            post.as_ptr().wrapping_add(start[t as usize] as usize) as *const i8
+                        }
+                    };
+                    // SAFETY: a prefetch is only a hint and never faults.
+                    unsafe { _mm_prefetch(at, _MM_HINT_T0) };
+                }
+            }
             let start = operand(query.terms[0]);
             if matches!(start, Operand::List(l) if l.is_empty()) && !query.ops.contains(&b'O') {
                 continue;

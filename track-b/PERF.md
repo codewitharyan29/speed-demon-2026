@@ -32,6 +32,7 @@ They are only used to compare variants, never reported as results.
 | 21 | Leaner scan callback: each bucket index computed once, batch arrays made once per chunk, unchecked indexing where bounds are provable | 23093fe | 0.192 | 41 | 71.850 (K 27.36, 742 lines) |
 | 22 | Spare bitset row (every token sets a bit; one condition left in the bookkeeping) and a tokeniser with one step per token | b8b05c6 | 0.182 | 41 | 72.380 (K 28.03, 749 lines) |
 | 23 | A list term's pair written without a branch (every token stamps and writes; the count moves by 0 or 1) | 84edbf2 | 0.182 | 62 | 70.904 (K 26.19, 750 lines); reverted |
+| 25 | Bitset rows stored in BOOL queries (one random read less per operand in the evaluation) | 7341f08, 90ca9fe | 0.185, 0.180 | 40 | 72.499 (K 28.18, 758 lines) |
 
 ## Local measurements behind step 2 (in-process ms, median)
 
@@ -503,3 +504,10 @@ set) removes the `dense_of` read from every such operand. Locally within noise (
 judged on the board over two runs against the step-22 code's 0.182 s (and 0.208 s on its second run).
 
 Run 1 (7341f08, run-18820662088c): 0.1851 s, 40 MB, K 27.76.
+Run 2 (90ca9fe, run-f1da6792f609): 0.1797 s, 40 MB, K 28.18. Against the step-22 code's 0.182 and 0.208 s: kept.
+
+## Step 26: board experiment, evaluation operands prefetched ahead (on step 25)
+
+For the BOOL query 16 places on, the posting starts of its list terms are prefetched, and for the one 8 places on (whose
+starts are in cache by then) its postings, so the evaluation's dependent random reads overlap. Locally slower within
+noise (12 threads 147 -> 161, +14 lines); judged on the board over two runs against step 25's 0.185 and 0.180 s.
