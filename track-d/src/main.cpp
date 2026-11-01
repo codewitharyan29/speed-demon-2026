@@ -205,53 +205,54 @@ int main() {
     auto nl = (const char *)memchr(body + q, '\n', blen - q);
     cut[c] = nl ? nl + 1 - body : blen;
   }
-  // s0: edge counts, then offsets in the file's ids; e0: packed edges
-  // (target << 11 | weight); nid: new id of each node.
-  auto s0 = anon(2 * n + m + 2), e0 = s0 + n + 2, nid = e0 + m;
+  // e4: the first four edges of every node (target << 11 | weight), cnt: how
+  // many edges every node has, nid: the new id of every node. Edges beyond the
+  // fourth (about 1%) go to a spill list.
+  struct Sp {
+    u32 u, e;
+    u64 w;
+  };
+  size_t cells = 5 * (size_t)n + n / 2 + 64;
+  auto e4 = anon(cells), nid = e4 + 4 * (size_t)n + 16;
+  auto cnt = (u16 *)(nid + n + 16);
+  auto sp = anon<Sp>(m + 16);
   auto vis = anon<u64>(2 * (n / 64 + 1)), has_in = vis + n / 64 + 1;
   first = anon(n + 2), adj = anon(m);
-  std::atomic<size_t> job[2] = {0, 0}, seed = 0, rank = 0;
+  std::atomic<size_t> job = 0, seed = 0, rank = 0, spn = 0;
   std::barrier sync(T);
   Ov ovs, ov0[T], ov1[T];
   par([&](u32 tid) {
-    auto lines = [&](int pass, auto f) {
-      for (size_t c; (c = job[pass].fetch_add(1, rx)) < CHUNKS;)
-        for (auto q = body + cut[c], e = body + cut[c + 1]; q < e;)
-          f(q, e);
-    };
-    lines(0, [&](auto &q, auto e) {
-      u32 U[16], k = 0;
-      for (; k < 16 && q < e; k++)
-        U[k] = num(q), q = next_line(q, e),
-        __builtin_prefetch(s0 + U[k] + 2, 1);
-      while (k--)
-        std::atomic_ref<u32>(s0[U[k] + 2]).fetch_add(1, rx);
-    });
-    sync.arrive_and_wait(); // LAP:pass1
-    tid || (std::partial_sum(s0 + 1, s0 + n + 2, s0 + 1), 1);
-    sync.arrive_and_wait(); // LAP:prefix1
-    lines(1, [&](auto &q, auto e) {
-      u32 U[16], V[16], W[16], k = 0;
-      for (; k < 16 && q < e; k++)
-        U[k] = num(q), V[k] = num(q), W[k] = num(q),
-        __builtin_prefetch(s0 + U[k] + 1, 1);
-      for (u32 j = 0; j < k; j++) {
-        u32 u = U[j], v = V[j], w = W[j];
-        u32 slot = std::atomic_ref<u32>(s0[u + 1]).fetch_add(1, rx);
-        e0[slot] = v << 11 | std::min(w, 2047u);
-        w >= 2047 && (ov0[tid].push_back({slot, w}), 1);
-        if (!(has_in[v / 64] >> v % 64 & 1))
-          std::atomic_ref<u64>(has_in[v / 64]).fetch_or(1ULL << v % 64, rx);
+    for (size_t c; (c = job.fetch_add(1, rx)) < CHUNKS;)
+      for (auto q = body + cut[c], e = body + cut[c + 1]; q < e;) {
+        u32 U[16], V[16], W[16], k = 0;
+        for (; k < 16 && q < e; k++)
+          U[k] = num(q), V[k] = num(q), W[k] = num(q),
+          __builtin_prefetch(cnt + U[k], 1),
+          __builtin_prefetch(e4 + 4 * (size_t)U[k], 1);
+        for (u32 j = 0; j < k; j++) {
+          u32 u = U[j], v = V[j], w = W[j], e = v << 11 | std::min(w, 2047u);
+          u32 slot = std::atomic_ref<u16>(cnt[u]).fetch_add(1, rx);
+          if (slot < 4)
+            e4[4 * (size_t)u + slot] = e,
+                               w >= 2047 &&
+                                   (ov0[tid].push_back({4 * u + slot, w}), 1);
+          else
+            sp[spn.fetch_add(1, rx)] = {u, e, w};
+          if (!(has_in[v / 64] >> v % 64 & 1))
+            std::atomic_ref<u64>(has_in[v / 64]).fetch_or(1ULL << v % 64, rx);
+        }
       }
-    });
-    sync.arrive_and_wait(); // LAP:pass2
+    sync.arrive_and_wait(); // LAP:parse
     if (!tid) {
       for (auto &v : ov0)
         ovs.insert(ovs.end(), v.begin(), v.end());
       std::sort(ovs.begin(), ovs.end());
+      std::sort(sp, sp + spn,
+                [](const Sp &a, const Sp &b) { return a.u < b.u; });
     }
     // Renumber by breadth-first regions of up to 8192 nodes, so a search
-    // touches nearby memory.
+    // touches nearby memory. (The spill edges are left out: only the order of
+    // the regions depends on them.)
     auto claim = [&](u32 v) {
       std::atomic_ref<u64> cell(vis[v / 64]);
       u64 bit = 1ULL << v % 64;
@@ -264,27 +265,40 @@ int main() {
           continue;
         u32 h = 0, t = 1;
         for (qb[0] = r; h < t && t < 8192; h++) {
-          h + 4 < t && (__builtin_prefetch(e0 + s0[qb[h + 4]]), 1);
-          for (u32 i = s0[qb[h]]; i < s0[qb[h] + 1] && t < 8192; i++)
-            if (u32 v = e0[i] >> 11; claim(v))
-              qb[t++] = v, __builtin_prefetch(s0 + v);
+          h + 4 < t && (__builtin_prefetch(e4 + 4 * (size_t)qb[h + 4]), 1);
+          for (u32 c = 0, x = qb[h]; c < std::min<u32>(cnt[x], 4) && t < 8192;
+               c++)
+            if (u32 v = e4[4 * (size_t)x + c] >> 11; claim(v))
+              qb[t++] = v, __builtin_prefetch(e4 + 4 * (size_t)v),
+              __builtin_prefetch(cnt + v);
         }
         size_t base = rank.fetch_add(t, rx);
         for (u32 k = 0; k < t; k++)
-          nid[qb[k]] = base + k,
-          first[base + k + 1] = s0[qb[k] + 1] - s0[qb[k]];
+          nid[qb[k]] = base + k, first[base + k + 1] = cnt[qb[k]];
       }
     sync.arrive_and_wait(); // LAP:bfs
     tid || (std::partial_sum(first, first + n + 1, first), 1);
     sync.arrive_and_wait(); // LAP:prefix2
+    size_t nsp = spn;
     for (size_t u = (size_t)n * tid / T; u < (size_t)n * (tid + 1) / T; u++) {
-      u32 dst = first[nid[u]];
-      for (u32 i = s0[u]; i < s0[u + 1]; i++, dst++) {
-        _mm_prefetch((const char *)(nid + (e0[i + 8] >> 11)), _MM_HINT_T0);
-        u32 e = e0[i];
+      u32 dst = first[nid[u]], cu = cnt[u];
+      for (u32 c = 0; c < 4; c++)
+        _mm_prefetch((const char *)(nid + (e4[4 * (u + 3) + c] >> 11)),
+                     _MM_HINT_T0);
+      for (u32 c = 0; c < std::min(cu, 4u); c++, dst++) {
+        u32 e = e4[4 * u + c];
         adj[dst] = nid[e >> 11] << 11 | (e & 2047);
-        (e & 2047) == 2047 && (ov1[tid].push_back({dst, heavy(ovs, i)}), 1);
+        (e & 2047) == 2047 &&
+            (ov1[tid].push_back({dst, heavy(ovs, (u32)(4 * u + c))}), 1);
       }
+      if (cu > 4)
+        for (auto *a = std::lower_bound(
+                 sp, sp + nsp, u,
+                 [](const Sp &x, size_t v) { return x.u < v; });
+             a < sp + nsp && a->u == u; a++, dst++) {
+          adj[dst] = nid[a->e >> 11] << 11 | (a->e & 2047);
+          (a->e & 2047) == 2047 && (ov1[tid].push_back({dst, a->w}), 1);
+        }
     }
   }); // LAP:build
   for (auto &v : ov1)
@@ -302,7 +316,7 @@ int main() {
     if (s != t && (has_in[t / 64] >> t % 64 & 1) && first[a + 1] > first[a])
       work.push_back({a, b, (u32)ans.size() - 1});
   }
-  munmap(s0, (2 * n + m + 2) * 4ull + 4096);
+  munmap(e4, cells * 4 + 4096);
   // The reverse graph, in the final ids: count in-degrees, prefix, fill.
   rfirst = anon(n + 2), radj = anon(m);
   std::barrier rsync(T);

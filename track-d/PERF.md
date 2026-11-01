@@ -456,3 +456,17 @@ Both earlier failures had a reverse graph of 8-byte edges next to a 40 MB forwar
 
 Exact on 6 tiny, 3 sample and 2 full datasets; ASAN+UBSAN clean on four of them. One bug on the way: the answer expression mixed
 `u32` and `int` in a conditional, so unreachable queries printed 4294967295.
+
+Board run 381c3a7 (step 28): T 0.1783 s, M 82.0 MB, S 329, K 23.99, 69.0 pts (step 27: 0.2418 s, 66.0 pts). The local gain
+(-27%) carried over to the board in full.
+
+## Step 29: one parse pass into fixed four-slot rows
+
+Pass 1 only counted out-degrees so that pass 2 could place each edge; the BFS and the scatter then read two random cache
+lines per node (offset array, then the edge list). Out-degree is 2.9 on average and 97% of nodes have at most four edges.
+
+| Change | Local result (ms, median of 21, interleaved) | Verdict |
+|---|---|---|
+| Each node gets four edge slots (`e4[4u + c]`) and a `u16` counter; the first four edges are written in the single parse pass; edges beyond the fourth (about 1.2%, 58k) go to a spill list sorted by node during the BFS; the BFS ignores the spill (it only fixes the order of regions, and every node still becomes a root); the scatter reads one 16-byte row per node and looks the spill up only for nodes with more than four edges | parse 29.3 replaces pass 1 + prefix + pass 2 (11.7 + 0.8 + 27.6 = 40.1); BFS and scatter +1.5 ms each; total 138.2 -> 127.0, peak 65 -> 68 MB | kept |
+
+Exact on 6 tiny, 3 sample, 2 full datasets; ASAN+UBSAN clean on four.
