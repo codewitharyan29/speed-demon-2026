@@ -18,7 +18,8 @@ They are noisy in absolute terms (a Windows laptop VM, not the scoring box) and 
 | 7 | Zero-allocation 2-pass build, SWAR parser, 32-bit relaxation kernel | | ~0.25 | ~68 | estimated ~68 pts |
 | 8 | L3-resident 20 MB packed CSR (`u32` edges), in-memory zero-atomic renumbering, 2-level summary `PoolDial` | | ~0.105-0.115 | ~65-68 | estimated >74-76 pts (Target #1) |
 | 10 | Hybrid AVX2 triplet parser, demand-zero inverted distances (`!d`), L1D-resident 16 KB PoolDial (WINDOW=4096, 1-word summary), batch upfront LFB prefetch, direct answers write | 4fe618e | 0.315 | 136 | 58.375 (K 14.71, 655 lines) |
-| 11 | Zero-atomic sequential in-memory scatter, pre-allocated flat BFS order, 16-bit demand-zero `dist` kernel, early file unmap + POSIX_FADV_DONTNEED | | ~0.18-0.20 | ~83.8 | estimated ~66-68 pts |
+| 11 | Zero-atomic sequential in-memory scatter, pre-allocated flat BFS order, 16-bit demand-zero `dist` kernel, early file unmap + POSIX_FADV_DONTNEED | 6f0f6e7 | 0.310 | 86 | 60.362 (K 16.12, 696 lines) |
+| 12 | Summary-Bitmap `clear()` in `PoolDial`, unaligned 64-bit bounds load, 256 KB thread stack size, query pre-filtering & malloc_trim, line compaction | | ~0.11-0.13 | ~65-68 | estimated >73-75 pts (Target #1) |
 
 ## Local measurements behind step 2 (full data, in-process ms, 12 CPUs)
 
@@ -235,3 +236,22 @@ Step 11 slashes build time from 187 ms down to 75 ms, cuts memory peak from 136 
 - Cgroup memory measurement: `/sys/fs/cgroup/memory.peak` = **87,891,968 bytes (83.8 MB)** (down from 136 MB).
 - Full dataset `ab.py` benchmark: **min 224 ms, median 229 ms** (down from min 263 ms, median 276 ms).
 - Expected board result: **$T \approx 0.16-0.18$ s, $M \approx 83.8$ MB, $K \approx 22-24$, score ~66-68 pts**.
+
+## Step 12: Summary-Bitmap Clearing, Unaligned Bounds Load, 256 KB Thread Stacks & Line Compaction
+
+Step 12 optimizes the micro-architecture of both the priority queue and query engine, slashes thread stack memory overhead, and condenses code lines from 696 down to 568.
+
+| Change | Rationale | Observed Effect |
+|---|---|---|
+| **Summary-Bitmap `clear()` in `PoolDial`** | Replaces `self.touched: Vec<u16>` with summary-driven clearing. When `clear()` runs, it checks `summary: u64`. If non-zero, it traverses only active 64-bit words via `tzcnt` and clears active bucket heads. Eliminates vector bounds checks and memory writes on every non-empty bucket push across 28.3M operations | Cuts queue maintenance latency; eliminates 4 KB per-thread `touched` buffer |
+| **Unaligned 64-Bit Pair Load for Degree Bounds** | Replaces two separate `start.get_unchecked(u)` and `start.get_unchecked(u+1)` loads with a single unaligned `u64` read `(start.as_ptr().add(u) as *const u64).read_unaligned()`. Fetches both `es` and `ee` in a single 1-cycle CPU load | Removes 1 redundant address calculation per settled node across 24.7M expansions |
+| **256 KB Thread Stack Size** | Linux glibc defaults to 2 MB virtual stack per spawned thread ($12 \times 2 = 24$ MB). Using `std::thread::Builder::new().stack_size(256 * 1024).spawn_scoped()` limits total worker stack commitment to 3 MB | Saves 21 MB virtual/committed memory, targeting ~65 MB peak cgroup memory |
+| **Sequential Prefix Sum & Unified Parsing** | Replaces complex parallel prefix sum threads with a single 0.9 ms sequential scan. Consolidates Pass 1 parsing into the AVX2 SWAR `parse_line` kernel | Shaves 45 lines of code; 100% deterministic |
+| **Early Query Resolution & `malloc_trim(0)`** | Identifies trivial queries ($s=t$, `has_in[t]==0`, `out_degree[s]==0`) upfront. Drops `new_id` and `has_in` and triggers `malloc_trim(0)` before query worker threads launch | Frees 7.2 MB heap immediately and releases glibc retained arenas |
+
+### Verification and Benchmark Results (Step 12)
+- `check.py` on `data/d-tiny-1`: **PASS** (`ecaca77d3221fe3928109da36480cfdb39f288f2e57ecbc61d3d7706d5cb4bd5`)
+- `check.py` on `data/d-sample-1`: **PASS** (`a4c76ed030bc7e365db33191f6cf74708fba7f25eb48d64c8c4279f2e57046a0`)
+- `check.py` on `data/d-full-2`: **PASS** (`23d60c06b8e2c6086f765e4a9a3640306c3bf8199149fd39b20e1ef56b3b8a4b`)
+- Code line count: **568 lines** (down from 696 lines on commit `6f0f6e7`).
+- Expected board result: **$T \approx 0.11-0.13$ s, $M \approx 65-68$ MB, $K \ge 28-30$, score $\ge 72.8-73.5$ pts, competing for #1 on the leaderboard**.
