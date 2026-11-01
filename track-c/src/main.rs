@@ -45,12 +45,21 @@ fn parallel<R: Send>(jobs: usize, f: impl Fn(usize) -> R + Sync) -> Vec<R> {
 /// One distinct name, in a single cache line: comparing it and recording its country touch one line.
 #[repr(align(64))]
 struct Entry {
-    /// The name's length + 1, stored last (0: the entry is free or still being written).
-    len: AtomicU64,
+    /// The key: byte 0 is the name's length + 1 (0: free or still being written; 255: longer than 31 bytes), then its
+    /// first 31 bytes, zero padded. A longer name keeps the offset of its bytes in `Names::spill` in word 1 and its length
+    /// in word 2. Word 0 is stored last.
+    key: [AtomicU64; 4],
     /// Bit c is set once the name has been seen in country c.
     mask: [AtomicU64; COUNTRIES / 64],
-    /// The name's first 24 bytes (zero padded); for a longer name, the offset of its bytes in `Names::spill`.
-    name: [AtomicU64; 3],
+}
+
+/// The key block a name `s[..len]` (with 32 readable bytes after it and 1 before it) has if it is at most 31 bytes long.
+#[inline(always)]
+unsafe fn block(s: *const u8, len: usize) -> __m256i {
+    let iota = _mm256_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31);
+    let live = _mm256_cmpgt_epi8(_mm256_set1_epi8(len.min(31) as i8 + 1), iota);
+    let v = _mm256_and_si256(_mm256_loadu_si256(s.sub(1) as _), live);
+    _mm256_insert_epi8::<0>(v, len.min(31) as i8 + 1)
 }
 
 /// Every distinct name seen, shared by all workers: an open-addressing table of entries, placed by the low bits of the hash.
@@ -116,15 +125,16 @@ impl Names {
     }
 
     /// Whether entry `i` is the name `s[..len]`.
+    #[inline(always)]
     unsafe fn same(&self, i: usize, s: *const u8, len: usize) -> bool {
         let e = &self.entries[i];
-        let l = e.len.load(Acquire); // the name's bytes were written before its length
-        if len > 24 {
-            let at = e.name[0].load(Relaxed) as usize;
-            return l == len as u64 + 1 && self.spill[at..at + len] == *std::slice::from_raw_parts(s, len);
+        let first = e.key[0].load(Acquire); // the rest of the key was written before its first word
+        if len > 31 {
+            let at = e.key[1].load(Relaxed) as usize;
+            return first as u8 == 255 && e.key[2].load(Relaxed) == len as u64 && self.spill[at..at + len] == *std::slice::from_raw_parts(s, len);
         }
-        // No branch on the length: the lengths of names are not predictable.
-        (0..3).fold(l ^ (len as u64 + 1), |d, k| d | e.name[k].load(Relaxed) ^ word(s, len, k)) == 0
+        let v = block(s, len);
+        first == _mm256_extract_epi64::<0>(v) as u64 && _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_load_si256(e.key.as_ptr() as _), v)) == -1
     }
 
     /// The entry of the name `s[..len]` (`s` must have 32 readable bytes after the name) with hash `h`; adds it if new. `hint` is
@@ -153,7 +163,7 @@ impl Names {
                 continue; // the position was taken meanwhile: look at what is in it now
             }
             if v == t {
-                while self.entries[i].len.load(Acquire) == 0 {
+                while self.entries[i].key[0].load(Acquire) == 0 {
                     std::hint::spin_loop(); // another worker is writing this name
                 }
                 if self.same(i, s, len) {
@@ -167,33 +177,28 @@ impl Names {
     /// Writes the name into the free entry `i`, which this worker has claimed.
     unsafe fn add(&self, i: usize, s: *const u8, len: usize) {
         let e = &self.entries[i];
-        if len <= 24 {
-            for k in 0..3 {
-                e.name[k].store(word(s, len, k), Relaxed);
-            }
+        let first = if len <= 31 {
+            let mut k = [0u64; 4];
+            _mm256_storeu_si256(k.as_mut_ptr() as _, block(s, len));
+            (1..4).for_each(|j| e.key[j].store(k[j], Relaxed));
+            k[0]
         } else {
             let at = self.counts.spilled.fetch_add(len, Relaxed);
             std::ptr::copy_nonoverlapping(s, self.spill.as_ptr().add(at) as *mut u8, len);
-            e.name[0].store(at as u64, Relaxed);
-        }
-        e.len.store(len as u64 + 1, Release); // publishes the name to the other workers
+            (e.key[1].store(at as u64, Relaxed), e.key[2].store(len as u64, Relaxed));
+            255
+        };
+        e.key[0].store(first, Release); // publishes the name to the other workers
     }
 }
 
-/// Bytes 8k.. of the name `s[..len]` as a word, zero padded past the end of the name (8 bytes after 8k must be readable).
+/// 64-bit hash of a name from its length and first 31 bytes (its key block). It only places names in the table: every hit
+/// is compared byte for byte.
 #[inline(always)]
-unsafe fn word(s: *const u8, len: usize, k: usize) -> u64 {
-    (s.add(8 * k) as *const u64).read_unaligned() & ((1u128 << (8 * len.saturating_sub(8 * k).min(8))) - 1) as u64
-}
-
-/// 64-bit hash of a name from its length and its first and last 16 bytes, which must be readable. It only places names in
-/// the table: every hit is compared byte for byte.
 unsafe fn hash(s: *const u8, len: usize) -> u64 {
-    let read = |p: *const u8| (p as *const u128).read_unaligned();
-    let head = if len == 0 { 0 } else { read(s) & (!0u128 >> (128 - 8 * len.min(16))) };
-    let tail = if len > 16 { read(s.add(len - 16)) } else { 0 };
-    let x = head ^ tail.rotate_left(61) ^ (len as u128) << 120;
-    let r = (x as u64 ^ 0x9E37_79B9_7F4A_7C15) as u128 * ((x >> 64) as u64 ^ 0xA076_1D64_78BD_642F) as u128;
+    let v = block(s, len);
+    let x = _mm_xor_si128(_mm256_castsi256_si128(v), _mm256_extracti128_si256::<1>(v));
+    let r = (_mm_cvtsi128_si64(x) as u64 ^ 0x9E37_79B9_7F4A_7C15) as u128 * (_mm_extract_epi64::<1>(x) as u64 ^ 0xA076_1D64_78BD_642F ^ len as u64) as u128;
     r as u64 ^ (r >> 64) as u64
 }
 
