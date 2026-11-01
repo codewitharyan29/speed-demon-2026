@@ -8,7 +8,7 @@ using u16 = uint16_t;
 using u32 = uint32_t;
 using u64 = uint64_t;
 using Ov = std::vector<std::pair<u32, u64>>; // (edge index, weight) if >= 2047
-constexpr u32 NIL = ~0u, RING = 4096, CAP = 65536, POOL = 65536, T = 12;
+constexpr u32 NIL = ~0u, RING = 4096, POOL = 65536, T = 12;
 constexpr u32 CHUNKS = 48;
 constexpr auto rx = std::memory_order_relaxed;
 static u32 n, m, *first, *adj; // CSR (renumbered): offsets and packed edges
@@ -59,32 +59,31 @@ static u64 heavy(const Ov &o, u32 edge) {
 // 4095), a linked list per bucket in a pooled array, and a two-level bitmap to
 // jump to the next non-empty bucket.
 struct Dial {
-  u32 head[RING], fr = NIL, used = 0, at = 0, len = 0;
+  u32 head[RING], fr = NIL, used = 0, at = 0;
   u64 bits[RING / 64] = {}, top = 0, *pool;
   Dial(u64 *p) : pool(p) { memset(head, 0xFF, sizeof head); }
-  void push(u32 key, u32 node) {
-    u32 b = key % RING, h = head[b], i = fr != NIL ? fr : used++;
+  void push(u32 b, u32 node) {
+    u32 h = head[b], i = fr != NIL ? fr : used++;
     if (h == NIL)
       bits[b / 64] |= 1ULL << b % 64, top |= 1ULL << b / 64;
     fr = fr != NIL ? pool[i] >> 32 : fr;
-    pool[i] = node | (u64)h << 32, head[b] = i, len++;
+    pool[i] = node | (u64)h << 32, head[b] = i;
   }
-  bool pop(u32 &key, u32 &node) {
-    for (; len;) {
-      u32 b = at % RING, h = head[b], w = b / 64;
+  bool pop(u32 &b, u32 &node) {
+    for (; top;) {
+      u32 h = head[at], w = at / 64;
       if (h != NIL) {
         u64 e = pool[h];
-        node = e, key = at, head[b] = e >> 32, pool[h] = (u64)fr << 32;
-        fr = h, len--;
-        if (head[b] == NIL && !(bits[w] &= ~(1ULL << b % 64)))
+        node = e, b = at, head[at] = e >> 32, pool[h] = (u64)fr << 32, fr = h;
+        if (head[at] == NIL && !(bits[w] &= ~(1ULL << at % 64)))
           top &= ~(1ULL << w);
         return 1;
       }
-      if (u64 rest = bits[w] >> b % 64)
+      if (u64 rest = bits[w] >> at % 64)
         at += std::countr_zero(rest);
       else {
-        u32 nw = (w + 1 + std::countr_zero(std::rotr(top, (w + 1) & 63))) & 63;
-        at += ((nw << 6 | std::countr_zero(bits[nw])) - b) % RING;
+        u32 nw = std::countr_zero(top & -2ULL << w);
+        at = nw * 64 + std::countr_zero(bits[nw]);
       }
     }
     return 0;
@@ -93,7 +92,7 @@ struct Dial {
     for (; top; top &= top - 1)
       for (u32 w = std::countr_zero(top); bits[w]; bits[w] &= bits[w] - 1)
         head[w << 6 | std::countr_zero(bits[w])] = NIL;
-    fr = NIL, used = at = len = 0;
+    fr = NIL, used = at = 0;
   }
 };
 
@@ -121,46 +120,56 @@ static long slow(u32 s, u32 t) {
   return munmap(inv, n * 8ull + 4096), ans;
 }
 
-// 16-bit distances, stored inverted so that untouched (zero) memory means
-// "unseen".
-static long fast(u32 s, u32 t, u16 *dist, u32 *touched, Dial &q) {
-  u32 d, u, count = 1;
-  long ans = -1;
-  bool big = 0, bad = 0;
-  dist[s] = 0xFFFF, touched[0] = s, q.push(0, s);
-  while (q.pop(d, u)) {
-    if ((u16)~d < dist[u])
+// 16-bit distances, stored inverted (0 = unseen), in 512-entry pages that are
+// allocated on the first write; page 0 stays zero and backs every unseen page.
+struct Dist {
+  u32 *pt, *own, np = 1;
+  u16 *pool;
+  u16 get(u32 v) { return pool[pt[v >> 9] << 9 | v & 511]; }
+  void set(u32 v, u16 x) {
+    u32 &p = pt[v >> 9];
+    if (!p)
+      own[np] = v >> 9, p = np++;
+    pool[p << 9 | v & 511] = x;
+  }
+  void clear() {
+    for (u32 i = 1; i < np; i++)
+      memset(pool + (i << 9), 0, 1024), pt[own[i]] = 0;
+    np = 1;
+  }
+};
+
+static long fast(u32 s, u32 t, Dist &D, Dial &q) {
+  u32 b, u;
+  bool big = 0;
+  D.set(s, 0xFFFF), q.push(0, s);
+  while (q.pop(b, u)) {
+    u16 dt = D.get(t);
+    if (dt && ((u16)~dt >> 4) < b)
+      break; // every bucket up to t's has been emptied: its distance is final
+    u32 d = (u16)~D.get(u);
+    if (d >> 4 != b)
       continue;
-    if (u == t) {
-      ans = d;
-      break;
-    }
     u64 r;
     memcpy(&r, first + u, 8);
     for (u32 i = (u32)r; i < r >> 32; i++) {
       u32 e = adj[i], v = e >> 11, w = e & 2047;
       u64 nd = d + (w == 2047 ? heavy(ov, i) : w);
-      if (__builtin_expect(nd >= 60000 || nd - d > 4095, 0)) {
-        (nd >= 60000 ? big : bad) = 1; // too long for 16 bits, or the ring
+      if (__builtin_expect(nd >= 60000, 0)) {
+        big = 1; // too long for 16 bits
         continue;
       }
-      u16 inv = ~(u16)nd, cur = dist[v];
-      if (inv > cur) {
-        dist[v] = inv;
-        if (!cur)
-          touched[count++ % CAP] = v;
-        q.push(nd, v);
+      u16 inv = ~(u16)nd;
+      if (inv > D.get(v)) {
+        D.set(v, inv);
+        q.push(nd >> 4, v);
         _mm_prefetch((const char *)(first + v), _MM_HINT_T0);
       }
     }
   }
-  q.clear();
-  if (count > CAP)
-    memset(dist, 0, n * 2ull);
-  else
-    for (u32 i = 0; i < count; i++)
-      dist[touched[i]] = 0;
-  return bad || (ans < 0 && big) ? slow(s, t) : ans;
+  long ans = D.get(t) ? (u16)~D.get(t) : -1;
+  q.clear(), D.clear();
+  return ans < 0 && big ? slow(s, t) : ans;
 }
 
 int main() {
@@ -279,14 +288,15 @@ int main() {
   for (u32 k = 0; k < T; k++)
     cur[k * 8] = k * work.size() / T;
   par([&](u32 tid) {
-    auto touched = anon(CAP + 2 * POOL + n / 2 + 1); // touched | pool | dist
-    auto pool = (u64 *)(touched + CAP);
+    u32 P = (n >> 9) + 2;                              // pages of 512 nodes
+    auto pool = anon<u64>(POOL + 129 * (size_t)P + 2); // queue | tables | pages
+    auto pt = (u32 *)(pool + POOL);
+    Dist D{pt, pt + P, 1, (u16 *)(pool + POOL + P)};
     Dial q(pool);
     for (u32 k = 0; k < T; k++)
       for (size_t j, who = (tid + k) % T, end = (who + 1) * work.size() / T;
            (j = cur[who * 8].fetch_add(1, rx)) < end;)
-        ans[work[j][2]] =
-            fast(work[j][0], work[j][1], (u16 *)(pool + POOL), touched, q);
+        ans[work[j][2]] = fast(work[j][0], work[j][1], D, q);
   }); // LAP:queries
 
   std::string out;
