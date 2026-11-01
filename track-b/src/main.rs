@@ -195,16 +195,6 @@ fn key(b: &[u8], from: usize, len: usize) -> [u64; 4] {
 
 const M: u64 = 0x9E3779B97F4A7C15;
 
-fn hash(k: &[u64; 4]) -> u64 {
-    let mut h = k[0].wrapping_mul(M);
-    if k[1] | k[2] | k[3] != 0 {
-        for &w in &k[1..] {
-            h = (h.rotate_left(29) ^ w).wrapping_mul(M);
-        }
-    }
-    h
-}
-
 /// A token's first sixteen bytes, lower-cased, as two words, with no branch on its length: bytes past the token are
 /// masked off.
 fn short_key(b: &[u8], at: usize, len: usize) -> (u64, u64) {
@@ -227,9 +217,9 @@ struct Bucket {
     meta: [u32; 4],
 }
 
-/// The table the scan probes for every term of up to 16 bytes, which is all of them in practice (the longest token
-/// in a generated corpus has 17). A lookup compares a whole bucket at once; a full bucket spills into the next one,
-/// and only then, as `spilled` records, does a lookup go on to the next bucket.
+/// The table that numbers every query term of up to 16 bytes, which is all of them in practice (the longest token in a
+/// generated corpus has 17), and that the scan probes. A lookup compares a whole bucket at once; a full bucket spills
+/// into the next one (wrapping around), and only then, as `spilled` records, does a lookup go on to the next bucket.
 struct Probe {
     buckets: Vec<Bucket>,
     spilled: Vec<u64>,
@@ -237,25 +227,45 @@ struct Probe {
 }
 
 impl Probe {
-    fn new(keys: &[[u64; 4]], meta: impl Fn(usize) -> u32) -> Probe {
-        let bits = (keys.len() / 2).next_power_of_two().trailing_zeros().max(1);
-        let n = (1 << bits) + 64;
-        let mut p = Probe {
-            buckets: vec![Bucket::default(); n],
-            spilled: vec![0; n / 64 + 1],
+    /// An empty table with room for `max_keys` keys.
+    fn new(max_keys: usize) -> Probe {
+        let bits = (max_keys / 3 + 1)
+            .next_power_of_two()
+            .trailing_zeros()
+            .max(1);
+        Probe {
+            buckets: vec![Bucket::default(); 1 << bits],
+            spilled: vec![0; (1 << bits) / 64 + 1],
             shift: 64 - bits,
-        };
-        for (id, k) in keys.iter().enumerate().filter(|(_, k)| k[2] == 0) {
-            let mut i = p.bucket((k[0], k[1]));
-            while let None = p.buckets[i].k0.iter().position(|&x| x == 0) {
-                p.spilled[i / 64] |= 1 << (i % 64);
-                i += 1;
-            }
-            let b = &mut p.buckets[i];
-            let lane = b.k0.iter().position(|&x| x == 0).unwrap();
-            (b.k0[lane], b.k1[lane], b.meta[lane]) = (k[0], k[1], meta(id));
         }
-        p
+    }
+
+    /// The id of the key `k`; a new key is stored with id `next`, which then moves on.
+    fn intern(&mut self, k: (u64, u64), next: &mut u32) -> u32 {
+        let id = self.find(k, u32::MAX);
+        if id != u32::MAX {
+            return id;
+        }
+        let mut i = self.bucket(k);
+        while let None = self.buckets[i].k0.iter().position(|&x| x == 0) {
+            self.spilled[i / 64] |= 1 << (i % 64);
+            i = (i + 1) % self.buckets.len();
+        }
+        let b = &mut self.buckets[i];
+        let lane = b.k0.iter().position(|&x| x == 0).unwrap();
+        (b.k0[lane], b.k1[lane], b.meta[lane], *next) = (k.0, k.1, *next, *next + 1);
+        *next - 1
+    }
+
+    /// Asks for the cache line of the bucket where the key `k` is looked for first.
+    fn prefetch(&self, k: (u64, u64)) {
+        // SAFETY: a prefetch is only a hint and never faults; the address is inside the table.
+        unsafe {
+            _mm_prefetch(
+                self.buckets.as_ptr().add(self.bucket(k)) as *const i8,
+                _MM_HINT_T0,
+            )
+        };
     }
 
     fn bucket(&self, (k0, k1): (u64, u64)) -> usize {
@@ -281,57 +291,8 @@ impl Probe {
             if hit != 0 || self.spilled[i / 64] >> (i % 64) & 1 == 0 {
                 return if hit != 0 { found } else { miss };
             }
-            i += 1;
+            i = (i + 1) % self.buckets.len();
         }
-    }
-}
-
-/// An open-addressing hash table that numbers distinct keys in order of first appearance (slot = id + 1, 0 = empty).
-struct Table<K> {
-    keys: Vec<K>,
-    slots: Vec<u32>,
-    bits: u32,
-}
-
-impl<K: PartialEq + Copy> Table<K> {
-    fn new(max_keys: usize) -> Self {
-        let bits = (max_keys * 2).next_power_of_two().trailing_zeros();
-        Table {
-            keys: Vec::new(),
-            slots: vec![0; 1 << bits],
-            bits,
-        }
-    }
-
-    /// The key's id, or the empty slot where it would go. `h` is the key's hash.
-    fn find(&self, h: u64, k: &K) -> Result<u32, usize> {
-        let mask = self.slots.len() - 1;
-        let mut i = (h >> (64 - self.bits)) as usize;
-        loop {
-            match self.slots[i] {
-                0 => return Err(i),
-                s if self.keys[s as usize - 1] == *k => return Ok(s - 1),
-                _ => i = (i + 1) & mask,
-            }
-        }
-    }
-
-    /// Asks for the cache line of the slot where a key with hash `h` would be looked for.
-    fn prefetch(&self, h: u64) {
-        let slot = self
-            .slots
-            .as_ptr()
-            .wrapping_add((h >> (64 - self.bits)) as usize);
-        // SAFETY: a prefetch is only a hint and never faults; the address is inside `slots`.
-        unsafe { _mm_prefetch(slot as *const i8, _MM_HINT_T0) };
-    }
-
-    fn intern(&mut self, h: u64, k: K) -> u32 {
-        self.find(h, &k).unwrap_or_else(|slot| {
-            self.keys.push(k);
-            self.slots[slot] = self.keys.len() as u32;
-            self.keys.len() as u32 - 1
-        })
     }
 }
 
@@ -603,16 +564,24 @@ fn main() {
     );
     pieces.sort_unstable_by_key(|piece| piece.0);
 
-    // Number the terms, sixteen at a time: the table slots of a batch are fetched together, so their cache misses
-    // overlap. `used` says how a term is used: bit 0 in a BOOL query (needs a posting list), bit 2 in a phrase; bit 1,
-    // set later, if it triggers phrase checks.
+    // Number the terms, sixteen at a time: the buckets of a batch are fetched together, so their cache misses overlap.
+    // Terms of up to 16 bytes go straight into the table the scan probes, longer ones (rare) into a list. `used` says
+    // how a term is used: bit 0 in a BOOL query (needs a posting list), bit 2 in a phrase; bit 1, set later, if it
+    // triggers phrase checks.
     let all = pieces.iter().map(|piece| piece.1.len()).sum();
-    let (mut terms, mut ids) = (Table::new(all), Vec::new());
+    let (mut probe, mut long, mut ids, mut next) = (Probe::new(all), Vec::new(), Vec::new(), 0);
     for batch in pieces.iter().flat_map(|piece| piece.1.chunks(16)) {
-        batch.iter().for_each(|k| terms.prefetch(hash(k)));
-        ids.extend(batch.iter().map(|&k| terms.intern(hash(&k), k)));
+        batch.iter().for_each(|k| probe.prefetch((k[0], k[1])));
+        for k in batch {
+            ids.push(match long.iter().position(|(l, _)| l == k) {
+                _ if k[2] == 0 => probe.intern((k[0], k[1]), &mut next),
+                Some(i) => long[i].1,
+                None => (long.push((*k, next)), next += 1, next - 1).2,
+            });
+        }
     }
-    let (mut used, mut at) = (vec![0u8; terms.keys.len()], 0);
+    let nterms = next as usize;
+    let (mut used, mut at) = (vec![0u8; nterms], 0);
     let queries: Vec<Query> = (pieces.iter().flat_map(|piece| &piece.2))
         .map(|&(phrase, n, ops)| {
             let t = &ids[at..at + n];
@@ -627,7 +596,6 @@ fn main() {
         })
         .collect();
     drop((pieces, ids));
-    let nterms = terms.keys.len();
 
     // Scan the corpus in newline-aligned chunks. A chunk yields (term, doc) pairs for the query terms only,
     // each once per document, in document order, plus the byte offset of each of its documents. The first token
@@ -642,6 +610,13 @@ fn main() {
     let tail = &docs[..docs.len() - 1];
     let last_line = tail.iter().rposition(|&c| c == b'\n').map_or(0, |p| p + 1);
     let n_docs = first_doc(last_line) as usize + 1;
+    // The id of a token over 16 bytes (none in the generated data), looked up in full in `long`.
+    let long_id = |t: &Tok| {
+        let k = key(docs, t.at as usize, (t.len as usize).min(32));
+        long.iter()
+            .find(|(l, _)| *l == k && t.len <= 32)
+            .map(|e| e.1)
+    };
 
     // Terms in over 1/32 of the documents are kept as bitsets (a list that long would not be smaller), the rest as
     // lists. The first 12/1152 of the corpus is a good enough sample to choose; a wrong guess only costs speed.
@@ -653,13 +628,15 @@ fn main() {
             let range = (cut(docs, j, 96 * SAMPLE), cut(docs, j + 1, 96 * SAMPLE));
             let (mut lines, mut df) = (Vec::new(), vec![0u32; nterms]);
             scan(docs, range, first_doc(range.0), true, &mut lines, |batch| {
-                for t in batch.iter().filter(|t| t.len <= 32) {
-                    let k = key(docs, t.at as usize, t.len as usize);
-                    if let Ok(id) = terms.find(hash(&k), &k) {
-                        if used[id as usize] != 0 && stamp[id as usize] != t.doc + 1 {
-                            stamp[id as usize] = t.doc + 1;
-                            df[id as usize] += 1;
+                for t in batch {
+                    let id = match t.len {
+                        0..=16 => {
+                            probe.find(short_key(docs, t.at as usize, t.len as usize), u32::MAX)
                         }
+                        _ => long_id(t).unwrap_or(u32::MAX),
+                    } as usize;
+                    if id != u32::MAX as usize && stamp[id] != t.doc + 1 {
+                        (stamp[id], df[id]) = (t.doc + 1, df[id] + 1);
                     }
                 }
                 true
@@ -722,7 +699,11 @@ fn main() {
     assert!(ndense < NO_BITS && nkeys + 1 < 1 << 18);
     let meta = |t: usize| t as u32 | (used[t] as u32 & 3) << 18 | dense_of[t].min(NO_BITS) << 20;
     let miss = nkeys as u32 | NO_BITS << 20;
-    let probe = Probe::new(&terms.keys, meta);
+    for b in probe.buckets.iter_mut() {
+        for lane in (0..3).filter(|&lane| b.k0[lane] != 0) {
+            b.meta[lane] = meta(b.meta[lane] as usize);
+        }
+    }
 
     // Each chunk is scanned, indexed on its own, and then answers every query for its own documents. Chunks hold
     // consecutive documents, so nothing that grows with the corpus is ever kept: per query only the running count,
@@ -767,19 +748,13 @@ fn main() {
             let (mut found, mut keys) = ([miss; BATCH + 33], [(0, 0); BATCH + 33]);
             for (k, t) in keys.iter_mut().zip(batch) {
                 *k = short_key(docs, t.at as usize, t.len as usize);
-                // SAFETY: a prefetch is only a hint and never faults; the addresses are inside the table.
-                unsafe {
-                    let i = probe.bucket(*k);
-                    _mm_prefetch(probe.buckets.as_ptr().add(i) as *const i8, _MM_HINT_T0);
-                }
+                probe.prefetch(*k);
             }
             for ((m, t), &k) in found.iter_mut().zip(batch).zip(&keys) {
                 *m = probe.find(k, miss);
                 // A token over 16 bytes (none in the generated data) is looked up in full.
                 if t.len > 16 {
-                    let k = key(docs, t.at as usize, (t.len as usize).min(32));
-                    let id = terms.find(hash(&k), &k).ok().filter(|_| t.len <= 32);
-                    *m = id.map_or(miss, |id| meta(id as usize));
+                    *m = long_id(t).map_or(miss, |id| meta(id as usize));
                 }
             }
             // Then act on them.
