@@ -87,3 +87,18 @@ move T (R2: -14% instructions, no gain; Candidate A: fewer instructions, slower)
 |---|---|---|---|---:|---:|---:|---|---|
 | cx2 (= 6ec50ad) | baseline | `track-c/src/main.cpp` | 9/9, sanitizers | | 11.5 MB | 494 | **board 30.54** | baseline |
 | C-R (crm2) | a region map that stays in L2 (64-id bitmap + rank, 16 B per block, plus a dense country byte per region, 356 KB instead of 1 MB); the rank is computed and the country prefetched in `warm()`, so `resolve()` has no added dependent load | `docs/track-c-cpp-candidates/crm2_region_map.cpp` | 9/9 | +1.7% / +3.5% (CPU equal); 2 threads +1% | **-0.5 MB** (HWM 11.57 vs 12.04) | 546 | -1.5 to -2% at local T; positive only if the board's L2 misses on the 1 MB table cost about 1.5 ms or more (untested; analogy with board run 21) | not submitted |
+
+## cx3: compact rewrite, official result and promotion (Nov 1, 23:15 UTC)
+
+| | Commit (on speed-demon) | Run | T | M | S | K |
+|---|---|---|---:|---:|---:|---:|
+| **cx3** (same algorithm as 6ec50ad in 434 lines; tag reads in one asm load, so TSan-clean) | `4452f30`, main.cpp sha256 `3195cf70ac013b61` | **run-c6a876ca3df0** (scored, all gates) | 35.47 ms | 13.95 MB | 434 | **31.51** |
+| previous best (C++) | `6ec50ad` | run-50cc84be09bb | 36.34 ms | 13.92 MB | 494 | 30.54 |
+| Rust control | `9fb5c93` | three runs | 35.73-36.73 ms | 13.5-13.78 MB | 629 | 29.40-29.76 |
+
+Projected K was about 31.1 from the source-size effect at equal T and M; the official K is 31.51 (T came in 0.9 ms lower, inside
+one run's noise). Validation before the run: 9/9 fixtures normal and 9/9 with 200-byte blocks and 3,000-byte chunks;
+ASan/UBSan clean on 6 inputs; TSan clean on 6 inputs with tiny blocks (the earlier version had a benign data race in `warm()`'s
+16-byte tag read, removed by doing it as one asm load); local T at parity or better (4 threads -1.8%, 2 threads -4.5%); RSS
+equal. **Promotion:** `speed-demon` keeps cx3 as Track C (the best verified candidate). Recovery points: `4e11c91` (Rust
+control), `6ec50ad` (first C++).
