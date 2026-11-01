@@ -368,3 +368,24 @@ Step 23 eliminates thread tail latency during parsing, evicts graph.txt page cac
 - Zero compiler warnings.
 - Measured peak memory: **<62 MB** during queries, **<63 MB** during scatter.
 - Expected board result: ** \approx 0.11-0.13$ s,  \approx 61-63$ MB,  \ge 29-31$, Score $\ge 73.5-75.0$ pts (targeting #1 on the leaderboard)**.
+
+## Step 24: C++ rewrite (293 lines), crash fix, 12 workers
+
+Local numbers only (Docker on a Windows laptop, 12 CPUs pinned, seed-1 data on a native docker volume, median of 7-9
+interleaved runs, in-process ms; `memory.peak` of a fresh container). The board has not measured this step yet.
+
+| Change | Result | Verdict |
+|---|---|---|
+| The C++ port of step 23 crashed on the full data (exit 139): the per-worker `touched` list holds 65536 entries but searches touch up to ~136k nodes, and the overflow ran into the queue pool. The queue itself peaks at ~6k entries | `touched` writes wrap with a mask; a search that touches more than 65536 nodes clears `dist` with one `memset` instead of walking the list | fixed; found with an ASAN build |
+| Pass 2 parsed one line too many per chunk (the number parser stops on the newline, which is still inside the chunk), adding a phantom edge from the next chunk; it passed d-full-2 only because the phantom edge duplicated a real one | consume the line end in pass 2 | fixed; tiny seeds and sample failed before |
+| Full rewrite with `std::thread`, `std::barrier`, `atomic_ref`: no arena overlay, no thread-context structs, a lock-free slow path (one `mmap` per slow query), per-thread overflow lists merged once | 640 -> 293 lines (S factor 0.66 -> 0.75, +13% K) at the same speed (186.6 vs ~182 ms at 12 workers, inside noise) | kept |
+| Edges heavier than the ring (4096..59999) force the exact slow path; >= 60000 only if the search finds nothing | the data has no weights in 4096..59999 (3.4k in 2047..4095, 50 above 60000), so this costs nothing and removes a silent bucket-aliasing risk on other seeds | kept |
+| 8 / 10 / 12 / 16 query workers | total 209 / 194 / 187 / 194 ms, peak 71 / 78 / 87 / 89 MB | 12 kept |
+| `MADV_HUGEPAGE` on all mappings vs none | 185 ms / 89 MB vs 193 ms / 74 MB: sparse per-worker `dist` pages are rounded up to 2 MB. About +1.8% K without it, and no dependence on the board's THP setting | removed |
+| `dist` from a fresh mapping per worker on top of the build arena | 194 ms, 124 MB (the arena stays resident) | rejected |
+| 192 chunks instead of 48 | 198.7 vs 199.3 ms | rejected: noise |
+
+Phase times now (ms, local): first pass 15, prefix 1, second pass 37, renumbering 20, prefix 3, scatter 13, query setup 2,
+searches 102; total ~195, peak 74 MB. Both big phases are bound by random memory access (the second pass scatters 5M edges and
+atomic counters; the search reads `dist[v]` at random). Checked: 6 tiny seeds, 3 samples and both full seeds match `ref.txt`;
+an ASAN + UBSAN build is clean on the sample and on d-full-2.
