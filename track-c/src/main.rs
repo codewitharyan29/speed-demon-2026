@@ -22,7 +22,7 @@ extern "C" {
     fn prctl(option: i32, ...) -> i32;
 }
 
-const BLOCK: usize = 64 << 10; // bytes read at a time
+const BLOCK: usize = 16 << 10; // bytes read at a time: a block and what stage 1 derives from it stay in the L1 cache
 const PAD: usize = 64; // zero bytes after the data in a buffer, which the parser may read
 const BATCH: usize = 16; // records looked up together
 const COUNTRIES: usize = 256; // room in a name's mask (the spec has 240, plus _UNMATCHED)
