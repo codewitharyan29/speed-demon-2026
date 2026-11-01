@@ -389,3 +389,21 @@ Phase times now (ms, local): first pass 15, prefix 1, second pass 37, renumberin
 searches 102; total ~195, peak 74 MB. Both big phases are bound by random memory access (the second pass scatters 5M edges and
 atomic counters; the search reads `dist[v]` at random). Checked: 6 tiny seeds, 3 samples and both full seeds match `ref.txt`;
 an ASAN + UBSAN build is clean on the sample and on d-full-2.
+
+## Step 25: board run of step 24, then line count and kernel experiments
+
+Board run 1e851d2 (step 24): T 0.2606 s, M 86.8 MB, S 341, K 19.51, 64.5 pts. The board is about 1.37x slower than the local
+Docker run on T (260 vs 190 ms) and counts 341 lines where `scc` on the raw file gave 293.
+
+| Finding | Evidence | Verdict |
+|---|---|---|
+| The board's S is `clang-format` (LLVM style) output, then non-blank non-comment lines, plus the 7-line Dockerfile | `main.cpp` formatted with `--style=LLVM` is 334 lines, +7 = 341, the board's number exactly | commit the formatted file, and count with `tools`-free `clang-format --style=LLVM` |
+| Compact rewrite, 341 -> 265 lines: one `bits/stdc++.h` include, globals instead of a `Graph` struct, `partial_sum` for both prefix scans, `memchr` tail in the line skipper, `num()` consumes its own separator (also removes the skip loop that caused the phantom edge), a max-heap on `~distance` in the slow path | local total 193 vs 204 ms, same output on 11 datasets, ASAN+UBSAN clean | kept |
+| Further golf to 242 lines: `std::map` + mutex overflow table, `touched` sized n, unconditional bitmap OR, early exit through the loop condition | 207 vs 193 ms (queries 115 vs 106, scatter 17 vs 12.5); restoring the `if (h == NIL)` branch and a cold hint on the scatter did not recover it | rejected: it costs time, and time counts more than lines here |
+| Branch-free relax + push (write unconditionally, commit by arithmetic, scratch slot for uncommitted writes) | queries 127 vs 103 ms | rejected: about half of the relaxations do not improve a distance, so the unconditional work costs more than the mispredicts it removes |
+| Drop `MADV_DONTNEED` on the input; `MADV_POPULATE_READ` per chunk | 196 / 206 vs 198 ms | no effect, noise |
+| Workers 1 / 2 / 4 / 12 | queries 819 / 420 / 241 / 115 ms: ~33 ns per settled node on one thread, ~55 ns at 12 threads | the base per-settle cost is the problem, not only contention |
+| Graph symmetry (needed to cost a bidirectional search) | 97.1% of edges have a reverse edge, but only 4.9% with the same weight (median difference 8, p90 23); 6016 duplicate pairs; out-degree max 10 | a backward search needs exact reverse weights: a parallel u16 array (+10 MB) plus a side list for the 2.9% one-way edges |
+
+cachegrind (sample, P-core cache model): the search workers are 62% of instructions and 78% of branch mispredicts, ~119 instructions
+and ~2.3 mispredicts per settled node.
