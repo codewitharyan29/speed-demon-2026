@@ -89,3 +89,38 @@ faults on the 10 MB table) is therefore untested; the memory risk made it not wo
 * Not done: partitioning the name space across workers (needs a bounded-round record exchange; local VM has 4 MB of L3 against the board's 24 MB, so it cannot rank the idea); a persistent thread pool (about 1 ms).
 * Tools: `tools/c_memcheck.sh` (debug assertions + overflow checks + valgrind memcheck; Rust sanitizers need nightly, not in the offline image) and `tools/c_ab.sh` (interleaved timing + memory.peak).
 * Slot table probed in groups of 4 (one SSE compare of the tags, as in SwissTable): same median as linear probing on the VM (136.35 vs 136.52 ms), M +0.2 MB. Reverted.
+
+## Session 4 (local only, no board runs): instruction diet, raw-byte name keys, direct name table
+
+Machine: KVM guest, 4 vCPUs of an Intel Xeon (Sapphire Rapids, 2 MB L2 per core), no Docker, no `perf`. Built with the board's
+compiler (rustc 1.99.1, installed with rustup) and `-C target-cpu=raptorlake` (the board's i5-13500), run directly on full seed 1.
+Timings are medians of interleaved runs (`tools/c_local_bench.py`); instruction and mispredict counts are valgrind cachegrind on a
+`haswell` build (valgrind cannot decode the GFNI instructions of the raptorlake build). Every candidate matched an independent
+reference (`tools/c_ref.py`, which reproduces the published sha256 of full and sample seed 1) on tiny, sample, full, adversarial,
+hostile-LF and three `tools/c_stress_gen.py` files, also with 200-byte blocks and 3,000-byte chunks, and was clean under memcheck
+and overflow checks. Full report: [OPTIMIZATION_REPORT.md](OPTIMIZATION_REPORT.md).
+
+Where the time went (647e26f, one thread, full file): read + fixed 36 ms, stage 1 22 ms, **stage 2 110 ms**, lookups 77 ms. Stage 2
+was 270 instructions a record, not the ~40 assumed: a `malloc` + byte loop for each of the 12.6% of names with `""`, a mispredicted
+branch on the quote count, `Vec::push` capacity checks, `at.reserve` per 64-byte word. regions.csv cost 33 M instructions.
+
+| Change | Instructions (full) | 4 threads | 1 thread | max RSS | Kept |
+|---|---:|---:|---:|---:|---|
+| 647e26f | 2,110 M, 5.06 M mispredicts | 94.1 ms | 259.6 ms | 11.1 MB | |
+| names keyed by their raw bytes between the quotes (writing a value with `"` doubled is one to one, so equality is unchanged); no unescaping, quote counts without a branch, one combined separator test, fixed batch array | -13% (sample) | -8.5% | -14.6% | = | yes |
+| `at` reserved once per block, eight separator writes unrolled | -2.5% (sample) | | | = | yes |
+| regions.csv: comma found with one SWAR test, id with `digits8`; 48 pieces | -14.8 M, -200 k mispredicts | | | = | yes |
+| `next`/`spilled`/`full` on their own cache line | | -3.6% | | = | yes |
+| 32 KiB blocks | | = | | -0.3 MB (4 threads) | yes |
+| **= candidate A (working tree)** | **1,684 M, 3.06 M** | **75.1 ms (-20%)** | **214.8 ms (-17%)** | **10.7 MB** | |
+| **B = A + direct name table (2^17 entries indexed by hash, 128 KB of tags, 16 tags compared at once)** | **1,785 M, 2.13 M** | **69.5 ms (-26%)** | 227.5 ms (-12%) | **11.7 MB** | `docs/track-c-candB.patch` |
+
+Rejected: the direct table with a scalar probe (-4% at 4 threads, +7% at 1, +1 MB); 2^17 slots (+4%, -0.5 MB); `bzhi` masks in
+`word`/`hash` (neutral); inlined hint path (+0.7 M instructions); 512/256 KiB chunks (neutral/worse); one thread spawn with barriers
+(neutral, +14 lines); 16 KiB blocks (slower, no more memory saved); testing the mask bit before the locked OR (+3%); batches of 8 or
+32 (neutral); PGO with the pinned compiler (-1.5 to -3%, inside the noise; would need a profile regenerated per edit). Diagnostics:
+read-only lookups (no mask write, T0 prefetch) cost the same as the real ones; a private name table per thread saved 12% CPU, so
+sharing the table costs something, but not through the mask writes.
+
+Both candidates need board runs (two each, given the board's 6% noise). Projected K if the 4-thread ratios carried over (they did
+not always, see above): A 28.8, B 29.5.

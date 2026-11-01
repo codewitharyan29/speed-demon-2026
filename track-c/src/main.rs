@@ -14,7 +14,6 @@
 
 use std::arch::x86_64::*;
 use std::fs::File;
-use std::io::Write;
 use std::os::unix::fs::FileExt;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
@@ -23,7 +22,7 @@ extern "C" {
     fn prctl(option: i32, ...) -> i32;
 }
 
-const BLOCK: usize = 64 << 10; // bytes read at a time
+const BLOCK: usize = 32 << 10; // bytes read at a time
 const PAD: usize = 64; // zero bytes after the data in a buffer, which the parser may read
 const BATCH: usize = 16; // records looked up together
 const COUNTRIES: usize = 256; // room in a name's mask (the spec has 240, plus _UNMATCHED)
@@ -62,6 +61,13 @@ struct Names {
     idmask: u32,
     entries: &'static [Entry],
     spill: &'static [u8], // the bytes of the names longer than 24, written once each
+    counts: Counts,
+}
+
+/// What adding a name writes, kept away from the cache line that every lookup reads.
+#[repr(align(128))]
+#[derive(Default)]
+struct Counts {
     spilled: AtomicUsize,
     next: AtomicUsize,
     full: AtomicBool,
@@ -75,7 +81,7 @@ impl Names {
         let base = (unsafe { std::alloc::alloc_zeroed(layout) } as usize + 63) & !63;
         let entries = unsafe { std::slice::from_raw_parts(base as *const Entry, 1 << (bits - 1)) };
         let spill = Box::leak(vec![0u8; 32 << bits].into_boxed_slice());
-        Names { slots: zeros(1 << bits), idmask: (1 << bits) - 1, entries, spill, spilled: AtomicUsize::new(0), next: AtomicUsize::new(0), full: AtomicBool::new(false) }
+        Names { slots: zeros(1 << bits), idmask: (1 << bits) - 1, entries, spill, counts: Counts::default() }
     }
 
     /// The slot where the search for a name with hash `h` starts.
@@ -138,9 +144,9 @@ impl Names {
 
     /// Stores a new name; returns its id. Sets `full` (and returns an id that is not used) if there is no room.
     unsafe fn add(&self, s: *const u8, len: usize) -> usize {
-        let id = self.next.fetch_add(1, Relaxed);
-        if id >= self.entries.len() || self.spilled.load(Relaxed) + len > self.spill.len() {
-            self.full.store(true, Relaxed);
+        let id = self.counts.next.fetch_add(1, Relaxed);
+        if id >= self.entries.len() || self.counts.spilled.load(Relaxed) + len > self.spill.len() {
+            self.counts.full.store(true, Relaxed);
             return 0;
         }
         let e = &self.entries[id];
@@ -150,7 +156,7 @@ impl Names {
                 e.name[k].store(word(s, len, k), Relaxed);
             }
         } else {
-            let at = self.spilled.fetch_add(len, Relaxed);
+            let at = self.counts.spilled.fetch_add(len, Relaxed);
             std::ptr::copy_nonoverlapping(s, self.spill.as_ptr().add(at) as *mut u8, len);
             e.name[0].store(at as u64, Relaxed);
         }
@@ -201,24 +207,31 @@ impl Agg {
 const NONE: Agg = Agg { count: 0, id_sum: 0, sum: 0, min: i64::MAX, max: i64::MIN, name_bytes: 0, note_bytes: 0 };
 
 #[derive(Clone, Copy)]
-/// A parsed record whose country and name are still to be looked up. The name is in the input buffer, or in the batch's
-/// `owned` list (unescaped, with padding) when it contained `""`; its hash is computed and its table slot prefetched.
+/// A parsed record whose country and name are still to be looked up. The name is in the input buffer, as written; its
+/// hash is computed and its table slot prefetched.
 struct Rec {
     id: u64,
     cents: i64,
-    region: usize,
     name: *const u8,
-    len: usize,
     hash: u64,
+    region: u32,
+    len: u32,
+    name_bytes: u32,
+    note_bytes: u32,
     hint: u32,
-    note_bytes: usize,
 }
 
-/// Records waiting to be looked up, and the unescaped names some of them point to.
-#[derive(Default)]
+/// Records waiting to be looked up.
 struct Batch {
-    recs: Vec<Rec>,
-    owned: Vec<Vec<u8>>,
+    recs: [Rec; BATCH],
+    n: usize,
+}
+
+impl Default for Batch {
+    fn default() -> Batch {
+        // SAFETY: a `Rec` of zeros is valid (a null pointer is never read: `n` counts the records written).
+        Batch { recs: unsafe { std::mem::zeroed() }, n: 0 }
+    }
 }
 
 /// What the workers share.
@@ -267,9 +280,13 @@ impl Quotes {
 /// and the quotes to `quotes`. A quote toggles being inside quotes, and so does each half of a `""`, so the bytes inside
 /// quotes are the prefix XOR of the quote bits, which a carry-less multiplication by all ones computes.
 fn structure(b: &[u8], end: usize, at: &mut Vec<u32>, quotes: &mut Quotes) {
-    (at.clear(), quotes.words.clear(), quotes.before.clear());
-    let (mut inside, mut seen) = (0u64, 0u32);
-    for base in (0..end).step_by(64) {
+    // Room for every byte of the block being a separator, reserved once per block (pages that are never written cost
+    // no memory); the quote words are written in place.
+    let words = end.div_ceil(64);
+    (at.clear(), at.reserve(64 * words + 8), quotes.words.resize(words + 1, 0), quotes.before.resize(words + 1, 0));
+    let (mut inside, mut seen, mut n, out) = (0u64, 0u32, 0usize, at.as_mut_ptr());
+    for w in 0..words {
+        let base = 64 * w;
         // SAFETY: the buffer extends 64 bytes past `end`.
         let (quote, separators, in_quotes) = unsafe {
             let (lo, hi) = (_mm256_loadu_si256(b.as_ptr().add(base) as _), _mm256_loadu_si256(b.as_ptr().add(base + 32) as _));
@@ -286,17 +303,23 @@ fn structure(b: &[u8], end: usize, at: &mut Vec<u32>, quotes: &mut Quotes) {
         // Eight positions are written whether or not there are that many, and the length advances by the real number: a
         // branch per block would be mispredicted about as often as it is taken. More than eight are rare.
         let (mut outside, count) = (separators & !in_quotes, (separators & !in_quotes).count_ones() as usize);
-        at.reserve(64);
-        for k in 0..count.max(8) {
-            // SAFETY: 64 elements of spare capacity were reserved, and a block has at most 64 separators.
-            unsafe { at.as_mut_ptr().add(at.len() + k).write((base + outside.trailing_zeros() as usize) as u32) };
+        let mut put = |k: usize| {
+            // SAFETY: there is room for 64 per word, plus 8.
+            unsafe { out.add(n + k).write((base + outside.trailing_zeros() as usize) as u32) };
             outside &= outside.wrapping_sub(1);
+        };
+        (0..8).for_each(&mut put);
+        if count > 8 {
+            (8..count).for_each(put);
         }
-        unsafe { at.set_len(at.len() + count) };
-        (quotes.words.push(quote), quotes.before.push(seen));
+        n += count;
+        // SAFETY: both have `words + 1` elements.
+        unsafe { (*quotes.words.get_unchecked_mut(w), *quotes.before.get_unchecked_mut(w)) = (quote, seen) };
         seen += quote.count_ones();
     }
-    (quotes.words.push(0), quotes.before.push(seen)); // so that `before` works for a position at the very end
+    // SAFETY: `n` positions were written.
+    unsafe { at.set_len(n) };
+    (quotes.words[words], quotes.before[words]) = (0, seen); // so that `before` works for a position at the very end
 }
 
 /// Stage 2: the record that starts at `start` and whose four commas and LF are at `sep` goes into `batch`.
@@ -305,63 +328,51 @@ fn structure(b: &[u8], end: usize, at: &mut Vec<u32>, quotes: &mut Quotes) {
 unsafe fn record(c: &Ctx, b: &[u8], q: &Quotes, start: usize, sep: &[u32], batch: &mut Batch) -> Option<()> {
     let [e1, e2, e3, e4, e5] = [0, 1, 2, 3, 4].map(|k| sep[k] as usize);
     let at = |i: usize| *b.get_unchecked(i);
-    let sep_ok = at(e1) == b',' && at(e2) == b',' && at(e3) == b',' && at(e4) == b',' && at(e5) == b'\n';
-    let p = start + 3 * (at(start) == 0xEF) as usize; // a BOM in front of the record
-    (sep_ok && (p == start || b[start + 1..start + 3] == [0xBB, 0xBF])).then_some(())?;
+    let sep_bad = (at(e1) ^ b',') | (at(e2) ^ b',') | (at(e3) ^ b',') | (at(e4) ^ b',') | (at(e5) ^ b'\n');
+    let bom = at(start) == 0xEF;
+    let p = start + 3 * bom as usize; // a BOM in front of the record
+    (sep_bad == 0 && (!bom || (b.as_ptr().add(start + 1) as *const u16).read_unaligned() == 0xBFBB)).then_some(())?;
     let (neg, cr) = (at(e4 + 1) == b'-', (at(e5 - 1) == b'\r') as usize);
     let (whole_at, dot) = (e4 + 1 + neg as usize, e5 - cr - 3); // the amount ends in ".dd"
     let cents = (digits(b, whole_at, dot - whole_at) * 100 + (at(dot + 1) - b'0') as u64 * 10 + (at(dot + 2) - b'0') as u64) as i64;
     let (id, region) = (digits(b, p, e1 - p), digits(b, e3 + 1, e4 - e3 - 1) as usize);
-    // A quoted text field has two delimiting quotes and two more for every `""` pair inside it. If the name and the note
-    // together have no more than their delimiters, neither has a pair.
-    let (name_quoted, note_quoted) = (e2 > e1 + 1 && at(e1 + 1) == b'"', e3 > e2 + 1 && at(e2 + 1) == b'"');
-    let (mut nd, mut td) = (0, 0);
-    if q.before(e3) - q.before(e1 + 1) != 2 * (name_quoted as u32 + note_quoted as u32) {
-        nd = if name_quoted { (q.before(e2) - q.before(e1 + 1) - 2) as usize / 2 } else { 0 };
-        td = if note_quoted { (q.before(e3) - q.before(e2 + 1) - 2) as usize / 2 } else { 0 };
-    }
-    let (ns, ne) = (e1 + 1 + name_quoted as usize, e2 - name_quoted as usize);
-    let note_len = e3 - e2 - 1 - 2 * note_quoted as usize - td;
-    let owned = (nd > 0).then(|| {
-        let (mut v, mut k) = (Vec::with_capacity(ne - ns + 32), ns);
-        while k < ne {
-            v.push(at(k));
-            k += 1 + (at(k) == b'"') as usize;
-        }
-        v.extend_from_slice(&[0; 32]); // readable padding, like the input buffer has
-        v
-    });
-    let len = ne - ns - nd;
-    let name = owned.as_ref().map_or(b[ns..].as_ptr(), |v| v.as_ptr());
-    batch.owned.extend(owned);
-    // SAFETY: both buffers have 32 readable bytes after the name; the hash reads at most 16 around its ends.
+    // An unquoted text field has no quotes; a quoted one has its two delimiters and two more for every `""` pair inside.
+    let (qname, qnote) = ((q.before(e2) - q.before(e1)) as usize, (q.before(e3) - q.before(e2)) as usize);
+    let (name_quoted, note_quoted) = ((qname != 0) as usize, (qnote != 0) as usize);
+    // A name is looked up by the bytes between its delimiters as written, with `""` for each `"`: writing a value that way
+    // is one to one, so two names are equal exactly when these bytes are. Its length after unescaping is one less per pair.
+    let (ns, len) = (e1 + 1 + name_quoted, e2 - e1 - 1 - 2 * name_quoted);
+    let name_bytes = len - (qname / 2 - name_quoted);
+    let note_len = e3 - e2 - 1 - 2 * note_quoted - (qnote / 2 - note_quoted);
+    let name = b.as_ptr().add(ns);
+    // SAFETY: the buffer has 32 readable bytes after the name; the hash reads at most 16 around its ends.
     let hash = hash(name, len);
     _mm_prefetch::<_MM_HINT_T0>(c.names.slot(hash) as *const AtomicU32 as *const i8);
     if let Some(r) = c.region.get(region) {
         _mm_prefetch::<_MM_HINT_T0>(r as *const AtomicU8 as *const i8);
     }
     let cents = if neg { -cents } else { cents };
-    batch.recs.push(Rec { id, cents, region, name, len, hash, hint: 0, note_bytes: note_len });
+    *batch.recs.get_unchecked_mut(batch.n) = Rec { id, cents, name, hash, region: region.min(u32::MAX as usize) as u32, len: len as u32, name_bytes: name_bytes as u32, note_bytes: note_len as u32, hint: 0 };
+    batch.n += 1;
     Some(())
 }
 
 /// Looks up the countries and names of the records in `batch` and adds them to `aggs`.
 fn resolve(c: &Ctx, batch: &mut Batch, aggs: &mut [Agg]) {
-    for r in batch.recs.iter() {
-        let country = c.region.get(r.region).map_or(0, |x| x.load(Relaxed)) as usize;
+    for r in &batch.recs[..batch.n] {
+        let country = c.region.get(r.region as usize).map_or(0, |x| x.load(Relaxed)) as usize;
         // SAFETY: the name has 32 readable bytes after it, as `record` ensured.
-        let name = unsafe { c.names.entry(r.name, r.len, r.hash, r.hint) };
+        let name = unsafe { c.names.entry(r.name, r.len as usize, r.hash, r.hint) };
         name.mask[country / 64].fetch_or(1 << (country % 64), Relaxed);
         let a = &mut aggs[country];
         a.count += 1;
         a.id_sum += r.id;
         a.sum += r.cents;
         (a.min, a.max) = (a.min.min(r.cents), a.max.max(r.cents));
-        a.name_bytes += r.len as u64;
+        a.name_bytes += r.name_bytes as u64;
         a.note_bytes += r.note_bytes as u64;
     }
-    batch.recs.clear();
-    batch.owned.clear();
+    batch.n = 0;
 }
 
 /// The buffers of one worker, kept from chunk to chunk.
@@ -395,10 +406,11 @@ fn parse_chunk(c: &Ctx, lo: usize, hi: usize, aggs: &mut [Agg], w: &mut Worker) 
                 return false;
             }
             start = sep[4] as usize + 1;
-            if batches[now].recs.len() == BATCH {
+            if batches[now].n == BATCH {
                 // The batch before this one has had the slots of its names prefetched while this one was parsed: look at
                 // them now, and prefetch the entries. The batch before that has had its entries prefetched: resolve it.
-                batches[(now + 2) % 3].recs.iter_mut().for_each(|r| r.hint = c.names.warm(r.hash));
+                let w = &mut batches[(now + 2) % 3];
+                w.recs[..w.n].iter_mut().for_each(|r| r.hint = c.names.warm(r.hash));
                 resolve(c, &mut batches[(now + 1) % 3], aggs);
                 now = (now + 1) % 3;
             }
@@ -406,7 +418,7 @@ fn parse_chunk(c: &Ctx, lo: usize, hi: usize, aggs: &mut [Agg], w: &mut Worker) 
         for k in [1, 2, 0] {
             // before the buffer changes
             let b = &mut batches[(now + k) % 3];
-            b.recs.iter_mut().for_each(|r| r.hint = c.names.warm(r.hash));
+            b.recs[..b.n].iter_mut().for_each(|r| r.hint = c.names.warm(r.hash));
             resolve(c, b, aggs);
         }
         if last {
@@ -456,7 +468,7 @@ fn run(regions: &File, file: &File, len: usize, bits: u32, chunk: usize) -> Opti
     let max_id = tail[last..].iter().take_while(|c| c.is_ascii_digit()).fold(0, |v, &c| v * 10 + (c - b'0') as usize);
     // Countries get indices 1, 2, ... in the order the pieces meet them (0 is _UNMATCHED); the output is sorted afterwards.
     let (region, index, codes): (Vec<AtomicU8>, Vec<AtomicU8>, _) = (zeros(max_id + 1), zeros(26 * 26 * 26), Mutex::new(vec![]));
-    let pieces = 16;
+    let pieces = 48;
     let cut = |j: usize| match j {
         0 => first,
         _ if j == pieces => rlen,
@@ -468,15 +480,22 @@ fn run(regions: &File, file: &File, len: usize, bits: u32, chunk: usize) -> Opti
         regions.read_exact_at(&mut text[..len], cut(j) as u64).ok()?;
         let mut p = 0;
         while p < len {
-            // A line is "region_id,CCC" and an LF.
-            // SAFETY: the buffer extends `PAD` bytes past the data.
-            let i = p + text[p..].iter().position(|&c| c == b',')?;
-            let id = text[p..i].iter().fold(0, |v, &c| v * 10 + (c - b'0') as usize);
-            let country = &text[i + 1..i + 4];
-            if text[i] != b',' || text[i + 4] != b'\n' || id > max_id || !country.iter().all(|c| c.is_ascii_uppercase()) {
+            // A line is "region_id,CCC" and an LF. The comma is found among the first 8 bytes (the lowest zero byte of
+            // `w ^ ",,,,,,,,"`) unless the id has more than 7 digits.
+            let w = u64::from_le_bytes(text[p..p + 8].try_into().unwrap());
+            let x = w ^ 0x2C2C_2C2C_2C2C_2C2C;
+            let zero = x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080;
+            let i = p + if zero != 0 { zero.trailing_zeros() as usize / 8 } else { text[p..].iter().position(|&c| c == b',')? };
+            let id = match i - p {
+                0 => return None,
+                n @ 1..=8 => digits8(w << (8 * (8 - n))) as usize,
+                _ => text[p..i].iter().fold(0, |v, &c| v * 10 + (c - b'0') as usize),
+            };
+            let country = [text[i + 1], text[i + 2], text[i + 3]].map(|c| c.wrapping_sub(b'A') as usize);
+            if text[i + 4] != b'\n' || id > max_id || country.iter().any(|&c| c >= 26) {
                 return None;
             }
-            let code = country.iter().fold(0, |v, &c| v * 26 + (c - b'A') as usize);
+            let code = country[0] * 676 + country[1] * 26 + country[2];
             if index[code].load(Relaxed) == 0 {
                 let mut codes = codes.lock().unwrap();
                 if index[code].load(Relaxed) == 0 {
@@ -523,7 +542,7 @@ fn run(regions: &File, file: &File, len: usize, bits: u32, chunk: usize) -> Opti
             ok &= lo >= hi || parse_chunk(&ctx, lo, hi, &mut aggs, &mut worker);
         }
     });
-    if names.full.load(Relaxed) || results.iter().any(|r| r.is_none()) {
+    if names.counts.full.load(Relaxed) || results.iter().any(|r| r.is_none()) {
         return None;
     }
     let mut total = vec![NONE; countries];
@@ -532,7 +551,7 @@ fn run(regions: &File, file: &File, len: usize, bits: u32, chunk: usize) -> Opti
     }
 
     // Distinct names per country: the set bits of the masks, counted by ranges of entries in parallel.
-    let used = names.next.load(Relaxed).min(names.entries.len());
+    let used = names.counts.next.load(Relaxed).min(names.entries.len());
     let parts = parallel(used.div_ceil(4096), |j| {
         let mut counts = vec![0u64; countries];
         for e in &names.entries[j * 4096..((j + 1) * 4096).min(used)] {
