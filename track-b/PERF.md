@@ -24,7 +24,8 @@ They are only used to compare variants, never reported as results.
 | 12 | No binary-search probing in `combine`; `par` without job order (-17 lines) | 9158a69 (scored as c4904b3) | 0.245 | 45 | 68.831 (K 23.80, 805 lines) |
 | 13 | Board experiment: scan table on 2 MB pages (2 MB-aligned, `MADV_HUGEPAGE`, exactly 4 MB with wrap-around spills) | 1e99e80 | 0.253 | 45 | 68.421 (K 23.36, 812 lines); reverted |
 | 14 | Board experiment: tokens looked up 16 at a time instead of 48 (the box has 16 L1D fill buffers per core, shared by two threads) | 6f0f6e7 | 0.262 | 45 | 68.055 (K 22.97, 805 lines); reverted to 48 |
-| 15 | Phrases checked on each document's term-id sequence at their rarest term (no pair postings, bloom filter or re-tokenising) | pending | | | |
+| 15 | Phrases checked on each document's term-id sequence at their rarest term (no pair postings, bloom filter or re-tokenising) | cc9739a | 0.248 | 42 | 69.006 (K 24.00, 755 lines) |
+| 17 | 60 chunks instead of 64: five per thread, no idle tail | pending | | | |
 
 ## Local measurements behind step 2 (in-process ms, median)
 
@@ -311,3 +312,50 @@ bloom filter, the pair postings and the re-tokenising of candidates, and the phr
 | Phrases at their trigger term | 918 | 179 (min 158) | 40 MB | 748 |
 
 Verified on full seeds 1 and 2, sample seeds 1-3, tiny seeds 1-6 and the worked example.
+
+## Step 16 (rejected): redesign, part 2: rare-cover BOOL queries at their trigger terms
+
+Every match of a left-to-right BOOL query holds a term of its cover (`R AND t`: the rarer of R's cover and t; `R OR t`:
+both; `R NOT t`: R's). A query whose cover has a small sampled df was evaluated at the end of each document holding a
+cover term, from the scan's per-document stamps and bitset bits, and skipped the per-chunk pass. Correct (full seed 1
+hash, worked example), but slower at every threshold (12 threads, median of 9):
+
+| Light if the cover's df is below | Light queries | Checks | Median (min) |
+|---|---|---|---|
+| (step 15 code) | 0 | 0 | 173 (159) |
+| ~250 documents | 19,758 | 1.28 M | 185 (181) |
+| ~1,000 documents | 24,785 | 3.94 M | 195 (179) |
+| ~4,000 documents | more | more | 247 (217) |
+
+The queries it can take are the ones the per-chunk pass already answers cheaply (a rare first term exits early in
+most chunks); the per-chunk cost sits in queries with common terms or OR, which have no rare cover. Each per-document
+check also costs several scattered reads (the query, `dense_of`, the trigger index, the stamps).
+
+## Step 17: instruction-level work on the scan, and the chunk count
+
+Cachegrind on the full data (step-15 code): 8.12 G instructions (224 per token), 74.4 M mispredicts (2.05 per
+token). Since the box is compute-bound at 2.5 GHz, candidates were judged first by instructions and mispredicts
+(estimate: Ir/3 + 17 x mispredicts + 40 x LL misses), then by clean single-thread timing:
+
+| Change | Ir | Mispredicts | 1 thread (median) | Verdict |
+|---|---|---|---|---|
+| Step-15 code | 8.12 G | 74.4 M | 867 | |
+| Probe: hit/miss as a non-short-circuit condition and a select from an array | 8.38 G | 71.5 M | | rejected |
+| Lookup and bookkeeping in one loop, unchecked indexing where bounds are provable | 7.76 G | 61.8 M | 914 | rejected: fewer cache misses overlap once each lookup is followed by its bookkeeping (the cachegrind estimate said -6%) |
+| Unchecked indexing only (tokeniser batch slot, probe bucket, bitset row, stamp) | 7.72 G | 71.9 M | 863 | neutral here; kept in reserve |
+| + `select_unpredictable` for the probe's hit/miss | 8.01 G | 61.5 M | | rejected: the mispredicts stay |
+| + branch-free bookkeeping (always OR a bit, always stamp, always write the pair and count it or not) | 8.45 G | 47.8 M | | rejected: -14 M mispredicts for +0.7 G instructions |
+
+The chunk count: with 64 chunks on 12 threads every thread takes five and then four threads take a sixth while eight
+wait, so the run lasts six chunk-times instead of 5.33 (about 12% lost on 12 equal hardware threads). That fits the
+board going from 0.250 s to 0.260 s when step 10 moved from 48 to 64 chunks while this laptop (unequal cores) showed
+no change. 60 chunks: five each, and fewer chunks to evaluate every query on.
+
+| Chunks | 12 threads (median of 9) | `memory.peak` |
+|---|---|---|
+| 64 | 171 | 40 MB |
+| 60 | 165 | 40 MB |
+| 72 | 172 | 37 MB |
+| 48 | 170 | 44 MB |
+
+60 chunks: verified on full seeds 1 and 2, sample seeds 1-3, tiny seeds 1-6 and the worked example. Board: pending.

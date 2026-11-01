@@ -8,7 +8,7 @@ The queries are read first and every distinct term is numbered. A 2% sample of t
 document frequency: BOOL terms in over 1/32 of the documents become bitsets, the rest sorted lists. Each phrase is
 assigned its rarest term as its trigger.
 
-The corpus is then scanned in 64 newline-aligned chunks on 12 threads, each chunk indexed and answered on its own, so
+The corpus is then scanned in 60 newline-aligned chunks on 12 threads (five each), each chunk indexed and answered on its own, so
 nothing that grows with the corpus is kept. An AVX2 tokeniser finds token edges 64 bytes at a time; tokens are looked
 up 48 at a time with their table buckets prefetched, one 64-byte bucket holding the key words and metadata of three
 terms, compared in one SIMD instruction. Dense terms set bits in the chunk's bitsets; other BOOL terms become `u16`
