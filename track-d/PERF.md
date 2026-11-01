@@ -24,7 +24,8 @@ They are noisy in absolute terms (a Windows laptop VM, not the scoring box) and 
 | 14 | Disjoint sequential streaming scatter, 256 KB worker thread stacks, sliding-window neighbor LFB prefetch, drop MADV_SEQUENTIAL | 061ec57 | 0.281 | 74 | 62.576 (K 17.85, 592 lines) |
 | 15 | Plain store prefix sum 0 (no locked XCHG), eliminate inner-loop LFB prefetch, unchecked line parsing, drop unmap_file syscalls (-28 lines) | 9af42e6 | 0.245 | 76 | 64.159 (K 19.20, 564 lines) |
 | 16 | Skip Pass 1 SWAR weight parsing (parse_edge::<false>), barrier-synchronized unified scatter & parallel prefix sum, pre-size worker touched buffer (163840) | 6564b62 | 0.248 | 76 | 63.776 (K 18.86, 602 lines) |
-| 17 | Freelist-free bump-allocated PoolDial, zero-futex pipeline restoration, fast Pass 1 weight bypass, S=565 (-37 lines) | | ~0.215 | ~75 | estimated ~66.0 pts |
+| 17 | Freelist-free bump-allocated PoolDial, zero-futex pipeline restoration, fast Pass 1 weight bypass, S=565 (-37 lines) | 555a39c | 0.246 | 86 | 63.548 (K 18.66, 565 lines) |
+| 18 | Unified single-pass sequential renumber & prefix sum, right-size Worker pool/touched capacity (32K), drop Phase 4 thread pool (-17 lines) | | ~0.230 | ~72 | estimated ~66.5 pts |
 
 ## Local measurements behind step 2 (full data, in-process ms, 12 CPUs)
 

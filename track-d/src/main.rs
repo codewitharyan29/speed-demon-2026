@@ -145,7 +145,7 @@ impl PoolDial {
             head: [u32::MAX; WINDOW],
             bitmap: [0u64; WINDOW / 64],
             summary: 0,
-            pool: Vec::with_capacity(163840),
+            pool: Vec::with_capacity(32768),
             at: 0,
             len: 0,
         }
@@ -436,22 +436,12 @@ fn main() {
     drop(claimed);
 
     let (mut new_id, mut first) = (vec![0u32; n], vec![0u32; n + 1]);
-    let (nid_ptr, f_ptr) = (new_id.as_mut_ptr() as usize, first.as_mut_ptr() as usize);
-
-    par(THREADS, |t| {
-        let (i_start, i_end) = (t * n / THREADS, (t + 1) * n / THREADS);
-        let (nid, f) = (nid_ptr as *mut u32, f_ptr as *mut u32);
-        for i in i_start..i_end {
-            let u = order[i] as usize;
-            unsafe {
-                *nid.add(u) = i as u32;
-                *f.add(i + 1) = start0[u + 1] - start0[u];
-            }
-        }
-    });
-
     for i in 0..n {
-        first[i + 1] += first[i];
+        let u = unsafe { *order.get_unchecked(i) } as usize;
+        unsafe {
+            *new_id.get_unchecked_mut(u) = i as u32;
+            *first.get_unchecked_mut(i + 1) = *first.get_unchecked(i) + (start0[u + 1] - start0[u]);
+        }
     }
 
     let mut adj = vec![0u32; m];
@@ -541,7 +531,7 @@ fn main() {
                     let mut w = Worker {
                         dist: vec![0u16; n],
                         wide: Vec::new(),
-                        touched: Vec::with_capacity(163840),
+                        touched: Vec::with_capacity(32768),
                         heap: PoolDial::new(),
                     };
                     let ans_out = ans_ptr as *mut i64;
