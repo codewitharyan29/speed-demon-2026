@@ -234,3 +234,44 @@ local signal, and they cost lines).
   are committed and pushed.
 * **Board validation:** still required for both A and B.
 * **Pushed:** nothing.
+
+# Session 5 (Nov 1, 13:30-): starting from the board-validated candidate B
+
+## Baseline and board results since session 4
+
+| Candidate | Commit | Board run | T | M | S | K |
+|---|---|---|---:|---:|---:|---:|
+| 647e26f | `647e26f` | run-10dbb3692f36 | 47.56 ms | 14.4 MB | 606 | 25.70 |
+| A | `75bd0cd` | (in PERF.md) | 40.23 ms | 13.1 MB | 624 | 28.36 |
+| **B** | **`9fb5c93`, tag `tc-good-6`** | **run-99e4e3237a66** | **36.59 ms** | **13.5 MB** | **629** | **29.52** |
+
+The session-4 projections were A 28.8 and B 29.5. B landed on its projection; A came in 1.5% below. The source of `9fb5c93` is
+byte-identical to this report's candidate B, except for one unused import that B still carries.
+
+## Where the time goes in B (local, 4 threads, full seed 1, 30 interleaved runs)
+
+| Variant | Median | CPU | What it says |
+|---|---:|---:|---|
+| B | 78.2 ms | 275 ms | |
+| no mask write | 73.4 | 259 | the locked OR is about 6% |
+| no name lookup | 48.7 | 173 | name lookups are about 38% |
+| no lookup, no region, no aggregation | 48.6 | 165 | region lookup and totals are nearly free |
+
+## Experiments
+
+| # | Hypothesis | Correctness | Local median (B same run) | Memory | S | Board K | Decision |
+|---|---|---|---:|---:|---:|---:|---|
+| F1 | name table of 15/16 of 2^17 entries (multiply-shift home), load 0.82: -0.5 MB | pass + stress1 | 73.9 (72.5) | -0.5 MB | 633 | N/A | rejected: about 0 net K |
+| F2 | 14/16 of 2^17 (load 0.87): -1.0 MB | pass + stress1 | 76.7 (72.5) +5.7% | -1.0 MB | 633 | N/A | rejected: about -1.3% K net |
+| F3 | 13/16 | over capacity, so it **correctly fell back** to the single-chunk run (490 ms) | | | | N/A | shows the cliff: a table under about 107 k names makes every run slow |
+| P1 | partitioning names by hash across threads: upper bound by having each thread look up only the names it would own | diag | 67.5 (76.6) with a quarter of the lookups | | | N/A | rejected: a quarter of the lookups on a private quarter of the table still cost 17 of 26 ms; sharing is not the dominant cost, and the exchange plus about 100 lines would cost more |
+| H1 | huge pages for the 8 MB entry table only (`PR_THP_DISABLE_EXCEPT_ADVISED`, Linux 6.18, falls back to disabling everywhere; table aligned to 2 MiB, `MADV_HUGEPAGE`): fewer TLB misses, no memory cost because every page of it is used | pass; AnonHugePages 8,192 kB confirmed | 69.95 (69.83), 80 runs | = | 633 | N/A | rejected: neutral locally; the board's kernel version is unknown |
+
+## Conclusion for this session
+
+No Track C source change beat `9fb5c93` locally. The three hypotheses with a clear mechanism (smaller table, less sharing, fewer
+TLB misses) were each measured and rejected. `tc-good-6` remains the submission. The next opportunities, in order: (1) an
+instruction-level pass over `same()` and `warm()` of B (about 170 instructions per record for the whole lookup path); (2) a compact
+region table, now that B's 1 MB region table competes with the 8 MB entry table for L2 on the board (estimated net about 0
+before, so only worth a try together with something else); (3) H1 on the board, only if the board's kernel is 6.18 or newer
+(otherwise the prctl falls back and nothing changes).
