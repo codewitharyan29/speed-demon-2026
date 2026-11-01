@@ -16,7 +16,7 @@ use std::arch::x86_64::*;
 use std::fs::File;
 use std::io::Write;
 use std::os::unix::fs::FileExt;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering::*};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
 
 extern "C" {
     fn prctl(option: i32, ...) -> i32;
@@ -53,10 +53,12 @@ struct Entry {
     name: [AtomicU64; 3],
 }
 
-/// Every distinct name seen, shared by all workers. `slots` is an open-addressing table of `hash tag << 32 | id + 1`,
+/// Every distinct name seen, shared by all workers. `slots` is an open-addressing table of `hash tag | id + 1` (the tag is the high bits of the hash,
+/// above the `bits` bits of the id),
 /// small enough to stay in the cache; `entries[id]` is the name itself.
 struct Names {
-    slots: Vec<AtomicU64>,
+    slots: Vec<AtomicU32>,
+    idmask: u32,
     entries: &'static [Entry],
     spill: &'static [u8], // the bytes of the names longer than 24, written once each
     spilled: AtomicUsize,
@@ -72,11 +74,11 @@ impl Names {
         let base = (unsafe { std::alloc::alloc_zeroed(layout) } as usize + 63) & !63;
         let entries = unsafe { std::slice::from_raw_parts(base as *const Entry, 1 << (bits - 1)) };
         let spill = Box::leak(vec![0u8; 32 << bits].into_boxed_slice());
-        Names { slots: zeros(1 << bits), entries, spill, spilled: AtomicUsize::new(0), next: AtomicUsize::new(0), full: AtomicBool::new(false) }
+        Names { slots: zeros(1 << bits), idmask: (1 << bits) - 1, entries, spill, spilled: AtomicUsize::new(0), next: AtomicUsize::new(0), full: AtomicBool::new(false) }
     }
 
     /// The slot where the search for a name with hash `h` starts.
-    fn slot(&self, h: u64) -> &AtomicU64 {
+    fn slot(&self, h: u64) -> &AtomicU32 {
         &self.slots[h as usize & (self.slots.len() - 1)]
     }
 
@@ -88,9 +90,9 @@ impl Names {
             if v == 0 {
                 return;
             }
-            if v >> 32 == h >> 32 {
+            if v & !self.idmask == (h >> 32) as u32 & !self.idmask {
                 // SAFETY: prefetching has no effect on correctness, whatever the address.
-                return unsafe { _mm_prefetch::<_MM_HINT_ET0>(&self.entries[(v & 0xFFFF_FFFF) as usize - 1] as *const Entry as *const i8) };
+                return unsafe { _mm_prefetch::<_MM_HINT_ET0>(&self.entries[(v & self.idmask) as usize - 1] as *const Entry as *const i8) };
             }
             i = (i + 1) & (self.slots.len() - 1);
         }
@@ -115,19 +117,19 @@ impl Names {
 
     /// The entry of the name `s[..len]` (`s` must have 32 readable bytes after the name) with hash `h`; adds it if new.
     unsafe fn entry(&self, s: *const u8, len: usize, h: u64) -> &Entry {
-        let (tag, mut mine) = (h & !0xFFFF_FFFF, None);
+        let (tag, mut mine) = ((h >> 32) as u32 & !self.idmask, None);
         let mut i = h as usize & (self.slots.len() - 1);
         loop {
             let v = self.slots[i].load(Acquire);
             if v == 0 {
                 let id = *mine.get_or_insert_with(|| self.add(s, len));
-                if self.slots[i].compare_exchange(0, tag | (id as u64 + 1), AcqRel, Acquire).is_ok() {
+                if self.slots[i].compare_exchange(0, tag | (id as u32 + 1), AcqRel, Acquire).is_ok() {
                     return &self.entries[id];
                 }
                 continue; // the slot was taken meanwhile: look at what is in it now
             }
-            if v & !0xFFFF_FFFF == tag && self.same((v & 0xFFFF_FFFF) as usize - 1, s, len) {
-                return &self.entries[(v & 0xFFFF_FFFF) as usize - 1];
+            if v & !self.idmask == tag && self.same((v & self.idmask) as usize - 1, s, len) {
+                return &self.entries[(v & self.idmask) as usize - 1];
             }
             i = (i + 1) & (self.slots.len() - 1);
         }
@@ -329,7 +331,7 @@ unsafe fn record(c: &Ctx, b: &[u8], q: &Quotes, start: usize, sep: &[u32], batch
     batch.owned.extend(owned);
     // SAFETY: both buffers have 32 readable bytes after the name; the hash reads at most 16 around its ends.
     let hash = hash(name, len);
-    _mm_prefetch::<_MM_HINT_T0>(c.names.slot(hash) as *const AtomicU64 as *const i8);
+    _mm_prefetch::<_MM_HINT_T0>(c.names.slot(hash) as *const AtomicU32 as *const i8);
     if let Some(r) = c.region.get(region) {
         _mm_prefetch::<_MM_HINT_T0>(r as *const AtomicU16 as *const i8);
     }
