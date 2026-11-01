@@ -20,3 +20,4 @@ board,95582d0,run-c30f1d80a49f,52.85,15.5,605,24.05,"branch-free compare + hint 
 board,647e26f,run-10dbb3692f36,47.56,14.4,606,25.70,"u8 region table with direct country index"
 board,75bd0cd,run-f0c4b3883b10,40.23,13.1,624,28.36,"candidate A"
 board,9fb5c93,run-99e4e3237a66,36.59,13.5,629,29.52,"candidate B (final)"
+board,46829d6,run-a3e9f05bd3dc,36.09,13.3,656,29.63,"R2 (cloud): no gain over B, reverted"

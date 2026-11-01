@@ -45,21 +45,12 @@ fn parallel<R: Send>(jobs: usize, f: impl Fn(usize) -> R + Sync) -> Vec<R> {
 /// One distinct name, in a single cache line: comparing it and recording its country touch one line.
 #[repr(align(64))]
 struct Entry {
-    /// The key: byte 0 is the name's length + 1 (0: free or still being written; 255: longer than 31 bytes), then its
-    /// first 31 bytes, zero padded. A longer name keeps the offset of its bytes in `Names::spill` in word 1 and its length
-    /// in word 2. Word 0 is stored last.
-    key: [AtomicU64; 4],
+    /// The name's length + 1, stored last (0: the entry is free or still being written).
+    len: AtomicU64,
     /// Bit c is set once the name has been seen in country c.
     mask: [AtomicU64; COUNTRIES / 64],
-}
-
-/// The key block a name `s[..len]` (with 32 readable bytes after it and 1 before it) has if it is at most 31 bytes long.
-#[inline(always)]
-unsafe fn block(s: *const u8, len: usize) -> __m256i {
-    let iota = _mm256_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31);
-    let live = _mm256_cmpgt_epi8(_mm256_set1_epi8(len.min(31) as i8 + 1), iota);
-    let v = _mm256_and_si256(_mm256_loadu_si256(s.sub(1) as _), live);
-    _mm256_insert_epi8::<0>(v, len.min(31) as i8 + 1)
+    /// The name's first 24 bytes (zero padded); for a longer name, the offset of its bytes in `Names::spill`.
+    name: [AtomicU64; 3],
 }
 
 /// Every distinct name seen, shared by all workers: an open-addressing table of entries, placed by the low bits of the hash.
@@ -125,16 +116,15 @@ impl Names {
     }
 
     /// Whether entry `i` is the name `s[..len]`.
-    #[inline(always)]
     unsafe fn same(&self, i: usize, s: *const u8, len: usize) -> bool {
         let e = &self.entries[i];
-        let first = e.key[0].load(Acquire); // the rest of the key was written before its first word
-        if len > 31 {
-            let at = e.key[1].load(Relaxed) as usize;
-            return first as u8 == 255 && e.key[2].load(Relaxed) == len as u64 && self.spill[at..at + len] == *std::slice::from_raw_parts(s, len);
+        let l = e.len.load(Acquire); // the name's bytes were written before its length
+        if len > 24 {
+            let at = e.name[0].load(Relaxed) as usize;
+            return l == len as u64 + 1 && self.spill[at..at + len] == *std::slice::from_raw_parts(s, len);
         }
-        let v = block(s, len);
-        first == _mm256_extract_epi64::<0>(v) as u64 && _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_load_si256(e.key.as_ptr() as _), v)) == -1
+        // No branch on the length: the lengths of names are not predictable.
+        (0..3).fold(l ^ (len as u64 + 1), |d, k| d | e.name[k].load(Relaxed) ^ word(s, len, k)) == 0
     }
 
     /// The entry of the name `s[..len]` (`s` must have 32 readable bytes after the name) with hash `h`; adds it if new. `hint` is
@@ -163,7 +153,7 @@ impl Names {
                 continue; // the position was taken meanwhile: look at what is in it now
             }
             if v == t {
-                while self.entries[i].key[0].load(Acquire) == 0 {
+                while self.entries[i].len.load(Acquire) == 0 {
                     std::hint::spin_loop(); // another worker is writing this name
                 }
                 if self.same(i, s, len) {
@@ -177,28 +167,33 @@ impl Names {
     /// Writes the name into the free entry `i`, which this worker has claimed.
     unsafe fn add(&self, i: usize, s: *const u8, len: usize) {
         let e = &self.entries[i];
-        let first = if len <= 31 {
-            let mut k = [0u64; 4];
-            _mm256_storeu_si256(k.as_mut_ptr() as _, block(s, len));
-            (1..4).for_each(|j| e.key[j].store(k[j], Relaxed));
-            k[0]
+        if len <= 24 {
+            for k in 0..3 {
+                e.name[k].store(word(s, len, k), Relaxed);
+            }
         } else {
             let at = self.counts.spilled.fetch_add(len, Relaxed);
             std::ptr::copy_nonoverlapping(s, self.spill.as_ptr().add(at) as *mut u8, len);
-            (e.key[1].store(at as u64, Relaxed), e.key[2].store(len as u64, Relaxed));
-            255
-        };
-        e.key[0].store(first, Release); // publishes the name to the other workers
+            e.name[0].store(at as u64, Relaxed);
+        }
+        e.len.store(len as u64 + 1, Release); // publishes the name to the other workers
     }
 }
 
-/// 64-bit hash of a name from its length and first 31 bytes (its key block). It only places names in the table: every hit
-/// is compared byte for byte.
+/// Bytes 8k.. of the name `s[..len]` as a word, zero padded past the end of the name (8 bytes after 8k must be readable).
 #[inline(always)]
+unsafe fn word(s: *const u8, len: usize, k: usize) -> u64 {
+    (s.add(8 * k) as *const u64).read_unaligned() & ((1u128 << (8 * len.saturating_sub(8 * k).min(8))) - 1) as u64
+}
+
+/// 64-bit hash of a name from its length and its first and last 16 bytes, which must be readable. It only places names in
+/// the table: every hit is compared byte for byte.
 unsafe fn hash(s: *const u8, len: usize) -> u64 {
-    let v = block(s, len);
-    let x = _mm_xor_si128(_mm256_castsi256_si128(v), _mm256_extracti128_si256::<1>(v));
-    let r = (_mm_cvtsi128_si64(x) as u64 ^ 0x9E37_79B9_7F4A_7C15) as u128 * (_mm_extract_epi64::<1>(x) as u64 ^ 0xA076_1D64_78BD_642F ^ len as u64) as u128;
+    let read = |p: *const u8| (p as *const u128).read_unaligned();
+    let head = if len == 0 { 0 } else { read(s) & (!0u128 >> (128 - 8 * len.min(16))) };
+    let tail = if len > 16 { read(s.add(len - 16)) } else { 0 };
+    let x = head ^ tail.rotate_left(61) ^ (len as u128) << 120;
+    let r = (x as u64 ^ 0x9E37_79B9_7F4A_7C15) as u128 * ((x >> 64) as u64 ^ 0xA076_1D64_78BD_642F) as u128;
     r as u64 ^ (r >> 64) as u64
 }
 
@@ -273,22 +268,13 @@ fn digits8(w: u64) -> u64 {
 // The functions that read the buffer without bounds checks rely on one fact: the buffer extends 64 bytes past the data
 // (`PAD`), and every index they use is at most a separator position plus 8.
 
-/// The decimal numbers of `n` digits (1 or more) at `b[i..]` for each `(i, n)`: up to 8 digits each in one AVX2 pass, longer
-/// ones digit by digit.
+/// The decimal number of `n` digits (1 or more) at `b[i..]`. Up to 8 digits are converted at once, without a branch.
 #[inline(always)]
-unsafe fn numbers(b: &[u8], f: [(usize, usize); 3]) -> [u64; 3] {
-    if f.iter().any(|&(_, n)| n > 8) {
-        return f.map(|(i, n)| (i..i + n).fold(0, |v, k| v * 10 + (*b.get_unchecked(k) - b'0') as u64));
+unsafe fn digits(b: &[u8], i: usize, n: usize) -> u64 {
+    if n > 8 {
+        return (i..i + n).fold(0, |v, k| v * 10 + (*b.get_unchecked(k) - b'0') as u64);
     }
-    // Each number's digits go to the high bytes of a word, most significant digit first, zeros before them.
-    let w = f.map(|(i, n)| ((b.as_ptr().add(i) as *const u64).read_unaligned() << (8 * (8 - n))) as i64);
-    let x = _mm256_and_si256(_mm256_setr_epi64x(w[0], w[1], w[2], 0), _mm256_set1_epi8(0x0F));
-    let x = _mm256_maddubs_epi16(x, _mm256_set1_epi16(0x010A)); // pairs of digits
-    let x = _mm256_madd_epi16(x, _mm256_set1_epi32(0x0001_0064)); // groups of four
-    let x = _mm256_add_epi64(_mm256_mul_epu32(x, _mm256_set1_epi64x(10000)), _mm256_srli_epi64::<32>(x));
-    let mut out = [0u64; 4];
-    _mm256_storeu_si256(out.as_mut_ptr() as _, x);
-    [out[0], out[1], out[2]]
+    digits8((b.as_ptr().add(i) as *const u64).read_unaligned() << (8 * (8 - n)))
 }
 
 /// Where the quotes are in a buffer: bit i of word w is set if byte 64 w + i is a `"`, and `before[w]` quotes precede word w.
@@ -364,9 +350,8 @@ unsafe fn record(c: &Ctx, b: &[u8], q: &Quotes, start: usize, sep: &[u32], batch
     (sep_bad == 0 && (!bom || (b.as_ptr().add(start + 1) as *const u16).read_unaligned() == 0xBFBB)).then_some(())?;
     let (neg, cr) = (at(e4 + 1) == b'-', (at(e5 - 1) == b'\r') as usize);
     let (whole_at, dot) = (e4 + 1 + neg as usize, e5 - cr - 3); // the amount ends in ".dd"
-    // The id, the region id and the whole part of the amount, converted together.
-    let [id, region, whole] = numbers(b, [(p, e1 - p), (e3 + 1, e4 - e3 - 1), (whole_at, dot - whole_at)]);
-    let (region, cents) = (region as usize, (whole * 100 + (at(dot + 1) - b'0') as u64 * 10 + (at(dot + 2) - b'0') as u64) as i64);
+    let cents = (digits(b, whole_at, dot - whole_at) * 100 + (at(dot + 1) - b'0') as u64 * 10 + (at(dot + 2) - b'0') as u64) as i64;
+    let (id, region) = (digits(b, p, e1 - p), digits(b, e3 + 1, e4 - e3 - 1) as usize);
     // An unquoted text field has no quotes; a quoted one has its two delimiters and two more for every `""` pair inside.
     let (qname, qnote) = ((q.before(e2) - q.before(e1)) as usize, (q.before(e3) - q.before(e2)) as usize);
     let (name_quoted, note_quoted) = ((qname != 0) as usize, (qnote != 0) as usize);
