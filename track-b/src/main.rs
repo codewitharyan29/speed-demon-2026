@@ -712,6 +712,10 @@ fn main() {
     let sum: Vec<AtomicU64> = (0..queries.len()).map(|_| AtomicU64::new(0)).collect();
     // The ten smallest ids of each query so far, and in the eleventh slot how many of the ten there are.
     let first: Vec<Mutex<[u32; 11]>> = (0..queries.len()).map(|_| Mutex::new([0; 11])).collect();
+    // DIAGNOSTIC: stop before the chunk pass, to read the cost of everything before it from the board.
+    std::fs::write("/out/results.txt", b"").expect("write output");
+    std::process::exit(0);
+    #[allow(unreachable_code)]
     par(CHUNKS, Chunk::default, |w, c| {
         let range = (cut(docs, c, CHUNKS), cut(docs, c + 1, CHUNKS));
         let base = first_doc(range.0);

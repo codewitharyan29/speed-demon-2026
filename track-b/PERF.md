@@ -27,7 +27,7 @@ They are only used to compare variants, never reported as results.
 | 15 | Phrases checked on each document's term-id sequence at their rarest term (no pair postings, bloom filter or re-tokenising) | cc9739a | 0.248 | 42 | 69.006 (K 24.00, 755 lines) |
 | 17 | 60 chunks instead of 64: five per thread, no idle tail | 6921432 | 0.242 | 43 | 69.285 (K 24.31, 755 lines) |
 | 18 | Less single-threaded work: queries parsed in 12 pieces at once, no rebuild of the term table, a 1% sample | d324374 | 0.207 | 44 | 70.947 (K 26.24, 756 lines) |
-| 19 | Terms numbered straight into the scan's probe table (no separate term table, no second build) | pending | | | |
+| 19 | Terms numbered straight into the scan's probe table (no separate term table, no second build) | 0dd42d9 | 0.206 | 38 | 71.142 (K 26.48, 734 lines) |
 
 ## Local measurements behind step 2 (in-process ms, median)
 
@@ -400,3 +400,15 @@ metadata. The generic term table, its hash function and the second build of the 
 
 Verified on full seeds 1 and 2, sample seeds 1-3, tiny seeds 1-6, the worked example, and a hand-made case with 17-,
 21-, 32- and 40-byte tokens in BOOL and PHRASE queries (matches the reference).
+
+## Board diagnostics (labelled DIAGNOSTIC; they write wrong output on purpose, T and M are still reported)
+
+The leaders are at 0.074-0.117 s, which is ~30 core cycles per token on the box against our ~85, and this laptop
+cannot say where the box spends its time. Each diagnostic is the step-19 code with one part cut off:
+
+| Diagnostic | What runs | Local (ms) | Board T | Board M |
+|---|---|---|---|---|
+| D1 | everything up to the chunk pass, then exit | ~15 | pending | |
+| D2 | + the chunk pass tokenising only (no lookups, no BOOL evaluation), + output | 37 | pending | |
+| D3 | everything but the per-chunk BOOL evaluation | ~115 | pending | |
+| (full) | step 19 | 144 | 0.206 | 38 |
