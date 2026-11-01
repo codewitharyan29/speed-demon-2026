@@ -322,23 +322,24 @@ struct Run {
   }
 };
 
-// ---- Shared results, by query.
-u32* g_count;
-u64* g_sum;
-u32* g_first;  // per query: its ten smallest ids so far, and in the eleventh slot how many there are
+// ---- Results, by query: each thread adds its chunks' counts and sums into its own arrays (added up at the end); the
+// ten smallest ids so far (and in the eleventh slot how many there are) are shared.
+u32* g_first;
 std::mutex g_mu[64];
 
 // Adds one chunk's answer for query q: the chunk's documents are base + the ids in `run`.
-void report(u32 q, const Run& run, u32 base) {
+void report(u32 q, const Run& run, u32 base, u32* count, u64* sum) {
   u64 c, s;
   CYTS(5) run.size_sum(c, s);
   CYT(5)
   if (!c) return;
   u32 cand[20], k = 0, m = 0;
-  __atomic_fetch_add(&g_count[q], (u32)c, __ATOMIC_RELAXED);
-  __atomic_fetch_add(&g_sum[q], s + c * base, __ATOMIC_RELAXED);
-  std::lock_guard<std::mutex> lock(g_mu[q & 63]);
+  count[q] += c;
+  sum[q] += s + c * base;
   u32* f = g_first + q * 11;
+  // No lock when the ten smallest are known and all below this chunk (they only ever get smaller).
+  if (__atomic_load_n(&f[10], __ATOMIC_RELAXED) == 10 && __atomic_load_n(&f[9], __ATOMIC_RELAXED) <= base) return;
+  std::lock_guard<std::mutex> lock(g_mu[q & 63]);
   if (f[10] == 10 && f[9] <= base) return;
   for (; k < f[10]; k++) cand[k] = f[k];
   m = run.smallest(cand + k);
@@ -359,7 +360,8 @@ struct Worker {
   u64* h;
   u32 *ids, *tp, *dend, *uniq, *slow;
   u16* stamp;
-  u32 *df, *start, *pairs, pcap;
+  u32 *df, *start, *pairs, pcap, *count;
+  u64* sum;
   u16* post;
   u32 postcap;
   u64* rows;
@@ -524,7 +526,8 @@ std::barrier<> g_bar(kThreads);
 std::vector<Worker*> g_workers(kThreads);
 std::vector<u32> g_dfall, g_fin, g_pay;
 std::atomic<u32> g_next{0};
-u8* g_out;
+u64 g_osz[kThreads];
+int g_fd;
 
 inline u8* put(u8* o, u64 x) {
   u8 buf[20];
@@ -554,11 +557,13 @@ void worker(int tid) {
   g_psize[tid] = pc.size();
   g_bar.arrive_and_wait();
   PH(1)
+  u32 nq = 0;
   {
     u32 o = 0;
     for (int t = 0; t < tid; t++) o += g_psize[t];
     memcpy(&g_queries[o], pc.data(), pc.size() * sizeof(Query));
-    if (tid == kThreads - 1) g_nq = o + pc.size();
+    for (int t = 0; t < kThreads; t++) nq += g_psize[t];
+    g_nq = nq;
     std::vector<Query>().swap(pc);
   }
 
@@ -571,6 +576,8 @@ void worker(int tid) {
   w.tp = alloc<u32>(kCap + 64);
   w.uniq = alloc<u32>(kCap + 64);
   w.slow = alloc<u32>(kCap + 64);
+  w.count = alloc<u32>(nq);
+  w.sum = alloc<u64>(nq);
   w.dend = alloc<u32>(256);
   g_workers[tid] = &w;
   u64 sa = cut(g_d, tid, 96 * kSamples), sb = cut(g_d, tid + 1, 96 * kSamples);
@@ -694,7 +701,7 @@ void worker(int tid) {
       run.dense = false;
       run.n = 0;
       for (; i < w.found.size() && w.found[i] >> kDocBits == q; i++) run.list[run.n++] = w.found[i] & ((1 << kDocBits) - 1);
-      report(q, run, base);
+      report(q, run, base, w.count, w.sum);
     }
     // Every BOOL query, on this chunk's documents.
     for (u32 q : g_bool) {
@@ -703,37 +710,44 @@ void worker(int tid) {
       if (x.b == nullptr && x.n == 0 && !qq.has_or) continue;
       run.start(x);
       for (u32 k = 0; k + 1 < qq.n; k++) run.apply(qq.ops[k], operand(qq.t[k + 1]));
-      report(q, run, base);
+      report(q, run, base, w.count, w.sum);
     }
     CY(1)
   }
   g_bar.arrive_and_wait();
   PH(7)
 
-  // ---- Output.
-  if (tid == 0) {
-    u8* o = g_out = (u8*)mmap(nullptr, (size_t)g_nq * 112 + 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    u8* o0 = o;
-    for (u32 q = 0; q < g_nq; q++) {
-      o = put(o, g_count[q]);
+  // ---- Output: each thread adds up the counts and sums of a twelfth of the queries, formats them, and writes them at
+  // their place in the file.
+  u32 q0 = (u64)g_nq * tid / kThreads, q1 = (u64)g_nq * (tid + 1) / kThreads;
+  u8 *buf = alloc<u8>((size_t)(q1 - q0) * 144 + 64), *o = buf;
+  for (u32 q = q0; q < q1; q++) {
+    u32 c = 0;
+    u64 sum = 0;
+    for (int x = 0; x < kThreads; x++) c += g_workers[x]->count[q], sum += g_workers[x]->sum[q];
+    o = put(o, c);
+    *o++ = ' ';
+    o = put(o, sum);
+    const u32* f = g_first + q * 11;
+    for (u32 i = 0; i < f[10]; i++) {
       *o++ = ' ';
-      o = put(o, g_sum[q]);
-      const u32* f = g_first + q * 11;
-      for (u32 i = 0; i < f[10]; i++) {
-        *o++ = ' ';
-        o = put(o, f[i]);
-      }
-      *o++ = '\n';
+      o = put(o, f[i]);
     }
-    PH(8)
-    int fd = open("/out/results.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    size_t left = o - o0;
-    for (const u8* p = o0; left;) {
-      ssize_t n = write(fd, p, left);
-      if (n <= 0) break;
-      p += n;
-      left -= n;
-    }
+    *o++ = '\n';
+  }
+  g_osz[tid] = o - buf;
+  if (tid == 0) g_fd = open("/out/results.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  PH(8)
+  g_bar.arrive_and_wait();
+  off_t at = 0;
+  for (int x = 0; x < tid; x++) at += g_osz[x];
+  for (size_t done = 0; done < g_osz[tid];) {
+    ssize_t n = pwrite(g_fd, buf + done, g_osz[tid] - done, at + done);
+    if (n <= 0) break;
+    done += n;
+  }
+  g_bar.arrive_and_wait();
+  if (tid == 0) {
     PH(9)
 #ifdef SD_PHASES
     {
@@ -766,8 +780,6 @@ int main() {
   g_ndocs = first_doc(last ? last + 1 - g_d.p : 0) + 1;
   size_t maxq = g_q.n / 7 + 16;  // a query takes at least 7 bytes
   g_queries.reset(new Query[maxq]);
-  g_count = alloc<u32>(maxq);
-  g_sum = alloc<u64>(maxq);
   g_first = alloc<u32>(maxq * 11);
   g_dfall.assign(kMaxProv + 1, 0);
   std::thread th[kThreads - 1];
