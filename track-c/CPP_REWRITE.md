@@ -119,3 +119,22 @@ Changes against cx3:
 Local before the run: -1.6% (4 threads), -1.7% (2 threads), -10% on sample; RSS equal; 27/27 fixtures (normal, 200-byte
 blocks/3,000-byte chunks, board flags), ASan/UBSan/TSan clean on 6 inputs. Board: T -0.96 ms, M +0.19 MB (inside the board's
 spread), K +1.2%. **Promoted:** speed-demon's Track C is cx5. Recovery points: `4452f30` (cx3), `6ec50ad`, `4e11c91` (Rust).
+
+## After cx5: candidates measured locally, none submitted (Nov 1-2)
+
+Production stays cx5 (K 31.88). Every candidate below matches the reference on all fixtures (tiny, sample, full seed 1,
+adversarial, hostile-LF, stress1-3, twins). Local = KVM, 4 vCPUs, interleaved runs, cx5 in the same run. Sources are in
+`docs/track-c-cpp-candidates/`.
+
+| ID | Hypothesis | Local T vs cx5 | RSS | S | Decision |
+|---|---|---|---:|---:|---|
+| cx6 (`cx6_double_buffer.cpp`) | double-buffered input, so the three-batch pipeline drains only at chunk ends | 4 threads -0.7% (noise), 2 threads +4.4% | +0.3 MB | 444 | rejected |
+| cx7 (`cx7_table_slots.cpp`, `-DSLOTS=`) | a name table smaller than 2^17 (index by multiply-shift, 1,024 entries kept free) to cut M | 114,688 slots: +3%; 122,880: -1% then +2.6% (noise); 110,592: +9% | -1.0 / -0.5 / -1.3 MB | 437 | rejected: at load 0.87, 5% of lookups pass the 16-tag window (simulated), and that cost is about what the M saving gives |
+| cx8 (`cx8_huge_table_prefault.cpp`) | the 8 MB entry table in 2 MiB pages (`MADV_HUGEPAGE` + `MADV_POPULATE_WRITE` before `PR_SET_THP_DISABLE`), so a random entry is no TLB miss | first sets -2.4 to -5%; with 120-150 rounds x 2: +0.0 to +2.0% at 4 threads, -2.6% at 1 thread | equal | 439 | rejected: no gain under parallel load |
+| cx9 | as cx8 but faulted lazily, with `PR_SET_THP_DISABLE` flag 2 (THP only where advised, kernel 6.18) | about -1% | equal | 437 | rejected: a read of an unfaulted entry maps the zero page, the write after it falls back to 4 KiB pages, so only 0-2 of 4 huge pages are used |
+| cx11 (`cx11_huge_table_parallel.cpp`) | as cx9, with each 2 MiB page populated for writing by one worker in phase 0 (8 MB in huge pages, checked in smaps) | +0.3 / +3.2% at 4 threads; -1.8% at 1 thread | equal | 445 | rejected |
+
+What this shows: TLB misses on the name table are not a measurable part of the parallel run, and the table's size can only shrink
+by giving up the one-line-per-lookup property, which every board result so far has rewarded. Not tried, with reasons: mmap input
+(three board measurements on Track A, all slower, including per-chunk populate), block/batch/chunk size sweeps (the VM's L2 and
+fill-buffer limits differ from the board's SMT pairs, so a locally neutral setting would have no basis for a board run).
