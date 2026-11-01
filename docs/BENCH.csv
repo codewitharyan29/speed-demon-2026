@@ -15,3 +15,5 @@ board,5806282,run-88a3e5416bb7,52.6,16.2,604,23.90,"back to batches of 16; dead 
 board,f8c5b1c,run-7d972f222c6a,52.9,16.2,604,23.73,"same source as 5806282 (repeat)"
 board,704be8c,run-2a43e35c614d,53.16,16.3,608,23.70,"lazy region table, 48 pieces: not better, reverted"
 board,c0a86ae,run-df1808806b72,55.77,16.4,604,23.14,"same source as 5806282 (third run: board noise up to 6%)"
+board,5586502,run-8836fdcebdbb,55.81,15.3,606,23.44,"u32 slots"
+board,95582d0,run-c30f1d80a49f,52.85,15.5,605,24.05,"branch-free compare + hint (final)"
