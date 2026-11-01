@@ -26,7 +26,8 @@ They are only used to compare variants, never reported as results.
 | 14 | Board experiment: tokens looked up 16 at a time instead of 48 (the box has 16 L1D fill buffers per core, shared by two threads) | 6f0f6e7 | 0.262 | 45 | 68.055 (K 22.97, 805 lines); reverted to 48 |
 | 15 | Phrases checked on each document's term-id sequence at their rarest term (no pair postings, bloom filter or re-tokenising) | cc9739a | 0.248 | 42 | 69.006 (K 24.00, 755 lines) |
 | 17 | 60 chunks instead of 64: five per thread, no idle tail | 6921432 | 0.242 | 43 | 69.285 (K 24.31, 755 lines) |
-| 18 | Less single-threaded work: queries parsed in 12 pieces at once, no rebuild of the term table, a 1% sample | pending | | | |
+| 18 | Less single-threaded work: queries parsed in 12 pieces at once, no rebuild of the term table, a 1% sample | d324374 | 0.207 | 44 | 70.947 (K 26.24, 756 lines) |
+| 19 | Terms numbered straight into the scan's probe table (no separate term table, no second build) | pending | | | |
 
 ## Local measurements behind step 2 (in-process ms, median)
 
@@ -376,3 +377,26 @@ and rebuilding the term table 3.1, sample 5.4 (12 threads), df sums, triggers, t
 | + a 1% sample instead of 2% (only steers bitset and trigger choices) | 11.3-12.6 | 19.2-20.4 | 158 | kept |
 
 Verified on full seeds 1 and 2, sample seeds 1-3, tiny seeds 1-6 and the worked example; `memory.peak` 40 MB local; +1 line.
+
+Board: 0.242 -> 0.207 s for step 18, far more than the ~5 ms it saved here. The box pays much more for single-threaded
+work than this laptop does (one core at 2.5 GHz against ~4.8 GHz turbo, and its page faults and cache misses), so
+everything before and after the chunk pass is worth cutting even when it barely shows here.
+
+## Step 19: number the terms straight into the probe table (local, in-process ms)
+
+Phases after step 18 (local): parse 2.8 (12 threads), numbering 6.8, query list 2.0, sample 4.2 (12 threads), df sums
+and triggers 2.1, building the probe table 2.5, accumulators 0.9, chunks ~132, formatting 4.1.
+
+The scan's probe table can number the terms itself: it is created empty with room for every term occurrence (so an
+insert always finds a free lane; spills now wrap around instead of using 64 spare buckets), `intern` stores a new key
+with the next id as its metadata, terms over 16 bytes (none in the generated data) go into a short list, the sample
+looks tokens up in the probe table, and once the flags are known every stored id is rewritten in place into the scan's
+metadata. The generic term table, its hash function and the second build of the probe table are gone.
+
+| Version | Numbering done by | Setup done by | 12 threads (median of 11) | `memory.peak` | Lines |
+|---|---|---|---|---|---|
+| Step 18 | 10.6-11.2 | 18.3-19.1 | 159 | 40 MB | 749 |
+| Probe table numbers the terms | 7.5-10.8 | 14.4-18.1 | 157 | 37 MB | 727 |
+
+Verified on full seeds 1 and 2, sample seeds 1-3, tiny seeds 1-6, the worked example, and a hand-made case with 17-,
+21-, 32- and 40-byte tokens in BOOL and PHRASE queries (matches the reference).
