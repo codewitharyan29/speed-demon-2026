@@ -247,7 +247,9 @@ struct Worker {
       Rec &r = b[k][i];
       u8 c = region[r.reg];
       Entry *e = names->find(r.name, r.len, key(r.name, r.len), r.hash, r.hint);
-      e->mask[c / 64].fetch_or(1ULL << c % 64, RX);
+      // The one worker that sets a bit counts the name for the country.
+      u64 bit = 1ULL << (c & 63);
+      counts[c] += !(e->mask[c >> 6].fetch_or(bit, RX) & bit);
       Agg &a = agg[c];
       a.count++, a.ids += r.id, a.sum += r.cents, a.nb += r.nb, a.tb += r.tb;
       a.lo = min(a.lo, r.cents), a.hi = max(a.hi, r.cents);
@@ -315,8 +317,11 @@ static string run(int bits, size_t chunk) {
   rd(fd_rec, h0, hn, 0);
   u8 *nl = (u8 *)memchr(h0, '\n', hn); // the header has no quotes
   if (!nl) return {};
-  size_t chunks = (n_rec + chunk - 1) / chunk, threads = thread::hardware_concurrency();
-  vector<size_t> starts(chunks + 1);
+  // Cuts every `chunk` bytes, then (past 85% of the file) every chunk / 8, so that the workers finish together.
+  vector<size_t> cuts{0}, starts;
+  while (cuts.back() < n_rec) cuts.push_back(cuts.back() + (cuts.back() < n_rec / 20 * 17 ? chunk : chunk / 8));
+  size_t chunks = cuts.size() - 1, threads = thread::hardware_concurrency();
+  starts.resize(chunks + 1);
   cpu_set_t set;
   if (!sched_getaffinity(0, sizeof set, &set)) threads = CPU_COUNT(&set);
   threads = max<size_t>(threads, 1);
@@ -356,17 +361,11 @@ static string run(int bits, size_t chunk) {
       }
     }
     for (size_t j; (j = job(1, chunks + 1)) != SIZE_MAX;)
-      starts[j] = !j ? nl - h0 + 1 : j == chunks ? n_rec : record_start(j * chunk);
+      starts[j] = !j ? nl - h0 + 1 : j == chunks ? n_rec : record_start(cuts[j]);
     sync.arrive_and_wait();
     for (size_t j; !bad && (j = job(2, chunks)) != SIZE_MAX;)
       if (starts[j] < starts[j + 1] && !ws[me].chunk(starts[j], starts[j + 1]))
         bad = true;
-    sync.arrive_and_wait();
-    for (size_t j; (j = job(3, names->n / 4096)) != SIZE_MAX;)
-      for (size_t i = j * 4096; i < j * 4096 + 4096; i++)
-        for (int k = 0; k < 4; k++)
-          for (u64 m = names->e[i].mask[k].load(RX); m; m &= m - 1)
-            ws[me].counts[k * 64 + __builtin_ctzll(m)]++;
   };
   vector<thread> pool;
   for (size_t i = 1; i < threads; i++) pool.emplace_back(work, i);
