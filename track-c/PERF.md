@@ -31,9 +31,10 @@ D = 1 throughout (no dependencies). Output hash on every row below: the board's 
 | 15 | 33ea307 | region table and name slots as lazily zeroed pages, alone | run-e1b6b13c4d77 | 54.9 | 16.2 | 612 | 23.34 |
 | 16 | f8c5b1c | source of row 12 again (repeat) | run-7d972f222c6a | 52.9 | 16.2 | 604 | 23.73 |
 | 17 | 704be8c | region table only as lazily zeroed pages, 48 pieces | run-2a43e35c614d | 53.16 | 16.3 | 608 | 23.70 |
+| 18 | c0a86ae | source of row 12 once more (final HEAD) | run-df1808806b72 | 55.77 | 16.4 | 604 | 23.14 |
 
 Kept: 1, 3, 4, 7, 8, 10, 12 (13-15 reverted: 64 KiB blocks and eagerly written zeros are the best measured). Rejected or reverted: 2 (equal to 1 within noise, kept for the instruction counts it enabled), 6 (alone: M
-37.5 MB until THP was disabled, then kept as part of 7), 9 (fewer instructions but 2.1 ms slower on the board, cause not found), 11. Rows 5 and 16 show the board's run-to-run noise: 0.04% on one pair, 0.6% (52.6 vs 52.9 ms) on the other, so differences below about 0.5 ms are not distinguishable.
+37.5 MB until THP was disabled, then kept as part of 7), 9 (fewer instructions but 2.1 ms slower on the board, cause not found), 11. Rows 5 and 16 show the board's run-to-run noise: 0.04% on one pair, 6% (52.6, 52.9 and 55.8 ms for the same source, rows 12, 16, 18) on the other, so differences below about 3 ms are not distinguishable.
 Rows 16-17 are not improvements; the final source is the one of row 12.
 
 ## Board diagnostics (labelled; they print wrong output on purpose, T and M are still reported)

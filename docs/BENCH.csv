@@ -14,3 +14,4 @@ board,d1bc253,run-0682687bde57,54.3,16.5,652,23.16,"batches of 32 + lazily zeroe
 board,5806282,run-88a3e5416bb7,52.6,16.2,604,23.90,"back to batches of 16; dead code removed"
 board,f8c5b1c,run-7d972f222c6a,52.9,16.2,604,23.73,"same source as 5806282 (repeat)"
 board,704be8c,run-2a43e35c614d,53.16,16.3,608,23.70,"lazy region table, 48 pieces: not better, reverted"
+board,c0a86ae,run-df1808806b72,55.77,16.4,604,23.14,"same source as 5806282 (third run: board noise up to 6%)"
