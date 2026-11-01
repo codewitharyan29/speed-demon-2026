@@ -385,6 +385,13 @@ void scan(Worker& w, u64 from, u64 to, u32 first_doc, u32 base, u32 wl) {
   u64 carry_a = 0, carry_nl = 1, in_id = 0, open = ~0ULL;
   auto flush = [&]() {
     CYTS(2) u32 end = w.dend[nd - 1], nslow = 0;
+    if (!kSample) {  // DIAGNOSTIC DB: tokenise and hash only
+      memmove(w.h, w.h + end, (nt - end) * 8);
+      nt -= end;
+      done += nd;
+      nd = 0;
+      return;
+    }
     // Look up every token (id, and bit 17 if the term triggers phrases); the lines are prefetched a few tokens ahead.
     for (u32 i = 0; i < end; i++) {
       __builtin_prefetch(g_tab + (w.h[i + kAhead] & (kLines - 1)) * 8);
