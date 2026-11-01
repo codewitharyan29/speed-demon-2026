@@ -788,7 +788,6 @@ void worker(int tid) {
 }  // namespace
 
 int main() {
-  prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
   g_q = map_file("/data/queries.txt");
   g_d = map_file("/data/docs.txt");
   const char* last = (const char*)memrchr(g_d.p, '\n', g_d.n - 1);
