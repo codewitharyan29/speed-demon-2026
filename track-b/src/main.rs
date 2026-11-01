@@ -9,7 +9,7 @@ extern "C" {
 }
 
 const THREADS: usize = 12;
-const CHUNKS: usize = 96;
+const CHUNKS: usize = 48;
 const ONES: u64 = 0x0101010101010101;
 const DOC_BITS: u32 = 14;
 const NO_BITS: u32 = 0xFFF;
