@@ -16,7 +16,8 @@ use std::arch::x86_64::*;
 use std::fs::File;
 use std::io::Write;
 use std::os::unix::fs::FileExt;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
 
 extern "C" {
     fn prctl(option: i32, ...) -> i32;
@@ -224,8 +225,7 @@ struct Batch {
 struct Ctx<'a> {
     file: &'a File,
     len: usize,
-    region: &'a [AtomicU16], // region_id -> packed country code + 1 (0: no such region)
-    dense: &'a [u16],        // packed country code + 1 -> index into the totals (0: _UNMATCHED, which is last)
+    region: &'a [AtomicU8], // region_id -> index of its country in the totals (0: no such region, which is _UNMATCHED)
     names: &'a Names,
 }
 
@@ -338,7 +338,7 @@ unsafe fn record(c: &Ctx, b: &[u8], q: &Quotes, start: usize, sep: &[u32], batch
     let hash = hash(name, len);
     _mm_prefetch::<_MM_HINT_T0>(c.names.slot(hash) as *const AtomicU32 as *const i8);
     if let Some(r) = c.region.get(region) {
-        _mm_prefetch::<_MM_HINT_T0>(r as *const AtomicU16 as *const i8);
+        _mm_prefetch::<_MM_HINT_T0>(r as *const AtomicU8 as *const i8);
     }
     let cents = if neg { -cents } else { cents };
     batch.recs.push(Rec { id, cents, region, name, len, hash, hint: 0, note_bytes: note_len });
@@ -348,7 +348,7 @@ unsafe fn record(c: &Ctx, b: &[u8], q: &Quotes, start: usize, sep: &[u32], batch
 /// Looks up the countries and names of the records in `batch` and adds them to `aggs`.
 fn resolve(c: &Ctx, batch: &mut Batch, aggs: &mut [Agg]) {
     for r in batch.recs.iter() {
-        let country = c.dense[c.region.get(r.region).map_or(0, |x| x.load(Relaxed)) as usize] as usize;
+        let country = c.region.get(r.region).map_or(0, |x| x.load(Relaxed)) as usize;
         // SAFETY: the name has 32 readable bytes after it, as `record` ensured.
         let name = unsafe { c.names.entry(r.name, r.len, r.hash, r.hint) };
         name.mask[country / 64].fetch_or(1 << (country % 64), Relaxed);
@@ -454,7 +454,8 @@ fn run(regions: &File, file: &File, len: usize, bits: u32, chunk: usize) -> Opti
     let first = head.iter().position(|&c| c == b'\n')? + 1;
     let last = tail[..63].iter().rposition(|&c| c == b'\n')? + 1;
     let max_id = tail[last..].iter().take_while(|c| c.is_ascii_digit()).fold(0, |v, &c| v * 10 + (c - b'0') as usize);
-    let (region, seen): (Vec<AtomicU16>, Vec<AtomicBool>) = (zeros(max_id + 1), zeros(26 * 26 * 26 + 1));
+    // Countries get indices 1, 2, ... in the order the pieces meet them (0 is _UNMATCHED); the output is sorted afterwards.
+    let (region, index, codes): (Vec<AtomicU8>, Vec<AtomicU8>, _) = (zeros(max_id + 1), zeros(26 * 26 * 26), Mutex::new(vec![]));
     let pieces = 16;
     let cut = |j: usize| match j {
         0 => first,
@@ -475,27 +476,30 @@ fn run(regions: &File, file: &File, len: usize, bits: u32, chunk: usize) -> Opti
             if text[i] != b',' || text[i + 4] != b'\n' || id > max_id || !country.iter().all(|c| c.is_ascii_uppercase()) {
                 return None;
             }
-            let code = country.iter().fold(0, |v, &c| v * 26 + (c - b'A') as usize) + 1;
-            region[id].store(code as u16, Relaxed);
-            seen[code].store(true, Relaxed);
+            let code = country.iter().fold(0, |v, &c| v * 26 + (c - b'A') as usize);
+            if index[code].load(Relaxed) == 0 {
+                let mut codes = codes.lock().unwrap();
+                if index[code].load(Relaxed) == 0 {
+                    codes.push(code);
+                    index[code].store(u8::try_from(codes.len()).ok()?, Relaxed);
+                }
+            }
+            region[id].store(index[code].load(Relaxed), Relaxed);
             p = i + 5;
         }
         (p == len).then_some(())
     });
     parsed.iter().all(|r| r.is_some()).then_some(())?;
-    // Countries get indices in the order of their packed codes, which is the byte order of the codes; _UNMATCHED is last.
-    let (mut dense, mut keys) = (vec![0u16; seen.len()], vec![]);
-    for code in (1..seen.len()).filter(|&c| seen[c].load(Relaxed)) {
-        dense[code] = keys.len() as u16;
-        keys.push(vec![b'A' + ((code - 1) / 676) as u8, b'A' + ((code - 1) / 26 % 26) as u8, b'A' + ((code - 1) % 26) as u8]);
-    }
-    dense[0] = keys.len() as u16;
-    keys.push(b"_UNMATCHED".to_vec());
-    let countries = keys.len();
-    (countries <= COUNTRIES).then_some(())?;
+    // The output order: the countries by their codes, then _UNMATCHED.
+    let mut order: Vec<(Vec<u8>, usize)> = (codes.into_inner().ok()?.into_iter())
+        .map(|code| (vec![b'A' + (code / 676) as u8, b'A' + (code / 26 % 26) as u8, b'A' + (code % 26) as u8], index[code].load(Relaxed) as usize))
+        .collect();
+    order.sort();
+    order.push((b"_UNMATCHED".to_vec(), 0));
+    let countries = order.len(); // at most 256: the indices are bytes
 
     let names = Names::new(bits);
-    let ctx = Ctx { file, len, region: &region, dense: &dense, names: &names };
+    let ctx = Ctx { file, len, region: &region, names: &names };
     let mut head = [0u8; 256];
     file.read_exact_at(&mut head[..len.min(256)], 0).ok()?;
     let body = head.iter().position(|&c| c == b'\n')? + 1; // the header has no quotes
@@ -543,8 +547,8 @@ fn run(regions: &File, file: &File, len: usize, bits: u32, chunk: usize) -> Opti
         counts
     });
     let mut out = vec![];
-    for (c, (key, a)) in keys.iter().zip(&total).enumerate().filter(|(_, (_, a))| a.count > 0) {
-        let distinct: u64 = parts.iter().map(|p| p[c]).sum();
+    for (key, c) in order.iter().filter(|(_, c)| total[*c].count > 0) {
+        let (a, distinct) = (&total[*c], parts.iter().map(|p| p[*c]).sum::<u64>());
         out.extend_from_slice(key);
         let (sum, min, max) = (money(a.sum), money(a.min), money(a.max));
         let line = format!(" {} {} {sum} {min} {max} {distinct} {} {}\n", a.count, a.id_sum, a.name_bytes, a.note_bytes);
