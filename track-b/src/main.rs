@@ -6,7 +6,6 @@ use std::sync::Mutex;
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
-    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
 }
 
 const THREADS: usize = 12;
@@ -16,7 +15,7 @@ const DOC_BITS: u32 = 14;
 const BLOOM_BITS: u32 = 20;
 const NO_BITS: u32 = 0xFFF;
 /// Tokens handed over at a time: enough independent table lookups to keep many cache misses in flight.
-const BATCH: usize = 48;
+const BATCH: usize = 16;
 
 /// Maps a file read-only. The mapping is never unmapped, so the slice is 'static.
 fn map(path: &str) -> &'static [u8] {
@@ -233,7 +232,7 @@ struct Bucket {
 /// in a generated corpus has 17). A lookup compares a whole bucket at once; a full bucket spills into the next one,
 /// and only then, as `spilled` records, does a lookup go on to the next bucket.
 struct Probe {
-    buckets: &'static mut [Bucket],
+    buckets: Vec<Bucket>,
     spilled: Vec<u64>,
     shift: u32,
 }
@@ -241,18 +240,9 @@ struct Probe {
 impl Probe {
     fn new(keys: &[[u64; 4]], meta: impl Fn(usize) -> u32) -> Probe {
         let bits = (keys.len() / 2).next_power_of_two().trailing_zeros().max(1);
-        let n = 1 << bits;
-        // The table is randomly accessed by every thread: 2 MB pages (MADV_HUGEPAGE) keep its TLB entries few. It is
-        // zeroed, aligned to 2 MB and never freed. A full bucket spills into the next one, wrapping around at the end.
-        let layout = std::alloc::Layout::from_size_align(n * 64, 2 << 20).unwrap();
-        // SAFETY: a fresh zeroed allocation of `n` buckets; all-zero bytes are a valid (empty) bucket.
-        let buckets = unsafe {
-            let at = std::alloc::alloc_zeroed(layout);
-            madvise(at, layout.size(), 14);
-            std::slice::from_raw_parts_mut(at as *mut Bucket, n)
-        };
+        let n = (1 << bits) + 64;
         let mut p = Probe {
-            buckets,
+            buckets: vec![Bucket::default(); n],
             spilled: vec![0; n / 64 + 1],
             shift: 64 - bits,
         };
@@ -260,7 +250,7 @@ impl Probe {
             let mut i = p.bucket((k[0], k[1]));
             while let None = p.buckets[i].k0.iter().position(|&x| x == 0) {
                 p.spilled[i / 64] |= 1 << (i % 64);
-                i = (i + 1) % n;
+                i += 1;
             }
             let b = &mut p.buckets[i];
             let lane = b.k0.iter().position(|&x| x == 0).unwrap();
@@ -292,7 +282,7 @@ impl Probe {
             if hit != 0 || self.spilled[i / 64] >> (i % 64) & 1 == 0 {
                 return if hit != 0 { found } else { miss };
             }
-            i = (i + 1) % self.buckets.len();
+            i += 1;
         }
     }
 }
