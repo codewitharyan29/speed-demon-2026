@@ -1,14 +1,17 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
 
 #[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+use std::arch::x86_64::{
+    __m256i, _mm256_cmpgt_epi8, _mm256_loadu_si256, _mm256_movemask_epi8, _mm256_set1_epi8,
+    _mm_prefetch, _MM_HINT_T0,
+};
 
 const THREADS: usize = 12;
 const CHUNKS: usize = 48;
 const REGION: usize = 1 << 15;
-const WINDOW: usize = 1 << 14;
+const WINDOW: usize = 1 << 12;
 
 #[cfg(unix)]
 fn map(path: &str) -> &'static [u8] {
@@ -48,22 +51,50 @@ fn num(b: &[u8], p: &mut usize) -> u64 {
 }
 
 #[inline(always)]
-unsafe fn parse_fast_u32(b: &[u8], p: &mut usize) -> u32 {
-    if *p + 8 <= b.len() {
-        let raw = (b.as_ptr().add(*p) as *const u64).read_unaligned();
-        let len = ((raw.wrapping_sub(0x3030303030303030) & 0x8080808080808080).trailing_zeros() / 8)
-            as usize;
-        if len < 8 {
-            let x = raw << (8 * (8 - len));
-            let x = ((x & 0x0F0F0F0F0F0F0F0F).wrapping_mul(2561) >> 8) & 0x00FF00FF00FF00FF;
-            let x = (x.wrapping_mul(6553601) >> 16) & 0x0000FFFF0000FFFF;
-            *p += len + 1;
-            return (x.wrapping_mul(42949672960001) >> 32) as u32;
+unsafe fn parse_swar_exact(p: *const u8, len: usize) -> u32 {
+    let raw = (p as *const u64).read_unaligned();
+    let x = raw << (8 * (8 - len));
+    let x = ((x & 0x0F0F0F0F0F0F0F0F).wrapping_mul(2561) >> 8) & 0x00FF00FF00FF00FF;
+    let x = (x.wrapping_mul(6553601) >> 16) & 0x0000FFFF0000FFFF;
+    (x.wrapping_mul(42949672960001) >> 32) as u32
+}
+
+#[inline(always)]
+unsafe fn parse_line(chunk: &[u8], p: &mut usize) -> (u32, u32, u32) {
+    while *p < chunk.len() && *chunk.get_unchecked(*p) < b'0' {
+        *p += 1;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if *p + 32 <= chunk.len() {
+        let vchunk = _mm256_loadu_si256(chunk.as_ptr().add(*p) as *const __m256i);
+        let mask = _mm256_movemask_epi8(_mm256_cmpgt_epi8(_mm256_set1_epi8(0x30), vchunk)) as u32;
+        let p0 = mask.trailing_zeros() as usize;
+        let m1 = mask & (mask - 1);
+        let p1 = m1.trailing_zeros() as usize;
+        let p2 = (m1 & (m1 - 1)).trailing_zeros() as usize;
+        if p2 < 32
+            && p0 < 8
+            && (p1 - p0 - 1) < 8
+            && (p2 - p1 - 1) < 8
+            && *chunk.get_unchecked(*p + p0) == b' '
+            && *chunk.get_unchecked(*p + p1) == b' '
+            && *chunk.get_unchecked(*p + p2) == b'\n'
+        {
+            let base = chunk.as_ptr().add(*p);
+            let u = parse_swar_exact(base, p0);
+            let v = parse_swar_exact(base.add(p0 + 1), p1 - p0 - 1);
+            let w = parse_swar_exact(base.add(p1 + 1), p2 - p1 - 1);
+            *p += p2 + 1;
+            return (u, v, w);
         }
     }
-    let x = num(b, p) as u32;
+    let u = num(chunk, p) as u32;
     *p += 1;
-    x
+    let v = num(chunk, p) as u32;
+    *p += 1;
+    let w = num(chunk, p) as u32;
+    *p += 1;
+    (u, v, w)
 }
 
 fn par<S, R: Send>(
@@ -101,12 +132,12 @@ fn par<S, R: Send>(
     all.into_iter().map(|r| r.1).collect()
 }
 
+#[repr(align(64))]
 struct PoolDial {
     head: [u32; WINDOW],
     bitmap: [u64; WINDOW / 64],
-    summary: [u64; 4],
-    pool_node: Vec<u32>,
-    pool_next: Vec<u32>,
+    summary: u64,
+    pool: Vec<u64>,
     free_head: u32,
     at: u32,
     len: usize,
@@ -120,32 +151,31 @@ impl PoolDial {
         PoolDial {
             head: [u32::MAX; WINDOW],
             bitmap: [0u64; WINDOW / 64],
-            summary: [0u64; 4],
-            pool_node: Vec::with_capacity(16384),
-            pool_next: Vec::with_capacity(16384),
+            summary: 0u64,
+            pool: Vec::with_capacity(8192),
             free_head: u32::MAX,
             at: 0,
             len: 0,
             far: BinaryHeap::new(),
             far_min: u32::MAX,
-            touched_buckets: Vec::with_capacity(2048),
+            touched_buckets: Vec::with_capacity(1024),
         }
     }
 
     #[inline(always)]
     fn alloc_slot(&mut self, node: u32, next: u32) -> u32 {
+        let packed = (node as u64) | ((next as u64) << 32);
         if self.free_head != u32::MAX {
             let slot = self.free_head as usize;
             unsafe {
-                self.free_head = *self.pool_next.get_unchecked(slot);
-                *self.pool_node.get_unchecked_mut(slot) = node;
-                *self.pool_next.get_unchecked_mut(slot) = next;
+                let old_entry = *self.pool.get_unchecked(slot);
+                self.free_head = (old_entry >> 32) as u32;
+                *self.pool.get_unchecked_mut(slot) = packed;
             }
             slot as u32
         } else {
-            let slot = self.pool_node.len() as u32;
-            self.pool_node.push(node);
-            self.pool_next.push(next);
+            let slot = self.pool.len() as u32;
+            self.pool.push(packed);
             slot
         }
     }
@@ -158,9 +188,9 @@ impl PoolDial {
             if old_h == u32::MAX {
                 let w = b >> 6;
                 unsafe {
-                    *self.bitmap.get_unchecked_mut(w) |= 1 << (b & 63);
-                    *self.summary.get_unchecked_mut(w >> 6) |= 1 << (w & 63);
+                    *self.bitmap.get_unchecked_mut(w) |= 1u64 << (b & 63);
                 }
+                self.summary |= 1u64 << w;
                 self.touched_buckets.push(b as u16);
             }
             let new_h = self.alloc_slot(node, old_h);
@@ -181,24 +211,21 @@ impl PoolDial {
             let h = unsafe { *self.head.get_unchecked(b) };
             if h != u32::MAX {
                 self.len -= 1;
-                let (node, nxt) = unsafe {
-                    (
-                        *self.pool_node.get_unchecked(h as usize),
-                        *self.pool_next.get_unchecked(h as usize),
-                    )
-                };
+                let entry = unsafe { *self.pool.get_unchecked(h as usize) };
+                let node = entry as u32;
+                let nxt = (entry >> 32) as u32;
                 unsafe {
                     *self.head.get_unchecked_mut(b) = nxt;
-                    *self.pool_next.get_unchecked_mut(h as usize) = self.free_head;
+                    *self.pool.get_unchecked_mut(h as usize) = (self.free_head as u64) << 32;
                 }
                 self.free_head = h;
                 if nxt == u32::MAX {
                     let w = b >> 6;
                     unsafe {
-                        let bit = *self.bitmap.get_unchecked(w) & !(1 << (b & 63));
+                        let bit = *self.bitmap.get_unchecked(w) & !(1u64 << (b & 63));
                         *self.bitmap.get_unchecked_mut(w) = bit;
                         if bit == 0 {
-                            *self.summary.get_unchecked_mut(w >> 6) &= !(1 << (w & 63));
+                            self.summary &= !(1u64 << w);
                         }
                     }
                 }
@@ -230,43 +257,24 @@ impl PoolDial {
                 continue;
             }
 
-            let sum_idx = word_idx >> 6;
-            let sum_bit = ((word_idx + 1) & 63) as u32;
-            let cur_sum = (unsafe { *self.summary.get_unchecked(sum_idx) } >> sum_bit) << sum_bit;
+            let next_shift = ((word_idx + 1) & 63) as u32;
+            let rot = self.summary.rotate_right(next_shift);
+            if rot != 0 {
+                let delta_words = rot.trailing_zeros() as usize + 1;
+                let next_word = (word_idx + delta_words) & 63;
+                let next_b = (next_word << 6)
+                    | (unsafe { *self.bitmap.get_unchecked(next_word) }.trailing_zeros() as usize);
+                self.at += (next_b.wrapping_sub(start_b) & (WINDOW - 1)) as u32;
+                continue;
+            }
 
-            let next_word = if cur_sum != 0 {
-                (sum_idx << 6) | (cur_sum.trailing_zeros() as usize)
-            } else {
-                let mut found = None;
-                for step in 1..4 {
-                    let s_idx = (sum_idx + step) & 3;
-                    let s_val = unsafe { *self.summary.get_unchecked(s_idx) };
-                    if s_val != 0 {
-                        found = Some((s_idx << 6) | (s_val.trailing_zeros() as usize));
-                        break;
-                    }
-                }
-                match found {
-                    Some(w) => w,
-                    None => {
-                        if self.far_min < u32::MAX {
-                            self.at = self.far_min;
-                            let popped = self.far.pop().map(|r| r.0);
-                            self.far_min = self.far.peek().map_or(u32::MAX, |r| r.0 .0);
-                            return popped;
-                        }
-                        return None;
-                    }
-                }
-            };
-
-            let next_b = (next_word << 6)
-                | (unsafe { *self.bitmap.get_unchecked(next_word) }.trailing_zeros() as usize);
-            self.at += if next_b >= start_b {
-                next_b - start_b
-            } else {
-                WINDOW - start_b + next_b
-            } as u32;
+            if self.far_min < u32::MAX {
+                self.at = self.far_min;
+                let popped = self.far.pop().map(|r| r.0);
+                self.far_min = self.far.peek().map_or(u32::MAX, |r| r.0 .0);
+                return popped;
+            }
+            return None;
         }
     }
 
@@ -277,13 +285,12 @@ impl PoolDial {
             unsafe {
                 *self.head.get_unchecked_mut(idx) = u32::MAX;
                 *self.bitmap.get_unchecked_mut(idx >> 6) = 0;
-                *self.summary.get_unchecked_mut(idx >> 12) = 0;
             }
         }
         self.touched_buckets.clear();
+        self.summary = 0;
         (self.at, self.len, self.far_min, self.free_head) = (0, 0, u32::MAX, u32::MAX);
-        self.pool_node.clear();
-        self.pool_next.clear();
+        self.pool.clear();
         self.far.clear();
     }
 }
@@ -308,7 +315,7 @@ fn search_fast(
     heap: &mut PoolDial,
 ) -> i64 {
     unsafe {
-        *dist.get_unchecked_mut(s as usize) = 0;
+        *dist.get_unchecked_mut(s as usize) = !0;
     }
     touched.push(s);
     heap.push(0, s);
@@ -317,7 +324,7 @@ fn search_fast(
 
     'search: while let Some((d, u)) = heap.pop() {
         unsafe {
-            if d > *dist.get_unchecked(u as usize) {
+            if !d < *dist.get_unchecked(u as usize) {
                 continue;
             }
             if u == t {
@@ -326,6 +333,10 @@ fn search_fast(
             }
             let es = *start.get_unchecked(u as usize) as usize;
             let ee = *start.get_unchecked(u as usize + 1) as usize;
+
+            for k in es..ee {
+                prefetch(dist.as_ptr().add((*adj.get_unchecked(k) >> 11) as usize));
+            }
 
             for ei in es..ee {
                 let entry = *adj.get_unchecked(ei);
@@ -339,20 +350,15 @@ fn search_fast(
                         break 'search;
                     }
                 }
-                if ei + 1 < ee {
-                    prefetch(
-                        dist.as_ptr()
-                            .add((*adj.get_unchecked(ei + 1) >> 11) as usize),
-                    );
-                }
 
                 let nd = d + w as u32;
-                let cur_d = *dist.get_unchecked(v);
-                if nd < cur_d {
-                    if cur_d == u32::MAX {
+                let inv_nd = !nd;
+                let cur_inv = *dist.get_unchecked(v);
+                if inv_nd > cur_inv {
+                    if cur_inv == 0 {
                         touched.push(v as u32);
                     }
-                    *dist.get_unchecked_mut(v) = nd;
+                    *dist.get_unchecked_mut(v) = inv_nd;
                     heap.push(nd, v as u32);
                 }
             }
@@ -362,12 +368,12 @@ fn search_fast(
     heap.clear();
     for v in touched.drain(..) {
         unsafe {
-            *dist.get_unchecked_mut(v as usize) = u32::MAX;
+            *dist.get_unchecked_mut(v as usize) = 0;
         }
     }
     if needs_wide {
         if wide.is_empty() {
-            *wide = vec![u64::MAX; dist.len()];
+            *wide = vec![0u64; dist.len()];
         }
         return search_wide(start, adj, overflow, s, t, wide, touched);
     }
@@ -385,7 +391,7 @@ fn search_wide(
 ) -> i64 {
     let mut heap = BinaryHeap::new();
     unsafe {
-        *dist.get_unchecked_mut(s as usize) = 0;
+        *dist.get_unchecked_mut(s as usize) = !0u64;
     }
     touched.push(s);
     heap.push(Reverse((0u64, s)));
@@ -393,7 +399,7 @@ fn search_wide(
 
     while let Some(Reverse((d, u))) = heap.pop() {
         unsafe {
-            if d > *dist.get_unchecked(u as usize) {
+            if !d < *dist.get_unchecked(u as usize) {
                 continue;
             }
             if u == t {
@@ -411,12 +417,13 @@ fn search_wide(
                     w = lookup_overflow(overflow, ei as u32);
                 }
                 let nd = d + w;
-                let cur_d = *dist.get_unchecked(v);
-                if nd < cur_d {
-                    if cur_d == u64::MAX {
+                let inv_nd = !nd;
+                let cur_inv = *dist.get_unchecked(v);
+                if inv_nd > cur_inv {
+                    if cur_inv == 0 {
                         touched.push(v as u32);
                     }
-                    *dist.get_unchecked_mut(v) = nd;
+                    *dist.get_unchecked_mut(v) = inv_nd;
                     heap.push(Reverse((nd, v as u32)));
                 }
             }
@@ -425,7 +432,7 @@ fn search_wide(
 
     for v in touched.drain(..) {
         unsafe {
-            *dist.get_unchecked_mut(v as usize) = u64::MAX;
+            *dist.get_unchecked_mut(v as usize) = 0;
         }
     }
     ans
@@ -446,8 +453,8 @@ fn main() {
         }
     };
 
+    let has_in: Vec<AtomicU64> = (0..(n + 63) / 64).map(|_| AtomicU64::new(0)).collect();
     let degree: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
-    let has_in: Vec<AtomicBool> = (0..n).map(|_| AtomicBool::new(false)).collect();
     par(
         CHUNKS,
         || (),
@@ -456,12 +463,10 @@ fn main() {
             let mut p = 0;
             while p < chunk.len() {
                 unsafe {
-                    let u = parse_fast_u32(chunk, &mut p);
-                    let v = parse_fast_u32(chunk, &mut p);
-                    let _w = parse_fast_u32(chunk, &mut p);
+                    let (u, v, _) = parse_line(chunk, &mut p);
                     if u != v {
                         degree[u as usize].fetch_add(1, Relaxed);
-                        has_in[v as usize].store(true, Relaxed);
+                        has_in[(v as usize) >> 6].fetch_or(1u64 << ((v as usize) & 63), Relaxed);
                     }
                 }
             }
@@ -474,7 +479,7 @@ fn main() {
     }
     let m = start0[n] as usize;
 
-    let edges0: Vec<AtomicU64> = (0..m).map(|_| AtomicU64::new(0)).collect();
+    let adj0: Vec<AtomicU32> = (0..m).map(|_| AtomicU32::new(0)).collect();
     par(
         CHUNKS,
         || (),
@@ -483,19 +488,18 @@ fn main() {
             let mut p = 0;
             while p < chunk.len() {
                 unsafe {
-                    let u = parse_fast_u32(chunk, &mut p);
-                    let v = parse_fast_u32(chunk, &mut p);
-                    let w = parse_fast_u32(chunk, &mut p) as u64;
+                    let (u, v, _) = parse_line(chunk, &mut p);
                     if u != v {
                         let slot = degree[u as usize].fetch_add(1, Relaxed) as usize;
-                        edges0[slot].store(((v as u64) << 32) | (w & 0xFFFF_FFFF), Relaxed);
+                        adj0[slot].store(v, Relaxed);
                     }
                 }
             }
         },
     );
+    drop(degree);
 
-    let claimed: Vec<AtomicBool> = (0..n).map(|_| AtomicBool::new(false)).collect();
+    let claimed: Vec<AtomicU64> = (0..(n + 63) / 64).map(|_| AtomicU64::new(0)).collect();
     let scan = AtomicUsize::new(0);
     let regions = par(
         THREADS,
@@ -508,7 +512,8 @@ fn main() {
                     return regions;
                 }
                 for root in from..(from + 1024).min(n) {
-                    if claimed[root].swap(true, Relaxed) {
+                    let bit = 1u64 << (root & 63);
+                    if (claimed[root >> 6].fetch_or(bit, Relaxed) & bit) != 0 {
                         continue;
                     }
                     let (mut region, mut head) = (vec![root as u32], 0);
@@ -518,9 +523,9 @@ fn main() {
                         let s = start0[u] as usize;
                         let e = start0[u + 1] as usize;
                         for idx in s..e {
-                            let edge = edges0[idx].load(Relaxed);
-                            let v = (edge >> 32) as usize;
-                            if !claimed[v].load(Relaxed) && !claimed[v].swap(true, Relaxed) {
+                            let v = adj0[idx].load(Relaxed) as usize;
+                            let v_bit = 1u64 << (v & 63);
+                            if (claimed[v >> 6].fetch_or(v_bit, Relaxed) & v_bit) == 0 {
                                 region.push(v as u32);
                             }
                         }
@@ -530,6 +535,7 @@ fn main() {
             }
         },
     );
+    drop(claimed);
 
     let regions: Vec<Vec<u32>> = regions.into_iter().flatten().collect();
     let mut offset = vec![0; regions.len() + 1];
@@ -538,69 +544,69 @@ fn main() {
     }
 
     let new_id: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
-    let new_deg: Vec<AtomicU32> = (0..n + 1).map(|_| AtomicU32::new(0)).collect();
+    let mut first = vec![0u32; n + 1];
+    let first_ptr = first.as_mut_ptr() as usize;
     par(
         regions.len(),
         || (),
         |_, r| {
+            let f_ptr = first_ptr as *mut u32;
             for (k, &u) in regions[r].iter().enumerate() {
                 let i = offset[r] + k;
                 new_id[u as usize].store(i as u32, Relaxed);
-                new_deg[i + 1].store(start0[u as usize + 1] - start0[u as usize], Relaxed);
+                unsafe {
+                    *f_ptr.add(i + 1) = start0[u as usize + 1] - start0[u as usize];
+                }
             }
         },
     );
     drop(regions);
+    drop(adj0);
+    drop(start0);
 
-    let new_id = new_id
-        .into_iter()
-        .map(AtomicU32::into_inner)
-        .collect::<Vec<u32>>();
-    let mut first = new_deg
-        .into_iter()
-        .map(AtomicU32::into_inner)
-        .collect::<Vec<u32>>();
     for i in 0..n {
         first[i + 1] += first[i];
     }
+    let new_id: Vec<u32> = unsafe {
+        let mut nid = std::mem::ManuallyDrop::new(new_id);
+        Vec::from_raw_parts(nid.as_mut_ptr() as *mut u32, nid.len(), nid.capacity())
+    };
 
+    let cur_cursor: Vec<AtomicU32> = first[..n].iter().map(|&f| AtomicU32::new(f)).collect();
     let adj: Vec<AtomicU32> = (0..m).map(|_| AtomicU32::new(0)).collect();
     let overflows = par(
-        THREADS,
+        CHUNKS,
         || Vec::new(),
-        |local_overflow, t| {
-            let u_start = t * n / THREADS;
-            let u_end = (t + 1) * n / THREADS;
-            for u in u_start..u_end {
-                let nu = unsafe { *new_id.get_unchecked(u) } as usize;
-                let es = unsafe { *start0.get_unchecked(u) } as usize;
-                let ee = unsafe { *start0.get_unchecked(u + 1) } as usize;
-                let mut out_idx = unsafe { *first.get_unchecked(nu) } as usize;
-
-                for edge_idx in es..ee {
-                    let edge = edges0[edge_idx].load(Relaxed);
-                    let v = (edge >> 32) as usize;
-                    let w = (edge & 0xFFFF_FFFF) as u64;
-                    let nv = unsafe { *new_id.get_unchecked(v) };
-
-                    if w < 2047 {
-                        adj[out_idx].store((nv << 11) | (w as u32), Relaxed);
-                    } else {
-                        adj[out_idx].store((nv << 11) | 0x7FF, Relaxed);
-                        local_overflow.push((out_idx as u32, w));
+        |local_of, c| {
+            let chunk = &g[cut(c)..cut(c + 1)];
+            let mut p = 0;
+            while p < chunk.len() {
+                unsafe {
+                    let (u, v, w) = parse_line(chunk, &mut p);
+                    if u != v {
+                        let nu = *new_id.get_unchecked(u as usize) as usize;
+                        let nv = *new_id.get_unchecked(v as usize);
+                        let out_idx = cur_cursor[nu].fetch_add(1, Relaxed) as usize;
+                        if w < 2047 {
+                            adj[out_idx].store((nv << 11) | (w as u32), Relaxed);
+                        } else {
+                            adj[out_idx].store((nv << 11) | 0x7FF, Relaxed);
+                            local_of.push((out_idx as u32, w as u64));
+                        }
                     }
-                    out_idx += 1;
                 }
             }
-            std::mem::take(local_overflow)
+            std::mem::take(local_of)
         },
     );
+    drop(cur_cursor);
 
-    drop(edges0);
-    drop(start0);
     let mut overflow: Vec<(u32, u64)> = overflows.into_iter().flatten().collect();
     overflow.sort_unstable_by_key(|&(idx, _)| idx);
-    let adj: Vec<u32> = adj.into_iter().map(AtomicU32::into_inner).collect();
+    let adj: Vec<u32> = unsafe {
+        let mut a = std::mem::ManuallyDrop::new(adj);
+        Vec::from_raw_parts(a.as_mut_ptr() as *mut u32, a.len(), a.capacity())
+    };
 
     let q = map("/data/queries.txt");
     let mut p = 0;
@@ -611,29 +617,62 @@ fn main() {
     let mut order: Vec<usize> = (0..queries.len()).collect();
     order.sort_unstable_by_key(|&i| new_id[queries[i].0]);
 
-    let sorted = par(
-        queries.len(),
-        || (vec![u32::MAX; n], Vec::new(), Vec::new(), PoolDial::new()),
-        |(dist, wide, touched, heap), j| {
-            let (s, t) = queries[order[j]];
-            if s == t {
-                return 0;
-            }
-            if !has_in[t].load(Relaxed) {
-                return -1;
-            }
-            let (s_new, t_new) = (new_id[s], new_id[t]);
-            if first[s_new as usize + 1] == first[s_new as usize] {
-                return -1;
-            }
-            search_fast(
-                &first, &adj, &overflow, s_new, t_new, dist, wide, touched, heap,
-            )
-        },
-    );
-
     let mut answers = vec![0i64; queries.len()];
-    order.iter().zip(sorted).for_each(|(&i, a)| answers[i] = a);
+    let ans_ptr = answers.as_mut_ptr() as usize;
+
+    let share = |t: usize| t * queries.len() / THREADS;
+    let next: Vec<AtomicUsize> = (0..THREADS).map(|t| AtomicUsize::new(share(t))).collect();
+    std::thread::scope(|sc| {
+        for me in 0..THREADS {
+            let (next, order, queries, has_in, first, adj, overflow, new_id) = (
+                &next, &order, &queries, &has_in, &first, &adj, &overflow, &new_id,
+            );
+            sc.spawn(move || {
+                let mut dist = vec![0u32; n];
+                let mut wide = Vec::new();
+                let mut touched = Vec::new();
+                let mut heap = PoolDial::new();
+                let ans_out = ans_ptr as *mut i64;
+
+                for t in (me..THREADS).chain(0..me) {
+                    loop {
+                        let j = next[t].fetch_add(1, Relaxed);
+                        if j >= share(t + 1) {
+                            break;
+                        }
+                        let orig_idx = order[j];
+                        let (s, t_node) = queries[orig_idx];
+                        let ans = if s == t_node {
+                            0
+                        } else if (has_in[t_node >> 6].load(Relaxed) & (1u64 << (t_node & 63))) == 0
+                        {
+                            -1
+                        } else {
+                            let (s_new, t_new) = (new_id[s], new_id[t_node]);
+                            if first[s_new as usize + 1] == first[s_new as usize] {
+                                -1
+                            } else {
+                                search_fast(
+                                    first,
+                                    adj,
+                                    overflow,
+                                    s_new,
+                                    t_new,
+                                    &mut dist,
+                                    &mut wide,
+                                    &mut touched,
+                                    &mut heap,
+                                )
+                            }
+                        };
+                        unsafe {
+                            *ans_out.add(orig_idx) = ans;
+                        }
+                    }
+                }
+            });
+        }
+    });
 
     let mut out = Vec::with_capacity(answers.len() * 8);
     for a in answers {
