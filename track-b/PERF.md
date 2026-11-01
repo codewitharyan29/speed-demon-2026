@@ -480,3 +480,24 @@ large reservation (here room for a pair per token, ~5 MB virtual per thread) is 
 write into each 2 MB range charges all of it, so each thread's pair buffer was rounded up in 2 MB steps (this laptop
 uses huge pages only when asked, so `memory.peak` here could not show it). And -14 M mispredicts for +0.4 G
 instructions bought no time on the box.
+
+Board noise: the revert (2346ada, the b8b05c6 code again) scored 0.208 s against 0.182 s for the same code an hour
+earlier (run-9826b964587b against run-4b48138e17f5). One board run can move by ~7-15% (native-CPU tracks are built on
+the box, possibly while others run), so it cannot rank changes below ~10%; local single-thread timing and cachegrind
+instruction counts decide, and the board is for memory and large changes.
+
+## Step 24 (rejected): more serial cuts, and a fused scan loop (local, in-process ms)
+
+| Change | Ir | 1 thread (median of 7) | 12 threads (median) | Lines | Verdict |
+|---|---|---|---|---|---|
+| Step 22 code | 6.75 G | 776-808 | 138-141 | 742 | |
+| Output formatted in 12 pieces + query list built in 12 pieces at once + bitset rows stored in BOOL queries | | 767 | 135 | 777 | rejected: saves ~1.5 ms (the build left a serial marking pass) for +35 lines |
+| Bitset rows in queries + unchecked appends to the document's term list | 6.85 G | noisy | | | rejected: no clear change |
+| Fused scan: the tokeniser hands each token to the callback, which keeps a ring of 16 (or 32) tokens, prefetches each new token's bucket and acts on the token 16 places back (no batch arrays) | 7.80 G | 954 (32: 1,000) | 162 (32: 166) | 729 | rejected: +1 G instructions; the batched loops compile tighter |
+
+## Step 25: board experiment, bitset rows stored in BOOL queries
+
+On the box the per-chunk BOOL evaluation waits on memory (it is ~6% of the instructions but ~20% of the time), and two
+threads' chunk buffers (~2.2 MB) do not fit their shared 1.25 MB L2. Storing a bitset term's row in the query (top bit
+set) removes the `dense_of` read from every such operand. Locally within noise (12 threads 153 -> 147, +9 lines);
+judged on the board over two runs against the step-22 code's 0.182 s (and 0.208 s on its second run).

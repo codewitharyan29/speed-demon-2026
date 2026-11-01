@@ -596,7 +596,7 @@ fn main() {
     }
     let nterms = next as usize;
     let (mut used, mut at) = (vec![0u8; nterms], 0);
-    let queries: Vec<Query> = (pieces.iter().flat_map(|piece| &piece.2))
+    let mut queries: Vec<Query> = (pieces.iter().flat_map(|piece| &piece.2))
         .map(|&(phrase, n, ops)| {
             let t = &ids[at..at + n];
             at += n;
@@ -667,6 +667,17 @@ fn main() {
     for t in 0..nterms {
         if used[t] & 1 != 0 && df[t] * 32 >= seen {
             (dense_of[t], ndense) = (ndense, ndense + 1);
+        }
+    }
+
+    // A BOOL query's terms with a bitset hold its row instead (with the top bit set), so evaluating them reads no table.
+    for query in queries.iter_mut().filter(|q| !q.phrase) {
+        let n = query.terms.len as usize;
+        for t in query.terms.items[..n]
+            .iter_mut()
+            .filter(|t| dense_of[**t as usize] != u32::MAX)
+        {
+            *t = 1 << 31 | dense_of[*t as usize];
         }
     }
 
@@ -820,9 +831,9 @@ fn main() {
             post[start[t] as usize] = (p & ((1 << DOC_BITS) - 1)) as u16;
         }
         let list = |t: u32| &post[start[t as usize] as usize..start[t as usize + 1] as usize];
-        let operand = |t: u32| match dense_of[t as usize] {
-            u32::MAX => Operand::List(list(t)),
-            d => Operand::Bits(&rows[d as usize * wl..][..wl]),
+        let operand = |t: u32| match t >> 31 {
+            0 => Operand::List(list(t)),
+            _ => Operand::Bits(&rows[(t & 0xFFFF) as usize * wl..][..wl]),
         };
 
         // A query's result on this chunk goes into its running count, sum and ten smallest ids.
