@@ -39,6 +39,9 @@ D = 1 throughout (no dependencies). Output hash on every row below: the board's 
 | 23 | 9fb5c93 | candidate B: direct table of entries indexed by hash, 128 KB tag array, 16-wide tag compare | run-99e4e3237a66 | 36.59 | 13.5 | 629 | **29.52** |
 | 24 | 46829d6 | R2 (cloud session 6): 32-byte name key block compared and hashed from one AVX2 vector, id/region/amount converted in one AVX2 pass | run-a3e9f05bd3dc | 36.09 | 13.3 | 656 | 29.63 |
 | 25 | 80abb30 | candidate A of the cloud session (one-pass parser, valid output) on top of 9fb5c93 | run-c79ae56cc4c1 | 38.51 | 13.2 | 608 | 29.05 |
+| 26 | 6ec50ad | **C++ rewrite** (same architecture as B: structural SIMD index, hash-indexed entries with tags, byte region table; one thread pool) | run-50cc84be09bb | 36.34 | 13.9 | 494 | **30.54** |
+| 27 | 4452f30 | cx3: the C++ rewrite in 434 lines; tag reads as one asm load (TSan clean) | run-c6a876ca3df0 | 35.47 | 14.0 | 434 | **31.51** |
+| 28 | 66693b1 | cx5: distinct names counted when their bit is first set (`lock bts`), no counting phase; 128 KiB chunks over the last 15% | run-ce3a1da5b3de | 34.51 | 14.1 | 432 | **31.88** |
 
 Kept: 1, 3, 4, 7, 8, 10, 12 (13-15 reverted: 64 KiB blocks and eagerly written zeros are the best measured). Rejected or reverted: 2 (equal to 1 within noise, kept for the instruction counts it enabled), 6 (alone: M
 37.5 MB until THP was disabled, then kept as part of 7), 9 (fewer instructions but 2.1 ms slower on the board, cause not found), 11. Rows 5 and 16 show the board's run-to-run noise: 0.04% on one pair, 6% (52.6, 52.9 and 55.8 ms for the same source, rows 12, 16, 18) on the other, so differences below about 3 ms are not distinguishable.
@@ -141,6 +144,8 @@ New fixture `tools/c_twins_gen.py` (names differing in exactly one byte at every
 left name bytes 15-16 uncompared in the first R1 draft. Details: [EXTREME_REWRITE_REPORT.md](EXTREME_REWRITE_REPORT.md).
 
 * R2 (row 24) gave -8% on the cloud VM but T 36.09 ms on the board against 35.7-36.7 ms for B (K 29.63 against 29.40-29.76), with S +27: no gain. Source reverted to B (9fb5c93); R2 is kept as tag `tc-r2-experiment`.
+
+Rows 26-28 are C++ (`src/main.cpp`); row 28 is the current source. Local experiments of that line, kept or rejected, are in `CPP_REWRITE.md` on branch `cloud/track-c-cpp`: an L2-sized region map (-0.5 MB, +2-3% T locally, not run) and double-buffered input so the lookup pipeline drains only at chunk ends (neutral locally, not run).
 
 ## Board diagnostics of session 7 (labelled; wrong output on purpose, T and M still reported; source restored to 9fb5c93 after each)
 
