@@ -38,91 +38,118 @@ fn parallel<R: Send>(jobs: usize, f: impl Fn(usize) -> R + Sync) -> Vec<R> {
     })
 }
 
-/// One distinct name, in a single cache line: finding it, comparing it and recording its country touch one line.
+/// One distinct name, in a single cache line: comparing it and recording its country touch one line.
 #[repr(align(64))]
 struct Entry {
-    /// `hash tag << 32 | length << 8 | state`; the state is `INSERTING` while the name is written, then `READY`.
-    head: AtomicU64,
+    /// The name's length.
+    len: AtomicU64,
     /// Bit c is set once the name has been seen in country c.
     mask: [AtomicU64; COUNTRIES / 64],
     /// The name's first 24 bytes (zero padded); for a longer name, the offset of its bytes in `Names::spill`.
     name: [AtomicU64; 3],
 }
 
-const INSERTING: u64 = 1;
-const READY: u64 = 2;
-
-/// Every distinct name seen: an open-addressing table of `Entry`, shared by all workers.
+/// Every distinct name seen, shared by all workers. `slots` is an open-addressing table of `hash tag << 32 | id + 1`,
+/// small enough to stay in the cache; `entries[id]` is the name itself.
 struct Names {
-    table: &'static [Entry],
+    slots: Vec<AtomicU64>,
+    entries: &'static [Entry],
     spill: &'static [u8], // the bytes of the names longer than 24, written once each
     spilled: AtomicUsize,
-    filled: AtomicUsize,
+    next: AtomicUsize,
     full: AtomicBool,
 }
 
 impl Names {
     fn new(bits: u32) -> Names {
-        // Large zeroed allocations are fresh pages that cost memory only once filled in, unless the alignment asked for is
-        // more than the allocator's: then it zeroes them by hand. So allocate with room to spare and align by hand.
-        let layout = std::alloc::Layout::from_size_align((64 << bits) + 64, 16).unwrap();
+        // The entries are zero from the start and cost memory only once used, except that the allocator zeroes memory by
+        // hand if asked for more alignment than it gives, so ask for less and align by hand.
+        let layout = std::alloc::Layout::from_size_align((64 << (bits - 1)) + 64, 16).unwrap();
         let base = (unsafe { std::alloc::alloc_zeroed(layout) } as usize + 63) & !63;
-        let table = unsafe { std::slice::from_raw_parts(base as *const Entry, 1 << bits) };
+        let entries = unsafe { std::slice::from_raw_parts(base as *const Entry, 1 << (bits - 1)) };
         let spill = Box::leak(vec![0u8; 32 << bits].into_boxed_slice());
-        Names { table, spill, spilled: AtomicUsize::new(0), filled: AtomicUsize::new(0), full: AtomicBool::new(false) }
+        Names { slots: zeros(1 << bits), entries, spill, spilled: AtomicUsize::new(0), next: AtomicUsize::new(0), full: AtomicBool::new(false) }
     }
 
     /// The slot where the search for a name with hash `h` starts.
-    fn slot(&self, h: u64) -> &Entry {
-        &self.table[h as usize & (self.table.len() - 1)]
+    fn slot(&self, h: u64) -> &AtomicU64 {
+        &self.slots[h as usize & (self.slots.len() - 1)]
+    }
+
+    /// Fetches, for writing, the entry that a later `entry` call for hash `h` will most likely look at.
+    fn warm(&self, h: u64) {
+        let mut i = h as usize & (self.slots.len() - 1);
+        loop {
+            let v = self.slots[i].load(Relaxed);
+            if v == 0 {
+                return;
+            }
+            if v >> 32 == h >> 32 {
+                // SAFETY: prefetching has no effect on correctness, whatever the address.
+                return unsafe { _mm_prefetch::<_MM_HINT_ET0>(&self.entries[(v & 0xFFFF_FFFF) as usize - 1] as *const Entry as *const i8) };
+            }
+            i = (i + 1) & (self.slots.len() - 1);
+        }
+    }
+
+    /// Whether entry `id` is the name `s[..len]`.
+    unsafe fn same(&self, id: usize, s: *const u8, len: usize) -> bool {
+        let e = &self.entries[id];
+        if e.len.load(Relaxed) as usize != len {
+            return false;
+        }
+        if len > 24 {
+            let at = e.name[0].load(Relaxed) as usize;
+            return self.spill[at..at + len] == *std::slice::from_raw_parts(s, len);
+        }
+        // The name as three zero-padded words, to compare with the entry's.
+        (0..3).all(|k| match len.saturating_sub(8 * k) {
+            0 => e.name[k].load(Relaxed) == 0,
+            n => e.name[k].load(Relaxed) == (s.add(8 * k) as *const u64).read_unaligned() & (u64::MAX >> (64 - 8 * n.min(8))),
+        })
     }
 
     /// The entry of the name `s[..len]` (`s` must have 32 readable bytes after the name) with hash `h`; adds it if new.
     unsafe fn entry(&self, s: *const u8, len: usize, h: u64) -> &Entry {
-        let tag = h & !0xFFFF_FFFF | (len as u64) << 8;
-        // The name as three zero-padded words, to compare with an inline name.
-        let word = |k: usize| match len.saturating_sub(8 * k) {
-            0 => 0,
-            n => (s.add(8 * k) as *const u64).read_unaligned() & (u64::MAX >> (64 - 8 * n.min(8))),
-        };
-        let mut i = h as usize & (self.table.len() - 1);
+        let (tag, mut mine) = (h & !0xFFFF_FFFF, None);
+        let mut i = h as usize & (self.slots.len() - 1);
         loop {
-            let e = &self.table[i];
-            let v = e.head.load(Acquire);
-            if v == tag | READY {
-                let at = e.name[0].load(Relaxed) as usize;
-                let same = if len > 24 {
-                    self.spill[at..at + len] == *std::slice::from_raw_parts(s, len)
-                } else {
-                    (0..3).all(|k| e.name[k].load(Relaxed) == word(k))
-                };
-                if same {
-                    return e;
+            let v = self.slots[i].load(Acquire);
+            if v == 0 {
+                let id = *mine.get_or_insert_with(|| self.add(s, len));
+                if self.slots[i].compare_exchange(0, tag | (id as u64 + 1), AcqRel, Acquire).is_ok() {
+                    return &self.entries[id];
                 }
-            } else if v == 0 {
-                if self.filled.fetch_add(1, Relaxed) * 10 > self.table.len() * 8 || self.spilled.load(Relaxed) + len > self.spill.len() {
-                    self.full.store(true, Relaxed);
-                    return e; // the run is abandoned; any entry will do
-                }
-                if e.head.compare_exchange(0, tag | INSERTING, Acquire, Acquire).is_ok() {
-                    if len <= 24 {
-                        (0..3).for_each(|k| e.name[k].store(word(k), Relaxed));
-                    } else {
-                        let at = self.spilled.fetch_add(len, Relaxed);
-                        std::ptr::copy_nonoverlapping(s, self.spill.as_ptr().add(at) as *mut u8, len);
-                        e.name[0].store(at as u64, Relaxed);
-                    }
-                    e.head.store(tag | READY, Release);
-                    return e;
-                }
-                self.filled.fetch_sub(1, Relaxed);
-                continue; // somebody else took the slot: look at what is in it now
-            } else if v & 0xFF == INSERTING {
-                std::hint::spin_loop();
-                continue; // a name is being written here: wait for it
+                continue; // the slot was taken meanwhile: look at what is in it now
             }
-            i = (i + 1) & (self.table.len() - 1);
+            if v & !0xFFFF_FFFF == tag && self.same((v & 0xFFFF_FFFF) as usize - 1, s, len) {
+                return &self.entries[(v & 0xFFFF_FFFF) as usize - 1];
+            }
+            i = (i + 1) & (self.slots.len() - 1);
         }
+    }
+
+    /// Stores a new name; returns its id. Sets `full` (and returns an id that is not used) if there is no room.
+    unsafe fn add(&self, s: *const u8, len: usize) -> usize {
+        let id = self.next.fetch_add(1, Relaxed);
+        if id >= self.entries.len() || self.spilled.load(Relaxed) + len > self.spill.len() {
+            self.full.store(true, Relaxed);
+            return 0;
+        }
+        let e = &self.entries[id];
+        e.len.store(len as u64, Relaxed);
+        if len <= 24 {
+            for k in 0..3 {
+                let n = len.saturating_sub(8 * k);
+                let w = if n == 0 { 0 } else { (s.add(8 * k) as *const u64).read_unaligned() & (u64::MAX >> (64 - 8 * n.min(8))) };
+                e.name[k].store(w, Relaxed);
+            }
+        } else {
+            let at = self.spilled.fetch_add(len, Relaxed);
+            std::ptr::copy_nonoverlapping(s, self.spill.as_ptr().add(at) as *mut u8, len);
+            e.name[0].store(at as u64, Relaxed);
+        }
+        id // published to other threads by the Release half of the compare-exchange of the slot
     }
 }
 
@@ -291,11 +318,7 @@ fn record(c: &Ctx, b: &[u8], q: &Quotes, start: usize, sep: &[u32], batch: &mut 
     // SAFETY: both buffers have 32 readable bytes after the name; the hash reads at most 16 around its ends.
     let hash = unsafe { hash(name, len) };
     unsafe {
-        // The entry is probably in the slot where its search starts, or within three lines after it. The first is about to be
-        // written (its country's bit is set), so it is fetched for writing, which saves a second trip to the core that wrote it.
-        let slot = c.names.slot(hash) as *const Entry as *const i8;
-        _mm_prefetch::<_MM_HINT_ET0>(slot);
-        (1..4).for_each(|k| _mm_prefetch::<_MM_HINT_T0>(slot.add(64 * k)));
+        _mm_prefetch::<_MM_HINT_T0>(c.names.slot(hash) as *const AtomicU64 as *const i8);
         if let Some(r) = c.region.get(region as usize) {
             _mm_prefetch::<_MM_HINT_T0>(r as *const AtomicU16 as *const i8);
         }
@@ -307,6 +330,7 @@ fn record(c: &Ctx, b: &[u8], q: &Quotes, start: usize, sep: &[u32], batch: &mut 
 
 /// Looks up the countries and names of the records in `batch` and adds them to `aggs`.
 fn resolve(c: &Ctx, batch: &mut Batch, aggs: &mut [Agg]) {
+    batch.recs.iter().for_each(|r| c.names.warm(r.hash));
     for r in batch.recs.drain(..) {
         let country = c.dense[c.region.get(r.region).map_or(0, |x| x.load(Relaxed)) as usize] as usize;
         // SAFETY: the name has 32 readable bytes after it, as `record` ensured.
@@ -476,9 +500,9 @@ fn run(regions: &File, file: &File, len: usize, bits: u32, chunk: usize) -> Opti
     }
 
     // Distinct names per country: the set bits of the masks, counted by ranges of entries in parallel.
-    let parts = parallel(names.table.len().div_ceil(4096), |j| {
+    let parts = parallel(names.next.load(Relaxed).min(names.entries.len()).div_ceil(4096), |j| {
         let mut counts = vec![0u64; countries];
-        for e in &names.table[j * 4096..((j + 1) * 4096).min(names.table.len())] {
+        for e in &names.entries[j * 4096..((j + 1) * 4096).min(names.next.load(Relaxed).min(names.entries.len()))] {
             for (w, mask) in e.mask.iter().enumerate() {
                 let mut bits = mask.load(Relaxed);
                 while bits != 0 {
@@ -504,7 +528,7 @@ fn main() {
     let file = File::open("/data/records.csv").unwrap();
     let len = file.metadata().unwrap().len() as usize;
     // If the parallel run gives up, parse everything as one chunk, with a name table that holds a name per record.
-    let out = run(&regions, &file, len, 17, 1 << 20).or_else(|| run(&regions, &file, len, 22, len.max(1)));
+    let out = run(&regions, &file, len, 18, 1 << 20).or_else(|| run(&regions, &file, len, 23, len.max(1)));
     std::fs::write("/out/aggregates.txt", out.expect("records.csv is not valid")).unwrap();
     std::process::exit(0);
 }
