@@ -29,7 +29,8 @@ They are only used to compare variants, never reported as results.
 | 18 | Less single-threaded work: queries parsed in 12 pieces at once, no rebuild of the term table, a 1% sample | d324374 | 0.207 | 44 | 70.947 (K 26.24, 756 lines) |
 | 19 | Terms numbered straight into the scan's probe table (no separate term table, no second build) | 0dd42d9 | 0.206 | 38 | 71.142 (K 26.48, 734 lines) |
 | 20 | 48 chunks instead of 60 (four per thread; the per-chunk BOOL evaluation is a fixed cost per chunk) | 8f752f8 | 0.205 | 42 | 71.193 (K 26.54, 734 lines) |
-| 21 | Leaner scan callback: each bucket index computed once, batch arrays made once per chunk, unchecked indexing where bounds are provable | pending | | | |
+| 21 | Leaner scan callback: each bucket index computed once, batch arrays made once per chunk, unchecked indexing where bounds are provable | 23093fe | 0.192 | 41 | 71.850 (K 27.36, 742 lines) |
+| 22 | Spare bitset row (every token sets a bit; one condition left in the bookkeeping) and a tokeniser with one step per token | pending | | | |
 
 ## Local measurements behind step 2 (in-process ms, median)
 
@@ -438,5 +439,24 @@ and the stamp are indexed without bounds checks (each with its reason).
 |---|---|---|---|---|---|
 | Step 20 | 8.09 G | 66.5 M | 934 | 166 | 727 |
 | Lean callback | 6.94 G | 66.8 M | 890 | 157 | 735 |
+
+Verified on full seeds 1 and 2, sample seeds 1-3, tiny seeds 1-6, the worked example and the long-token case.
+
+Board: 0.2046 -> 0.1919 s (-6.2%) for -14% instructions: on the box the instruction count is the lever.
+
+## Step 22: fewer instructions and mispredicts per token (cachegrind on the full data; local in-process ms)
+
+- Spare bitset row: terms without a bitset (and misses) point at row `ndense`, so every token ORs its document's bit
+  without a branch; bit 0 of a term's flags now means "BOOL term without a bitset" and is the only condition left
+  before the stamp check.
+- Tokeniser: token starts (a letter or digit after anything else) and ends (anything else after one) come from two
+  masks; the k-th end closes the k-th start, so a token is one loop step instead of two edge steps.
+
+| Version | Ir | Mispredicts | 1 thread (median of 7) | 12 threads (median of 11) | Lines |
+|---|---|---|---|---|---|
+| Step 21 | 6.94 G | 66.8 M | 826 | 149 | 735 |
+| Spare row only | 7.04 G | 57.0 M | | | |
+| Tokeniser only | 6.65 G | 66.6 M | | | |
+| Both | | | 756 | 140 | 742 |
 
 Verified on full seeds 1 and 2, sample seeds 1-3, tiny seeds 1-6, the worked example and the long-token case.
