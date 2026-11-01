@@ -409,6 +409,6 @@ cannot say where the box spends its time. Each diagnostic is the step-19 code wi
 | Diagnostic | What runs | Local (ms) | Board T | Board M |
 |---|---|---|---|---|
 | D1 | everything up to the chunk pass, then exit (821a000, run-de2e8ed01946) | ~15 | 0.0198 | 18.9 |
-| D2 | + the chunk pass tokenising only (no lookups, no BOOL evaluation), + output | 37 | pending | |
+| D2 | + the chunk pass tokenising only (no lookups, no BOOL evaluation), + output (686f5be, run-69335a86c2b0) | 37 | 0.0519 | 21.4 |
 | D3 | everything but the per-chunk BOOL evaluation | ~115 | pending | |
 | (full) | step 19 | 144 | 0.206 | 38 |
