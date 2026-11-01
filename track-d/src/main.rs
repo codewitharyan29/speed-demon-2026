@@ -49,7 +49,7 @@ unsafe fn parse_swar(p: *const u8, len: usize) -> u32 {
 }
 
 #[inline(always)]
-unsafe fn parse_edge(chunk: &[u8], p: &mut usize) -> (u32, u32, u32) {
+unsafe fn parse_edge<const W: bool>(chunk: &[u8], p: &mut usize) -> (u32, u32, u32) {
     while *p < chunk.len() && unsafe { *chunk.get_unchecked(*p) } < b'0' { *p += 1; }
     #[cfg(target_arch = "x86_64")]
     if *p + 32 <= chunk.len() {
@@ -61,12 +61,15 @@ unsafe fn parse_edge(chunk: &[u8], p: &mut usize) -> (u32, u32, u32) {
         if p2 < 32 && p0 < 8 && p1 - p0 <= 8 && p2 - p1 <= 8
             && *ptr.add(p0) == b' ' && *ptr.add(p1) == b' ' && *ptr.add(p2) == b'\n' {
             *p += p2 + 1;
-            return (parse_swar(ptr, p0), parse_swar(ptr.add(p0 + 1), p1 - p0 - 1), parse_swar(ptr.add(p1 + 1), p2 - p1 - 1));
+            let wt = if W { parse_swar(ptr.add(p1 + 1), p2 - p1 - 1) } else { 0 };
+            return (parse_swar(ptr, p0), parse_swar(ptr.add(p0 + 1), p1 - p0 - 1), wt);
         }
     }
     let (u, v) = (num(chunk, p) as u32, { *p += 1; num(chunk, p) as u32 });
-    *p += 1;
-    (u, v, num(chunk, p) as u32)
+    if W { *p += 1; (u, v, num(chunk, p) as u32) } else {
+        while *p < chunk.len() && unsafe { *chunk.get_unchecked(*p) } != b'\n' { *p += 1; }
+        *p += 1; (u, v, 0)
+    }
 }
 
 fn par<R: Send>(jobs: usize, f: impl Fn(usize) -> R + Sync) -> Vec<R> {
@@ -271,30 +274,19 @@ fn main() {
     let degree: Vec<AtomicU32> = unsafe { std::mem::transmute(vec![0u32; n]) };
     let has_in: Vec<AtomicU64> = unsafe { std::mem::transmute(vec![0u64; (n + 63) / 64]) };
 
-    // SINGLE PASS TEXT PARSE: Parse 92 MB text ONCE into thread-local u64 buffers
-    let chunk_data = par(CHUNKS, |c| {
+    // Pass 1: Count degrees and mark has_in (weights skipped in SIMD)
+    par(CHUNKS, |c| {
         let (chunk, mut p) = (&g[cuts[c]..cuts[c + 1]], 0);
-        let mut edges = Vec::with_capacity(chunk.len() / 18);
-        let mut of_weights = Vec::new();
         while p < chunk.len() {
-            let (u, v, w) = unsafe { parse_edge(chunk, &mut p) };
+            let (u, v, _) = unsafe { parse_edge::<false>(chunk, &mut p) };
             if u != v {
                 degree[u as usize].fetch_add(1, Relaxed);
                 let (bit, idx) = (1u64 << (v & 63), (v >> 6) as usize);
                 if (has_in[idx].load(Relaxed) & bit) == 0 {
                     has_in[idx].fetch_or(bit, Relaxed);
                 }
-                let packed = if w < 2047 {
-                    ((u as u64) << 32) | ((v as u64) << 11) | (w as u64)
-                } else {
-                    let of_idx = of_weights.len() as u64;
-                    of_weights.push(w as u64);
-                    ((of_idx & 0x7FF) << 53) | ((u as u64) << 32) | ((v as u64) << 11) | 0x7FF
-                };
-                edges.push(packed);
             }
         }
-        (edges, of_weights)
     });
 
     let (mut start0, mut cur) = (vec![0u32; n + 1], 0u32);
@@ -307,21 +299,21 @@ fn main() {
     start0[n] = cur;
     let m = cur as usize;
 
-    // Allocate adj buffer (20 MB) - used first for unweighted BFS, then overwritten for final weighted CSR!
-    let adj: Vec<AtomicU32> = unsafe { std::mem::transmute(vec![0u32; m]) };
-
-    // Fill adj as unweighted CSR from in-memory u64 edges (~3.5 ms)
+    // Build unweighted adj0 (20 MB) for BFS
+    let adj0: Vec<AtomicU32> = unsafe { std::mem::transmute(vec![0u32; m]) };
     par(CHUNKS, |c| {
-        let edges = &chunk_data[c].0;
-        for &packed in edges {
-            let u = ((packed >> 32) & 0x1FFFFF) as usize;
-            let slot = degree[u].fetch_add(1, Relaxed) as usize;
-            adj[slot].store(packed as u32, Relaxed);
+        let (chunk, mut p) = (&g[cuts[c]..cuts[c + 1]], 0);
+        while p < chunk.len() {
+            let (u, v, _) = unsafe { parse_edge::<false>(chunk, &mut p) };
+            if u != v {
+                let slot = degree[u as usize].fetch_add(1, Relaxed) as usize;
+                adj0[slot].store(v, Relaxed);
+            }
         }
     });
     drop(degree);
 
-    // BFS region growing on unweighted adj
+    // BFS region growing on unweighted adj0
     let claimed: Vec<AtomicU64> = unsafe { std::mem::transmute(vec![0u64; (n + 63) / 64]) };
     let (scan, order_cur) = (AtomicUsize::new(0), AtomicUsize::new(0));
     let mut order = vec![0u32; n];
@@ -345,7 +337,7 @@ fn main() {
                     let u = reg[head] as usize;
                     head += 1;
                     for idx in start0[u] as usize..start0[u + 1] as usize {
-                        let v = (adj[idx].load(Relaxed) >> 11) as usize;
+                        let v = adj0[idx].load(Relaxed) as usize;
                         if claim(v) { reg.push(v as u32); }
                     }
                 }
@@ -355,6 +347,7 @@ fn main() {
         }
     });
     drop(claimed);
+    drop(adj0); // FREE 20 MB immediately!
 
     // Parallel renumbering across 12 threads
     let (mut new_id, mut first) = (vec![0u32; n], vec![0u32; n + 1]);
@@ -371,36 +364,34 @@ fn main() {
             }
         }
     });
-    drop(start0);
-    drop(order);
+    drop(start0); // FREE start0!
+    drop(order);  // FREE order!
 
     for i in 0..n { first[i + 1] += first[i]; }
 
-    // Direct in-memory weighted write into final adj (overwriting adj in place!)
+    // Pass 2: Stream graph.txt directly into final renumbered adj! (Zero scatter!)
+    let adj: Vec<AtomicU32> = unsafe { std::mem::transmute(vec![0u32; m]) };
     let cursor: Vec<AtomicU32> = unsafe { std::mem::transmute(first.clone()) };
+
     let of_threads = par(CHUNKS, |c| {
-        let (edges, of_weights) = &chunk_data[c];
-        let mut local_of = Vec::new();
-        for &packed in edges {
-            let u = ((packed >> 32) & 0x1FFFFF) as usize;
-            let v = ((packed >> 11) & 0x1FFFFF) as usize;
-            let w_low = (packed & 0x7FF) as u32;
-            let nu = new_id[u] as usize;
-            let nv = new_id[v];
-            let slot = cursor[nu].fetch_add(1, Relaxed) as usize;
-            if w_low < 2047 {
-                adj[slot].store((nv << 11) | w_low, Relaxed);
-            } else {
-                let of_idx = ((packed >> 53) & 0x7FF) as usize;
-                let true_w = of_weights[of_idx];
-                adj[slot].store((nv << 11) | 0x7FF, Relaxed);
-                local_of.push((slot as u32, true_w));
+        let (chunk, mut p, mut local_of) = (&g[cuts[c]..cuts[c + 1]], 0, Vec::new());
+        while p < chunk.len() {
+            let (u, v, w) = unsafe { parse_edge::<true>(chunk, &mut p) };
+            if u != v {
+                let nu = new_id[u as usize] as usize;
+                let nv = new_id[v as usize];
+                let slot = cursor[nu].fetch_add(1, Relaxed) as usize;
+                if w < 2047 {
+                    adj[slot].store((nv << 11) | w, Relaxed);
+                } else {
+                    adj[slot].store((nv << 11) | 0x7FF, Relaxed);
+                    local_of.push((slot as u32, w as u64));
+                }
             }
         }
         local_of
     });
     drop(cursor);
-    drop(chunk_data);
 
     let mut overflow: Vec<(u32, u64)> = of_threads.into_iter().flatten().collect();
     overflow.sort_unstable_by_key(|&(i, _)| i);
@@ -422,7 +413,7 @@ fn main() {
             }
         }
     }
-    drop((has_in, new_id));
+    drop((has_in, new_id)); // FREE new_id!
     #[cfg(unix)]
     unsafe { malloc_trim(0); }
 
