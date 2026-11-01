@@ -45,19 +45,35 @@ template <class P = u32> static P *anon(size_t count) {
   return madvise(p, count * sizeof(P) + 4096, MADV_NOHUGEPAGE), (P *)p;
 }
 
+// Maps a file read-only. A zero page follows it, so that reading eight bytes
+// at the very end is safe.
 static const char *map(const char *path, size_t &len) {
   struct stat st;
   int fd = open(path, O_RDONLY);
   fstat(fd, &st);
-  return (const char *)mmap(0, len = st.st_size, 1, MAP_SHARED, fd, 0);
+  len = st.st_size;
+  char *p = (char *)mmap(0, len + 4096, 1, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  return (const char *)mmap(p, len, 1, MAP_SHARED | MAP_FIXED, fd, 0);
 }
 
-// Reads digits and the one separator after them.
+// Reads digits and the one separator after them. Up to seven digits are
+// converted at once: a digit has bit 4 set, a space or newline has not.
 static u32 num(const char *&p) {
-  u32 x = 0;
-  while (*p >= '0')
-    x = x * 10 + *p++ - '0';
-  return p++, x;
+  u64 w;
+  memcpy(&w, p, 8);
+  u64 sep = ~w & 0x1010101010101010ULL;
+  if (__builtin_expect(!sep || (sep & 0xFF) == 0x10, 0)) {
+    u32 x = 0; // eight digits or more
+    while (*p >= '0')
+      x = x * 10 + *p++ - '0';
+    return p++, x;
+  }
+  u32 len = std::countr_zero(sep) >> 3;
+  p += len + 1;
+  w <<= 64 - 8 * len;
+  w = (w & 0x0F0F0F0F0F0F0F0FULL) * 2561 >> 8;
+  w = (w & 0x00FF00FF00FF00FFULL) * 6553601 >> 16;
+  return (w & 0x0000FFFF0000FFFFULL) * 42949672960001ULL >> 32;
 }
 
 // Just past the next newline, eight bytes at a time.
