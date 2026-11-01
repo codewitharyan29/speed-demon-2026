@@ -21,8 +21,9 @@ They are only used to compare variants, never reported as results.
 | 9 | Popcount-based id sums for bitset results | cce528e | 0.250 | 58 | 67.417 (K 22.30, 827 lines) |
 | 10 | One cache line per scan lookup; one buffer for the scan's stamps and the posting starts; 64 chunks | cd013f9 | 0.260 | 46 | 68.031 (K 22.94, 820 lines) |
 | 11 | One bounds check per token key (`u128` + `bzhi`) | 4e0a5a9 | 0.260 | 45 | 68.068 (K 22.98, 822 lines) |
-| 12 | No binary-search probing in `combine`; `par` without job order (-17 lines) | 9158a69 | | | |
-| 13 | Board experiment: scan table on 2 MB pages (2 MB-aligned, `MADV_HUGEPAGE`, exactly 4 MB with wrap-around spills) | pending | | | |
+| 12 | No binary-search probing in `combine`; `par` without job order (-17 lines) | 9158a69 (scored as c4904b3) | 0.245 | 45 | 68.831 (K 23.80, 805 lines) |
+| 13 | Board experiment: scan table on 2 MB pages (2 MB-aligned, `MADV_HUGEPAGE`, exactly 4 MB with wrap-around spills) | 1e99e80 | 0.253 | 45 | 68.421 (K 23.36, 812 lines); reverted |
+| 14 | Board experiment: tokens looked up 16 at a time instead of 48 (the box has 16 L1D fill buffers per core, shared by two threads) | pending | | | |
 
 ## Local measurements behind step 2 (in-process ms, median)
 
@@ -286,4 +287,9 @@ This laptop cannot rank changes of a few percent any more (different core, cache
 each candidate goes to the board on its own.
 
 - Scan table on 2 MB pages: verified (all seeds, worked example), `AnonHugePages` 4096 kB, `memory.peak` 42 MB local,
-  +7 lines. Local single-thread 991 -> 1,001 (no gain here). Board: pending.
+  +7 lines. Local single-thread 991 -> 1,001 (no gain here). Board: 0.253 s against 0.245 s for the same code without
+  it: no gain, reverted.
+- Board noise: step 12 changed no work but scored 0.245 s against 0.260 s for step 11, so one board run moves by
+  about +-3% (Track C saw up to 6%). A single board run only settles a change of about 5% or more.
+- Lookup batch of 16 instead of 48, on the step-12 code (locally 24 was 224 ms against 213 for 48 in step 8, but
+  the laptop's caches differ). Verified on all seeds; `memory.peak` 43 MB local. Board: pending.
