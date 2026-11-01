@@ -712,10 +712,6 @@ fn main() {
     let sum: Vec<AtomicU64> = (0..queries.len()).map(|_| AtomicU64::new(0)).collect();
     // The ten smallest ids of each query so far, and in the eleventh slot how many of the ten there are.
     let first: Vec<Mutex<[u32; 11]>> = (0..queries.len()).map(|_| Mutex::new([0; 11])).collect();
-    // DIAGNOSTIC: stop before the chunk pass, to read the cost of everything before it from the board.
-    std::fs::write("/out/results.txt", b"").expect("write output");
-    std::process::exit(0);
-    #[allow(unreachable_code)]
     par(CHUNKS, Chunk::default, |w, c| {
         let range = (cut(docs, c, CHUNKS), cut(docs, c + 1, CHUNKS));
         let base = first_doc(range.0);
@@ -746,43 +742,8 @@ fn main() {
         let mut cur = base;
         (seq.clear(), hits.clear());
         scan(docs, range, base, true, offs, |batch| {
-            // Look every token of the batch up first: the loads are independent, so their cache misses overlap.
-            // First every token's key and home slot, asking for the slot's cache line straight away, so the misses
-            // of the whole batch overlap instead of being waited for one at a time.
-            let (mut found, mut keys) = ([miss; BATCH + 33], [(0, 0); BATCH + 33]);
-            for (k, t) in keys.iter_mut().zip(batch) {
-                *k = short_key(docs, t.at as usize, t.len as usize);
-                probe.prefetch(*k);
-            }
-            for ((m, t), &k) in found.iter_mut().zip(batch).zip(&keys) {
-                *m = probe.find(k, miss);
-                // A token over 16 bytes (none in the generated data) is looked up in full.
-                if t.len > 16 {
-                    *m = long_id(t).map_or(miss, |id| meta(id as usize));
-                }
-            }
-            // Then act on them.
-            for (m, t) in found.iter().zip(batch) {
-                let (id, flags, d) = ((m & 0x3FFFF) as usize, m >> 18 & 3, m >> 20);
-                let (doc, local) = (t.doc, t.doc - base);
-                if flags & 1 != 0 && d != NO_BITS {
-                    // A term with a bitset: set the document's bit.
-                    rows[d as usize * wl + local as usize / 64] |= 1 << (local % 64);
-                } else if flags & 1 != 0 && start[id] != doc + 1 {
-                    // Any other BOOL term: a pair, once per document.
-                    start[id] = doc + 1;
-                    pairs.push((id as u32) << DOC_BITS | local);
-                }
-                // The document's term ids in order, and where its phrase triggers are.
-                if doc != cur {
-                    check(seq, hits, cur - base, matched);
-                    (seq.clear(), hits.clear(), cur = doc);
-                }
-                if flags & 2 != 0 {
-                    hits.push(seq.len() as u32);
-                }
-                seq.push(id as u32);
-            }
+            // DIAGNOSTIC: tokenise only, to read the cost of the tokeniser from the board.
+            std::hint::black_box(batch.len());
             true
         });
         check(seq, hits, cur - base, matched);
@@ -834,6 +795,7 @@ fn main() {
         }
         // Every BOOL query, on this chunk's documents.
         for (q, query) in queries.iter().enumerate().filter(|(_, q)| !q.phrase) {
+            if std::hint::black_box(true) { continue; }
             let start = operand(query.terms[0]);
             if matches!(start, Operand::List(l) if l.is_empty()) && !query.ops.contains(&b'O') {
                 continue;
