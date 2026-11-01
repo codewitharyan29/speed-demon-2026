@@ -9,7 +9,7 @@ extern "C" {
 }
 
 const THREADS: usize = 12;
-const CHUNKS: usize = 60;
+const CHUNKS: usize = 48;
 const ONES: u64 = 0x0101010101010101;
 const DOC_BITS: u32 = 14;
 const NO_BITS: u32 = 0xFFF;
@@ -830,8 +830,6 @@ fn main() {
         }
         // Every BOOL query, on this chunk's documents.
         for (q, query) in queries.iter().enumerate().filter(|(_, q)| !q.phrase) {
-            // DIAGNOSTIC: no BOOL evaluation, to read its cost from the board.
-            if std::hint::black_box(true) { continue; }
             let start = operand(query.terms[0]);
             if matches!(start, Operand::List(l) if l.is_empty()) && !query.ops.contains(&b'O') {
                 continue;
