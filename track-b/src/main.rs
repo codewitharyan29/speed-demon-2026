@@ -771,8 +771,23 @@ fn main() {
         // A batch's keys (with their home bucket) and what they look up, made once per chunk.
         let (mut found, mut keys) = ([miss; BATCH + 33], [((0, 0), 0); BATCH + 33]);
         scan(docs, range, base, true, offs, |batch| {
-            // DIAGNOSTIC: tokenise only, to read the cost of the tokeniser from the board.
-            std::hint::black_box(batch.len());
+            // Look every token of the batch up first: the loads are independent, so their cache misses overlap.
+            // First every token's key and home slot, asking for the slot's cache line straight away, so the misses
+            // of the whole batch overlap instead of being waited for one at a time.
+            for (k, t) in keys.iter_mut().zip(batch) {
+                let k2 = short_key(docs, t.at as usize, t.len as usize);
+                *k = (k2, probe.bucket(k2));
+                probe.prefetch(k.1);
+            }
+            for ((m, t), &k) in found.iter_mut().zip(batch).zip(keys.iter()) {
+                *m = probe.find_from(k.1, k.0, miss);
+                // A token over 16 bytes (none in the generated data) is looked up in full.
+                if t.len > 16 {
+                    *m = long_id(t).map_or(miss, |id| meta(id as usize));
+                }
+            }
+            // DIAGNOSTIC: lookups only (no bookkeeping, no evaluation), to read their cost from the board.
+            std::hint::black_box(&found);
             true
         });
         check(seq, hits, cur - base, matched);
