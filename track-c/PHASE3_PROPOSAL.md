@@ -76,3 +76,18 @@ can then be taken to about half its instructions.
 Track C source. It is not to be repeated. The board never ran the diagnostic commits themselves (`9e7524d`, `f7037fd`), because
 later pushes superseded them. A script that waits for a run of its own commit therefore waits forever. Readings are taken from
 whichever run carries the source.
+
+## 7. Candidate A official result (16:54 UTC)
+
+| | Commit | Run | T | M | S | K |
+|---|---|---|---:|---:|---:|---:|
+| Candidate A (one-pass parser, `candA_valid.patch` on `9fb5c93`, source sha256 `b3ebb60f4a8daf64...`) | `80abb30` | run-c79ae56cc4c1 (scored, all gates) | **38.51 ms** | 13.23 MB | 608 | **29.05** |
+| control `9fb5c93` | | three runs | 35.73-36.73 ms | 13.5-13.78 MB | 629 | 29.40-29.76 |
+
+The board ran `80abb30` itself, and Track C did not change during the run. Restored to the control at `669e396` (source sha256
+`27c953167c289741...` = `9fb5c93`). `d4_fixed` (`ff362c4`) never got a run of its own: unavailable.
+
+**Decision: the one-pass parser architecture is rejected.** SMT did not hide its serial chain: it is about 2 ms slower than the
+control's slowest run, even with 14% fewer instructions. No more board runs on variants of it. This also refines section 3:
+the parse stage is not plainly throughput-bound, because a 230 M-instruction cut with a longer dependency chain made it slower.
+Latency and dependency structure matter at least as much as instruction count.
