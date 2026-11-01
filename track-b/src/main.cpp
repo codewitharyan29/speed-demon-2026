@@ -173,6 +173,7 @@ struct Query {
   u32 t[8];
   u8 ops[8];
   u8 n, phrase, has_or;
+  u32 bi;  // for a BOOL query: its place among the BOOL queries
 };
 std::unique_ptr<Query[]> g_queries;
 std::vector<u32> g_bool;  // the numbers of the BOOL queries
@@ -338,17 +339,22 @@ struct Run {
 // ---- Results, by query: each thread adds its chunks' counts and sums into its own arrays (added up at the end); the
 // ten smallest ids so far (and in the eleventh slot how many there are) are shared.
 u32* g_first;
+u64* g_pack;  // per phrase query: count and sum so far
 std::mutex g_mu[64];
 
 // Adds one chunk's answer for query q: the chunk's documents are base + the ids in `run`.
-void report(u32 q, const Run& run, u32 base, u32* count, u64* sum) {
+void report(u32 q, const Run& run, u32 base, u64* acc, bool shared) {
   u64 c, s;
   CYTS(5) run.size_sum(c, s);
   CYT(5)
   if (!c) return;
   u32 cand[20], k = 0, m = 0;
-  count[q] += c;
-  sum[q] += s + c * base;
+  // Count (20 bits) and sum of ids (above them) add up in one word.
+  u64 packed = c | (s + c * base) << 20;
+  if (shared)
+    __atomic_fetch_add(acc, packed, __ATOMIC_RELAXED);
+  else
+    *acc += packed;
   u32* f = g_first + q * 11;
   // No lock when the ten smallest are known and all below this chunk (they only ever get smaller).
   if (__atomic_load_n(&f[10], __ATOMIC_RELAXED) == 10 && __atomic_load_n(&f[9], __ATOMIC_RELAXED) <= base) return;
@@ -373,8 +379,8 @@ struct Worker {
   u64* h;
   u32 *ids, *tp, *dend, *uniq, *slow;
   u16* stamp;
-  u32 *df, *start, *pairs, pcap, *count;
-  u64* sum;
+  u32 *df, *start, *pairs, pcap;
+  u64* acc;  // per BOOL query: this thread's count and sum so far
   u16* post;
   u32 postcap;
   u64* rows;
@@ -587,8 +593,6 @@ void worker(int tid) {
   w.tp = alloc<u32>(kCap + 64);
   w.uniq = alloc<u32>(kCap + 64);
   w.slow = alloc<u32>(kCap + 64);
-  w.count = alloc<u32>(nq);
-  w.sum = alloc<u64>(nq);
   w.dend = alloc<u32>(256);
   g_workers[tid] = &w;
   u64 sa = cut(g_d, tid, 96 * kSamples), sb = cut(g_d, tid + 1, 96 * kSamples);
@@ -637,7 +641,7 @@ void worker(int tid) {
     std::vector<u32> fill(g_tstart.begin(), g_tstart.end());
     for (auto& e : by_term) g_trig[fill[e.first]++] = e.second;
     for (u32 q = 0; q < g_nq; q++)
-      if (!g_queries[q].phrase) g_bool.push_back(q);
+      if (!g_queries[q].phrase) g_queries[q].bi = g_bool.size(), g_bool.push_back(q);
     g_pay.assign(kMaxProv + 1, 0);
     for (u32 p = 1; p <= kMaxProv; p++) {
       u32 f = g_fin[p];
@@ -671,6 +675,7 @@ void worker(int tid) {
   w.stamp = alloc<u16>(g_nt + 1);
   w.start = alloc<u32>(g_ns + 2);
   w.pcap = 1 << 16;
+  w.acc = alloc<u64>(g_bool.size());
   w.pairs = alloc<u32>(w.pcap);
   w.postcap = 1 << 16;
   w.post = alloc<u16>(w.postcap);
@@ -712,7 +717,7 @@ void worker(int tid) {
       run.dense = false;
       run.n = 0;
       for (; i < w.found.size() && w.found[i] >> kDocBits == q; i++) run.list[run.n++] = w.found[i] & ((1 << kDocBits) - 1);
-      report(q, run, base, w.count, w.sum);
+      report(q, run, base, &g_pack[q], true);
     }
     // Every BOOL query, on this chunk's documents.
     for (u32 q : g_bool) {
@@ -721,7 +726,7 @@ void worker(int tid) {
       if (x.b == nullptr && x.n == 0 && !qq.has_or) continue;
       run.start(x);
       for (u32 k = 0; k + 1 < qq.n; k++) run.apply(qq.ops[k], operand(qq.t[k + 1]));
-      report(q, run, base, w.count, w.sum);
+      report(q, run, base, &w.acc[qq.bi], false);
     }
     CY(1)
   }
@@ -731,14 +736,13 @@ void worker(int tid) {
   // ---- Output: each thread adds up the counts and sums of a twelfth of the queries, formats them, and writes them at
   // their place in the file.
   u32 q0 = (u64)g_nq * tid / kThreads, q1 = (u64)g_nq * (tid + 1) / kThreads;
-  u8 *buf = alloc<u8>((size_t)(q1 - q0) * 144 + 64), *o = buf;
+  u8 *buf = (u8*)malloc((size_t)(q1 - q0) * 144 + 64), *o = buf;  // not calloc: it would touch all of it
   for (u32 q = q0; q < q1; q++) {
-    u32 c = 0;
-    u64 sum = 0;
-    for (int x = 0; x < kThreads; x++) c += g_workers[x]->count[q], sum += g_workers[x]->sum[q];
-    o = put(o, c);
+    u64 packed = g_pack[q];
+    for (int x = 0; x < kThreads && !g_queries[q].phrase; x++) packed += g_workers[x]->acc[g_queries[q].bi];
+    o = put(o, packed & 0xFFFFF);
     *o++ = ' ';
-    o = put(o, sum);
+    o = put(o, packed >> 20);
     const u32* f = g_first + q * 11;
     for (u32 i = 0; i < f[10]; i++) {
       *o++ = ' ';
@@ -792,6 +796,7 @@ int main() {
   size_t maxq = g_q.n / 7 + 16;  // a query takes at least 7 bytes
   g_queries.reset(new Query[maxq]);
   g_first = alloc<u32>(maxq * 11);
+  g_pack = alloc<u64>(maxq);
   g_dfall.assign(kMaxProv + 1, 0);
   std::thread th[kThreads - 1];
   for (int i = 0; i < kThreads - 1; i++) th[i] = std::thread(worker, i + 1);
