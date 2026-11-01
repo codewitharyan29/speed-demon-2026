@@ -157,16 +157,15 @@ impl Names {
     }
 }
 
-/// 64-bit hash of a name from its length and its first and last 16 bytes, which must be readable.
+/// 64-bit hash of a name from its length and its first and last 16 bytes, which must be readable. It only places names in
+/// the table: every hit is compared byte for byte.
 unsafe fn hash(s: *const u8, len: usize) -> u64 {
     let read = |p: *const u8| (p as *const u128).read_unaligned();
-    let mix = |x: u128, k: u64| {
-        let r = (x as u64 ^ k) as u128 * ((x >> 64) as u64 ^ 0xA076_1D64_78BD_642F) as u128;
-        r as u64 ^ (r >> 64) as u64
-    };
     let head = if len == 0 { 0 } else { read(s) & (!0u128 >> (128 - 8 * len.min(16))) };
     let tail = if len > 16 { read(s.add(len - 16)) } else { 0 };
-    mix(head, 0x9E37_79B9_7F4A_7C15) ^ mix(tail ^ len as u128, 0xE703_7ED1_A0B4_28DB)
+    let x = head ^ tail.rotate_left(61) ^ (len as u128) << 120;
+    let r = (x as u64 ^ 0x9E37_79B9_7F4A_7C15) as u128 * ((x >> 64) as u64 ^ 0xA076_1D64_78BD_642F) as u128;
+    r as u64 ^ (r >> 64) as u64
 }
 
 /// Running totals of one country.
@@ -183,6 +182,7 @@ struct Agg {
 
 const NONE: Agg = Agg { count: 0, id_sum: 0, sum: 0, min: i64::MAX, max: i64::MIN, name_bytes: 0, note_bytes: 0 };
 
+#[derive(Clone, Copy)]
 /// A parsed record whose country and name are still to be looked up. The name is in the input buffer, or in the batch's
 /// `owned` list (unescaped, with padding) when it contained `""`; its hash is computed and its table slot prefetched.
 struct Rec {
@@ -236,6 +236,15 @@ unsafe fn number(b: &[u8], i: usize) -> (u64, usize) {
         (v, j) = (v * 10 + (*b.get_unchecked(j) - b'0') as u64, j + 1);
     }
     (v, j)
+}
+
+/// The decimal number of `n` digits (1 or more) at `b[i..]`. Up to 8 digits are converted at once, without a branch.
+#[inline(always)]
+unsafe fn digits(b: &[u8], i: usize, n: usize) -> u64 {
+    if n > 8 {
+        return (i..i + n).fold(0, |v, k| v * 10 + (*b.get_unchecked(k) - b'0') as u64);
+    }
+    digits8((b.as_ptr().add(i) as *const u64).read_unaligned() << (8 * (8 - n)))
 }
 
 /// Where the quotes are in a buffer: bit i of word w is set if byte 64 w + i is a `"`, and `before[w]` quotes precede word w.
@@ -303,26 +312,33 @@ unsafe fn text(b: &[u8], q: &Quotes, from: usize, to: usize) -> Option<(usize, u
 }
 
 /// Stage 2: the record that starts at `start` and whose four commas and LF are at `sep` goes into `batch`.
+/// Fields are taken to be what the grammar says (spec 2.1: a solution may assume well-formed input), but the five
+/// separators must be the bytes they should be: a chunk that started inside a quoted field would fail that.
 unsafe fn record(c: &Ctx, b: &[u8], q: &Quotes, start: usize, sep: &[u32], batch: &mut Batch) -> Option<()> {
     let [e1, e2, e3, e4, e5] = [0, 1, 2, 3, 4].map(|k| sep[k] as usize);
-    let sep_ok = *b.get_unchecked(e1) == b',' && *b.get_unchecked(e2) == b',' && *b.get_unchecked(e3) == b',' && *b.get_unchecked(e4) == b',' && *b.get_unchecked(e5) == b'\n';
-    let p = start + 3 * (*b.get_unchecked(start) == 0xEF) as usize; // a BOM in front of the record
+    let at = |i: usize| *b.get_unchecked(i);
+    let sep_ok = at(e1) == b',' && at(e2) == b',' && at(e3) == b',' && at(e4) == b',' && at(e5) == b'\n';
+    let p = start + 3 * (at(start) == 0xEF) as usize; // a BOM in front of the record
     (sep_ok && (p == start || b[start + 1..start + 3] == [0xBB, 0xBF])).then_some(())?;
-    let (id, i) = number(b, p);
-    let (ns, ne, nd) = text(b, q, e1 + 1, e2)?;
-    let (ts, te, td) = text(b, q, e2 + 1, e3)?;
-    let (region, j) = number(b, e3 + 1);
-    let neg = *b.get_unchecked(e4 + 1) == b'-';
-    let (whole, k) = number(b, e4 + 1 + neg as usize);
-    let cr = (*b.get_unchecked(e5 - 1) == b'\r') as usize;
-    let fraction = (*b.get_unchecked(k + 1)).is_ascii_digit() && (*b.get_unchecked(k + 2)).is_ascii_digit();
-    (i == e1 && j == e4 && *b.get_unchecked(k) == b'.' && fraction && k + 3 + cr == e5).then_some(())?;
-    let cents = (whole * 100 + (*b.get_unchecked(k + 1) - b'0') as u64 * 10 + (*b.get_unchecked(k + 2) - b'0') as u64) as i64;
+    let (neg, cr) = (at(e4 + 1) == b'-', (at(e5 - 1) == b'\r') as usize);
+    let (whole_at, dot) = (e4 + 1 + neg as usize, e5 - cr - 3); // the amount ends in ".dd"
+    let cents = (digits(b, whole_at, dot - whole_at) * 100 + (at(dot + 1) - b'0') as u64 * 10 + (at(dot + 2) - b'0') as u64) as i64;
+    let (id, region) = (digits(b, p, e1 - p), digits(b, e3 + 1, e4 - e3 - 1) as usize);
+    // A quoted text field has two delimiting quotes and two more for every `""` pair inside it. If the name and the note
+    // together have no more than their delimiters, neither has a pair.
+    let (name_quoted, note_quoted) = (e2 > e1 + 1 && at(e1 + 1) == b'"', e3 > e2 + 1 && at(e2 + 1) == b'"');
+    let (mut nd, mut td) = (0, 0);
+    if q.before(e3) - q.before(e1 + 1) != 2 * (name_quoted as u32 + note_quoted as u32) {
+        nd = if name_quoted { (q.before(e2) - q.before(e1 + 1) - 2) as usize / 2 } else { 0 };
+        td = if note_quoted { (q.before(e3) - q.before(e2 + 1) - 2) as usize / 2 } else { 0 };
+    }
+    let (ns, ne) = (e1 + 1 + name_quoted as usize, e2 - name_quoted as usize);
+    let note_len = e3 - e2 - 1 - 2 * note_quoted as usize - td;
     let owned = (nd > 0).then(|| {
         let (mut v, mut k) = (Vec::with_capacity(ne - ns + 32), ns);
         while k < ne {
-            v.push(*b.get_unchecked(k));
-            k += 1 + (*b.get_unchecked(k) == b'"') as usize;
+            v.push(at(k));
+            k += 1 + (at(k) == b'"') as usize;
         }
         v.extend_from_slice(&[0; 32]); // readable padding, like the input buffer has
         v
@@ -331,22 +347,20 @@ unsafe fn record(c: &Ctx, b: &[u8], q: &Quotes, start: usize, sep: &[u32], batch
     let name = owned.as_ref().map_or(b[ns..].as_ptr(), |v| v.as_ptr());
     batch.owned.extend(owned);
     // SAFETY: both buffers have 32 readable bytes after the name; the hash reads at most 16 around its ends.
-    let hash = unsafe { hash(name, len) };
-    unsafe {
-        _mm_prefetch::<_MM_HINT_T0>(c.names.slot(hash) as *const AtomicU64 as *const i8);
-        if let Some(r) = c.region.get(region as usize) {
-            _mm_prefetch::<_MM_HINT_T0>(r as *const AtomicU16 as *const i8);
-        }
+    let hash = hash(name, len);
+    _mm_prefetch::<_MM_HINT_T0>(c.names.slot(hash) as *const AtomicU64 as *const i8);
+    if let Some(r) = c.region.get(region) {
+        _mm_prefetch::<_MM_HINT_T0>(r as *const AtomicU16 as *const i8);
     }
     let cents = if neg { -cents } else { cents };
-    batch.recs.push(Rec { id, cents, region: region as usize, name, len, hash, note_bytes: te - ts - td });
+    batch.recs.push(Rec { id, cents, region, name, len, hash, note_bytes: note_len });
     Some(())
 }
 
 /// Looks up the countries and names of the records in `batch` and adds them to `aggs`.
 fn resolve(c: &Ctx, batch: &mut Batch, aggs: &mut [Agg]) {
     batch.recs.iter().for_each(|r| c.names.warm(r.hash));
-    for r in batch.recs.drain(..) {
+    for r in batch.recs.iter() {
         let country = c.dense[c.region.get(r.region).map_or(0, |x| x.load(Relaxed)) as usize] as usize;
         // SAFETY: the name has 32 readable bytes after it, as `record` ensured.
         let name = unsafe { c.names.entry(r.name, r.len, r.hash) };
@@ -359,6 +373,7 @@ fn resolve(c: &Ctx, batch: &mut Batch, aggs: &mut [Agg]) {
         a.name_bytes += r.len as u64;
         a.note_bytes += r.note_bytes as u64;
     }
+    batch.recs.clear();
     batch.owned.clear();
 }
 
@@ -451,19 +466,24 @@ fn run(regions: &File, file: &File, len: usize, bits: u32, chunk: usize) -> Opti
         _ => line_start(regions, rlen, first + (rlen - first) * j / pieces),
     };
     let parsed = parallel(pieces, |j| {
-        let mut text = vec![0u8; cut(j + 1) - cut(j)];
-        regions.read_exact_at(&mut text, cut(j) as u64).ok()?;
-        for line in text.split(|&c| c == b'\n').filter(|l| !l.is_empty()) {
-            let (id, country) = line.split_at(line.iter().position(|&c| c == b',')?);
-            let (id, country) = (id.iter().fold(0, |v, &c| v * 10 + (c - b'0') as usize), &country[1..]);
-            if country.len() != 3 || !country.iter().all(|c| c.is_ascii_uppercase()) || id > max_id {
+        let len = cut(j + 1) - cut(j);
+        let mut text = vec![0u8; len + PAD];
+        regions.read_exact_at(&mut text[..len], cut(j) as u64).ok()?;
+        let mut p = 0;
+        while p < len {
+            // A line is "region_id,CCC" and an LF.
+            // SAFETY: the buffer extends `PAD` bytes past the data.
+            let (id, i) = unsafe { number(&text, p) };
+            let country = &text[i + 1..i + 4];
+            if text[i] != b',' || text[i + 4] != b'\n' || id as usize > max_id || !country.iter().all(|c| c.is_ascii_uppercase()) {
                 return None;
             }
             let code = country.iter().fold(0, |v, &c| v * 26 + (c - b'A') as usize) + 1;
-            region[id].store(code as u16, Relaxed);
+            region[id as usize].store(code as u16, Relaxed);
             seen[code].store(true, Relaxed);
+            p = i + 5;
         }
-        Some(())
+        (p == len).then_some(())
     });
     parsed.iter().all(|r| r.is_some()).then_some(())?;
     // Countries get indices in the order of their packed codes, which is the byte order of the codes; _UNMATCHED is last.
