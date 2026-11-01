@@ -26,8 +26,11 @@ D = 1 throughout (no dependencies). Output hash on every row below: the board's 
 | 10 | 0d1a0c6 | three batches in flight (slots prefetched, then entries, then resolved) | run-67bec4623d2f | 52.5 | 16.5 | 644 | 23.62 |
 | 11 | d1bc253 | batches of 32 + lazily zeroed tables | run-0682687bde57 | 54.3 | 16.5 | 652 | 23.16 |
 | 12 | 5806282 | back to batches of 16; dead code removed | run-88a3e5416bb7 | 52.6 | 16.2 | 604 | **23.90** |
+| 13 | c9c09c8 | 16 KiB blocks (a block and its separators in L1) | run-b11384dacf43 | 56.0 | 14.6 | 604 | 23.66 |
+| 14 | cb4a342 | 128 KiB blocks | run-de6e49033d9e | 61.2 | 18.9 | 604 | 21.50 |
+| 15 | 33ea307 | region table and name slots as lazily zeroed pages, alone | run-e1b6b13c4d77 | 54.9 | 16.2 | 612 | 23.34 |
 
-Kept: 1, 3, 4, 7, 8, 10, 12. Rejected or reverted: 2 (equal to 1 within noise, kept for the instruction counts it enabled), 6 (alone: M
+Kept: 1, 3, 4, 7, 8, 10, 12 (13-15 reverted: 64 KiB blocks and eagerly written zeros are the best measured). Rejected or reverted: 2 (equal to 1 within noise, kept for the instruction counts it enabled), 6 (alone: M
 37.5 MB until THP was disabled, then kept as part of 7), 9 (fewer instructions but 2.1 ms slower on the board, cause not found), 11. Row 5 shows the board's run-to-run noise on this track is under 0.1% (69.68 vs 69.65 ms), so every
 difference above 1 ms in this table is real.
 
@@ -53,6 +56,14 @@ difference above 1 ms in this table is real.
   7.4 MB structure that does not fit a core's 2 MB L2. A deeper prefetch pipeline gave 2.5 ms; two-level layout 9 ms (row 6 vs 3).
 * Local (VM) measurements misled twice: batch size and prefetch distance made no difference there but the table layout did on the
   board; and the VM's THP setting hid a 20 MB peak that the board's `always` setting produced (rows 6 and 7).
+
+## Transparent huge pages
+
+The board has THP `always`. Without `PR_SET_THP_DISABLE` (rows 6 vs 7) M was 37.5 MB instead of 16.2 MB with otherwise the same code,
+and I could not find the mapping that was inflated: with THP forced to `always` in the Docker VM, a smaps dump during the run
+shows huge pages only in the dense name table (6 MB), while cgroup `memory.peak` was 21-27 MB against 14 MB with THP disabled
+(small thread stacks, a sub-2 MiB spill area and `M_ARENA_MAX=1` changed nothing). A gain from huge pages (fewer TLB misses and page
+faults on the 10 MB table) is therefore untested; the memory risk made it not worth a board run.
 
 ## Not done / ideas with their expected value
 

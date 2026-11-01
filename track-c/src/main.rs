@@ -31,15 +31,6 @@ fn zeros<T: Default>(n: usize) -> Vec<T> {
     (0..n).map(|_| T::default()).collect()
 }
 
-/// The zeros as atomics. Zeroed memory from the allocator is fresh pages that are not touched until used, which costs
-/// less for a big array than writing the zeros (`zeros`) in one thread.
-fn zeroed<A, T>(zeros: Vec<T>) -> Vec<A> {
-    assert!(std::mem::size_of::<A>() == std::mem::size_of::<T>() && std::mem::align_of::<A>() == std::mem::align_of::<T>());
-    let mut zeros = std::mem::ManuallyDrop::new(zeros);
-    // SAFETY: an atomic has the layout of its integer; the allocation is handed over unchanged.
-    unsafe { Vec::from_raw_parts(zeros.as_mut_ptr() as *mut A, zeros.len(), zeros.capacity()) }
-}
-
 /// Runs `f(0..jobs)` on all available threads, which take jobs from one counter; returns the results in any order.
 fn parallel<R: Send>(jobs: usize, f: impl Fn(usize) -> R + Sync) -> Vec<R> {
     let next = AtomicUsize::new(0);
@@ -81,7 +72,7 @@ impl Names {
         let base = (unsafe { std::alloc::alloc_zeroed(layout) } as usize + 63) & !63;
         let entries = unsafe { std::slice::from_raw_parts(base as *const Entry, 1 << (bits - 1)) };
         let spill = Box::leak(vec![0u8; 32 << bits].into_boxed_slice());
-        Names { slots: zeroed(vec![0u64; 1 << bits]), entries, spill, spilled: AtomicUsize::new(0), next: AtomicUsize::new(0), full: AtomicBool::new(false) }
+        Names { slots: zeros(1 << bits), entries, spill, spilled: AtomicUsize::new(0), next: AtomicUsize::new(0), full: AtomicBool::new(false) }
     }
 
     /// The slot where the search for a name with hash `h` starts.
@@ -456,7 +447,7 @@ fn run(regions: &File, file: &File, len: usize, bits: u32, chunk: usize) -> Opti
     let first = head.iter().position(|&c| c == b'\n')? + 1;
     let last = tail[..63].iter().rposition(|&c| c == b'\n')? + 1;
     let max_id = tail[last..].iter().take_while(|c| c.is_ascii_digit()).fold(0, |v, &c| v * 10 + (c - b'0') as usize);
-    let (region, seen): (Vec<AtomicU16>, Vec<AtomicBool>) = (zeroed(vec![0u16; max_id + 1]), zeros(26 * 26 * 26 + 1));
+    let (region, seen): (Vec<AtomicU16>, Vec<AtomicBool>) = (zeros(max_id + 1), zeros(26 * 26 * 26 + 1));
     let pieces = 16;
     let cut = |j: usize| match j {
         0 => first,
