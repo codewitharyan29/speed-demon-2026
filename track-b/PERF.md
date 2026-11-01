@@ -21,6 +21,8 @@ They are only used to compare variants, never reported as results.
 | 9 | Popcount-based id sums for bitset results | cce528e | 0.250 | 58 | 67.417 (K 22.30, 827 lines) |
 | 10 | One cache line per scan lookup; one buffer for the scan's stamps and the posting starts; 64 chunks | cd013f9 | 0.260 | 46 | 68.031 (K 22.94, 820 lines) |
 | 11 | One bounds check per token key (`u128` + `bzhi`) | 4e0a5a9 | 0.260 | 45 | 68.068 (K 22.98, 822 lines) |
+| 12 | No binary-search probing in `combine`; `par` without job order (-17 lines) | 9158a69 | | | |
+| 13 | Board experiment: scan table on 2 MB pages (2 MB-aligned, `MADV_HUGEPAGE`, exactly 4 MB with wrap-around spills) | pending | | | |
 
 ## Local measurements behind step 2 (in-process ms, median)
 
@@ -252,3 +254,36 @@ is the loop and its mispredicted branches.
 | No `Table::shrink` (the term and pair tables keep their parse-time size) | 1 thread: 990 -> 1,000; 12 threads: 177 -> 176; `memory.peak` 42 -> 44 MB | rejected: 10 lines are worth less than 2 MB |
 
 Verified on full seeds 1 and 2, sample seeds 1-3, tiny seeds 1-6 and the worked example; `memory.peak` 42 MB local.
+
+## Research on the scoring box (2026-11-01)
+
+From the organisers' harness (`harness/setup-box.sh`, `run_submission.py`, `timer/sd-timer.c`): a Hetzner EX44 with an
+Intel Core i5-13500 on Debian 13; runs are pinned to CPUs 0-11 (the 6 P-cores with Hyper-Threading; the E-cores 12-19
+run the line-counting tools), turbo off and the performance governor, so the P-cores run at a fixed 2.5 GHz; T is
+exec-to-exit of five runs (mean of the middle three); M is the run cgroup's `memory.peak`; native builds are compiled on
+the box.
+
+From four research passes (web sources; details in the session notes):
+- The i5-13500 is cut from the Alder Lake C0 die: Golden Cove P-cores with 48 KB L1D (5 cycles), 1.25 MB L2 (~15
+  cycles), 24 MB shared L3 (~13-17 ns, only ~35-43 cycles at 2.5 GHz), DDR4 (~90 ns, ~225 cycles). 16 L1D fill buffers
+  and 48 outstanding L2 misses per core, shared by the two hardware threads. L1 DTLB 96 x 4 KB / 32 x 2 MB entries,
+  STLB ~2048. Mispredict ~17 cycles. All scalar bit operations and 64-bit multiplies use port 1 only; `vpgatherqq` is
+  ~22-29 cycles latency, 2 cycles throughput.
+- So on the box a cache miss costs fewer cycles than on this laptop (Core Ultra 7 155H, 2 MB L2, ~4.8 GHz turbo), and
+  instructions and mispredicts weigh more. At 0.13 s the whole budget is ~54 core cycles per token.
+- Debian 13's kernel (6.12) has transparent huge pages `always`, but only for 2 MB-aligned ranges, which glibc's
+  allocations usually are not. A 2 MB-aligned allocation with `madvise(MADV_HUGEPAGE)` does get huge pages here
+  (`AnonHugePages` 4096 kB for the 4 MB scan table), with no change in `memory.peak`; single-thread time here 991 -> 1,001
+  (no gain on the laptop; the box's smaller L2 and STLB pressure may differ).
+- Page-cache pages of `/data` loaded by the host's vmtouch are not charged to us; the output file in `/out` is.
+- Query evaluation: a rare term (df ~100) still appears in ~50 of 64 chunks, which is why chunk-level skipping never
+  helped. The structural alternative is document-driven ("trigger") evaluation of queries that have a rare cover term,
+  estimated at half the evaluation cost but ~300 lines.
+
+## Step 13: board experiments (one change per board run)
+
+This laptop cannot rank changes of a few percent any more (different core, cache sizes and clock from the box), so
+each candidate goes to the board on its own.
+
+- Scan table on 2 MB pages: verified (all seeds, worked example), `AnonHugePages` 4096 kB, `memory.peak` 42 MB local,
+  +7 lines. Local single-thread 991 -> 1,001 (no gain here). Board: pending.
