@@ -500,3 +500,17 @@ The scatter wrote the final edge array at random positions (13 ms) after a separ
 | Change | Local result (ms, median of 15, interleaved) | Verdict |
 |---|---|---|
 | A finished BFS region reserves its range of new ids and its range of edge slots with one atomic add (node count in the high half, edge count in the low half, so the two stay consistent), writes `nid`, `first` (absolute offsets: no prefix pass) and copies the rows of its nodes (still in cache) into its slice of `adj`, with targets still in old ids; a streaming pass then maps every target through `nid` (prefetched); the spill lists and the heavy-weight table are sorted before the BFS (one more barrier) | BFS 13.5 -> 20.5, scatter + prefix 14.2 -> 3.0; total 106.9 -> 102.6, peak 72 MB unchanged | kept |
+
+Board run 9c7e08a (step 31): T 0.1491 s, M 73.9 MB, S 384, K 26.17, 70.89 pts: level with step 30 (0.1479 s, K 26.25) inside the
+board's ~2% spread, although the local total fell 4%.
+
+## Step 32: SWAR number parsing
+
+Each number was parsed with a digit loop whose exit (3-7 digits) is unpredictable: about one mispredict per number, three per line.
+
+| Change | Local result (ms, median of 15) | Verdict |
+|---|---|---|
+| Load 8 bytes, find the separator from bit 4 (a digit has it set, a space or newline has not), shift the digits to the top of the word and convert with three multiplies; 8 digits or more (the rare large weights) take the old loop; every mapped file gets a zero page after it so the 8-byte load is safe at the end | parse 31.7 -> 27.0; total 117.7 -> 110.5 | kept |
+| BFS region size 4096 / 16384, prefetch lookahead 2 / 8 (default 8192 / 4) | BFS 24.5 / 25.1 / 24.4 / 24.5 vs 25.9 | no effect, kept |
+| Threads 8 / 16 / 24 instead of 12 | total 131 / 123 / 127 vs 116 ms | 12 kept |
+| Bucket widths 16 / 32 / 64 with the bidirectional search | queries 42.5 / 43.2 / 43.2 | no effect |
