@@ -116,3 +116,15 @@ Source sha256 `<see commit>`, S 630.
    (no PMU in the VM, no `perf`).
 3. Local-to-board ratios seen before (R2 -8% local, about 0 on the board; Candidate A +23% local, about +6% on the board)
    suggest 0 to +1 ms on the board: inside the board's noise, so low information value, and low odds of a clear gain.
+
+## 9. Q4 (read-only lookup diagnostic): rejected by the user, not run
+
+Q4 would have removed the locked OR and turned `warm()`'s write prefetch into a read prefetch, one line different from
+`tc6_nomask`. It would have measured the cost of taking write ownership of name entries (the ownership request, the
+invalidation of other copies) without separating migration from ownership requests served from L3. The 88.4% figure behind it
+was a Python simulation, not a measurement. It placed each record in a chunk at `index x 61 // 2^20`, assigned chunks round-robin
+to 12 workers, and compared each repeated name's worker with its previous one. It ignores real scheduling, SMT pairs sharing an
+L2, and above all eviction: the median gap of 67 k records (about 0.7 ms) makes it likely that the line has left the previous
+writer's L2. So 88.4% is an upper bound on ownership changes, not a count of core-to-core transfers. Even a large Q4 result would
+only have justified O2 (+131 lines, uncertain). **The name-table ownership and layout investigation is closed; O2 is not
+started.**
