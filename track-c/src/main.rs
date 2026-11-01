@@ -31,6 +31,14 @@ fn zeros<T: Default>(n: usize) -> Vec<T> {
     (0..n).map(|_| T::default()).collect()
 }
 
+/// `n` zero atomics. Zeroed memory from the allocator is fresh pages that nothing touches until a worker writes to them,
+/// which costs less for a big array that is only ever written first than one thread writing the zeros.
+fn zeroed_u16(n: usize) -> Vec<AtomicU16> {
+    let mut v = std::mem::ManuallyDrop::new(vec![0u16; n]);
+    // SAFETY: an `AtomicU16` has the layout of a `u16`; the allocation is handed over unchanged.
+    unsafe { Vec::from_raw_parts(v.as_mut_ptr() as *mut AtomicU16, v.len(), v.capacity()) }
+}
+
 /// Runs `f(0..jobs)` on all available threads, which take jobs from one counter; returns the results in any order.
 fn parallel<R: Send>(jobs: usize, f: impl Fn(usize) -> R + Sync) -> Vec<R> {
     let next = AtomicUsize::new(0);
@@ -447,8 +455,8 @@ fn run(regions: &File, file: &File, len: usize, bits: u32, chunk: usize) -> Opti
     let first = head.iter().position(|&c| c == b'\n')? + 1;
     let last = tail[..63].iter().rposition(|&c| c == b'\n')? + 1;
     let max_id = tail[last..].iter().take_while(|c| c.is_ascii_digit()).fold(0, |v, &c| v * 10 + (c - b'0') as usize);
-    let (region, seen): (Vec<AtomicU16>, Vec<AtomicBool>) = (zeros(max_id + 1), zeros(26 * 26 * 26 + 1));
-    let pieces = 16;
+    let (region, seen): (Vec<AtomicU16>, Vec<AtomicBool>) = (zeroed_u16(max_id + 1), zeros(26 * 26 * 26 + 1));
+    let pieces = 48;
     let cut = |j: usize| match j {
         0 => first,
         _ if j == pieces => rlen,
@@ -476,7 +484,6 @@ fn run(regions: &File, file: &File, len: usize, bits: u32, chunk: usize) -> Opti
         (p == len).then_some(())
     });
     parsed.iter().all(|r| r.is_some()).then_some(())?;
-    std::process::exit(0); // DIAGNOSTIC: regions only
     // Countries get indices in the order of their packed codes, which is the byte order of the codes; _UNMATCHED is last.
     let (mut dense, mut keys) = (vec![0u16; seen.len()], vec![]);
     for code in (1..seen.len()).filter(|&c| seen[c].load(Relaxed)) {
