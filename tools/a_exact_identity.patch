@@ -1,0 +1,116 @@
+--- a/track-a/src/main.rs
++++ b/track-a/src/main.rs
+@@ -41,33 +41,29 @@
+     (0..n).map(|_| T::default()).collect()
+ }
+ 
+-/// 64-bit hash of all `len` bytes at `s` (nonzero); `s` must have 128 readable bytes. The first 64 bytes are always
+-/// hashed as four independent AES blocks, so short and long endpoints take the same branch-free path.
++/// The first 64 bytes of the endpoint at `s` (`len` bytes; 128 bytes readable), zero past its end, as two vectors.
+ #[inline(always)]
+-unsafe fn hash(s: *const u8, len: usize) -> u64 {
++unsafe fn head(s: *const u8, len: usize) -> (__m256i, __m256i) {
+     let iota = _mm256_set_epi8(31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
+     let block = |o: usize| {
+-        let live = _mm256_cmpgt_epi8(_mm256_set1_epi8(len as i32 as i8 - o as i8), iota);
++        let live = _mm256_cmpgt_epi8(_mm256_set1_epi8((len.min(127) as i32 - o as i32) as i8), iota);
+         _mm256_and_si256(_mm256_loadu_si256(s.add(o) as _), live)
+     };
+-    let key = |i: i64| _mm_set_epi64x(0x9E37_79B9_7F4A_7C15u64 as i64 ^ i, 0xD6E8_FEB8_6659_FD93u64 as i64 ^ i * 0x517C_C1B7);
+-    let (v0, v1) = (block(0), block(32));
+-    let t = |x, i| _mm_aesenc_si128(x, key(i));
+-    let p = _mm_aesenc_si128(_mm_xor_si128(t(_mm256_castsi256_si128(v0), 1), t(_mm256_extracti128_si256(v0, 1), 2)), key(5));
+-    let q = _mm_aesenc_si128(_mm_xor_si128(t(_mm256_castsi256_si128(v1), 3), t(_mm256_extracti128_si256(v1, 1), 4)), key(6));
+-    let mut r = _mm_aesenc_si128(_mm_xor_si128(p, q), key(7));
+-    let mut o = 64;
+-    while o < len {
+-        let x = _mm_and_si128(_mm_loadu_si128(s.add(o) as _), _mm_cmpgt_epi8(_mm_set1_epi8(len as i32 as i8 - o as i8), _mm256_castsi256_si128(iota)));
+-        r = _mm_aesenc_si128(_mm_xor_si128(r, x), key(8));
+-        o += 16;
+-    }
+-    let r = _mm_aesenc_si128(_mm_xor_si128(r, _mm_set1_epi64x(len as i64)), key(9));
++    (block(0), block(32))
++}
++
++/// 64-bit hash (nonzero) of the length and the first 64 bytes of an endpoint. It only places endpoints in the dictionary:
++/// a hit is confirmed by comparing the bytes, so two AES rounds are enough.
++#[inline(always)]
++unsafe fn hash(v: (__m256i, __m256i), len: usize) -> u64 {
++    let lane = |x: __m256i| _mm_xor_si128(_mm256_castsi256_si128(x), _mm_shuffle_epi32(_mm256_extracti128_si256(x, 1), 0x4E));
++    let k = _mm_set_epi64x(0x9E37_79B9_7F4A_7C15u64 as i64, 0xD6E8_FEB8_6659_FD93u64 as i64 ^ len as i64);
++    let r = _mm_aesenc_si128(_mm_aesenc_si128(_mm_xor_si128(lane(v.0), k), lane(v.1)), k);
+     (_mm_cvtsi128_si64(r) ^ _mm_extract_epi64(r, 1)) as u64 | 1
+ }
+ 
+-/// Endpoint dictionary shared by all workers: open addressing keyed by the full 64-bit hash of the endpoint.
+-/// Lookups are lock-free and never touch the key bytes; inserts run under a lock.
++/// Endpoint dictionary shared by all workers: open addressing on a 64-bit hash, every hit confirmed by comparing the
++/// endpoint's bytes with the stored ones (zero padded). Lookups are lock-free; inserts run under a lock.
+ struct Dict {
+     hashes: Vec<AtomicU64>,
+     ids: Vec<AtomicU32>,
+@@ -77,7 +73,7 @@
+ 
+ impl Dict {
+     fn new() -> Self {
+-        let keys = vec![0u8; SLOTS * STRIDE].leak().as_ptr() as usize;
++        let keys = (vec![0u8; SLOTS * STRIDE + 64].leak().as_ptr() as usize + 63) & !63; // lines that a comparison reads whole
+         Dict { hashes: zeros(SLOTS), ids: zeros(SLOTS), keys, count: Mutex::new(0) }
+     }
+ 
+@@ -90,17 +86,25 @@
+         unsafe { std::slice::from_raw_parts(self.ptr(id), *self.ptr(id).add(STRIDE - 1) as usize) }
+     }
+ 
+-    /// Id of the endpoint at `s` (`len` bytes, hash `h`), adding it if it is new.
++    /// Whether endpoint `id` is the `len` bytes at `s`, whose first 64 bytes (zero padded) are `v`.
++    #[inline(always)]
++    unsafe fn same(&self, id: usize, s: *const u8, len: usize, v: (__m256i, __m256i)) -> bool {
++        let k = self.ptr(id);
++        let eq = |o: usize, x| _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256(k.add(o) as _), x)) == -1;
++        *k.add(STRIDE - 1) as usize == len && eq(0, v.0) && eq(32, v.1) && (len <= 64 || self.key(id)[64..] == *std::slice::from_raw_parts(s.add(64), len - 64))
++    }
++
++    /// Id of the endpoint at `s` (`len` bytes, first 64 bytes `v`, hash `h`), adding it if it is new.
+     #[inline(always)]
+-    unsafe fn lookup(&self, s: *const u8, len: usize, h: u64) -> u32 {
++    unsafe fn lookup(&self, s: *const u8, len: usize, v: (__m256i, __m256i), h: u64) -> u32 {
+         let mut slot = (h >> 40) as usize % SLOTS;
+         loop {
+-            let v = self.hashes[slot].load(Acquire);
+-            if v == h {
++            let x = self.hashes[slot].load(Acquire);
++            if x == h && self.same(self.ids[slot].load(Relaxed) as usize, s, len, v) {
+                 return self.ids[slot].load(Relaxed);
+             }
+-            if v == 0 {
+-                return self.insert(s, len, h, slot);
++            if x == 0 {
++                return self.insert(s, len, v, h, slot);
+             }
+             slot = (slot + 1) % SLOTS;
+         }
+@@ -108,10 +112,10 @@
+ 
+     #[cold]
+     #[inline(never)]
+-    unsafe fn insert(&self, s: *const u8, len: usize, h: u64, mut slot: usize) -> u32 {
++    unsafe fn insert(&self, s: *const u8, len: usize, v: (__m256i, __m256i), h: u64, mut slot: usize) -> u32 {
+         let mut count = self.count.lock().unwrap();
+         while self.hashes[slot].load(Acquire) != 0 {
+-            if self.hashes[slot].load(Acquire) == h {
++            if self.hashes[slot].load(Acquire) == h && self.same(self.ids[slot].load(Relaxed) as usize, s, len, v) {
+                 return self.ids[slot].load(Relaxed); // another worker added it first
+             }
+             slot = (slot + 1) % SLOTS;
+@@ -177,7 +181,9 @@
+             0 => (64..).step_by(32).map(|o| (o, find(w.add(o)))).find(|&(_, m)| m != 0).map(|(o, m)| o + m.trailing_zeros() as usize).unwrap(),
+             more => more.trailing_zeros() as usize,
+         };
+-        let id = dict.lookup(w.add(start), end - start, hash(w.add(start), end - start));
++        let (e, n) = (w.add(start), end - start);
++        let v = head(e, n);
++        let id = dict.lookup(e, n, v, hash(v, n));
+         let failed = *w.add(end + 1) == b'5';
+         let (lat, digits) = latency(w.add(end + 5));
+         let word = lat.min(SENT) | (id | (failed as u32) << 11) << 20;
