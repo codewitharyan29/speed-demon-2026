@@ -1,10 +1,20 @@
 # Track C: R2 board validation and next experiments
 
-## Status: no board run yet
+## Official result (run by another session, logged on `speed-demon`)
 
-The board builds only what is pushed to `speed-demon`. I was asked not to push R2 there, and speeddemon.dev is not reachable from
-this environment's proxy, so no official run was possible from here. **Every K for R1 and R2 below is a projection from local
-timings, not an official result.**
+R2 was pushed to `speed-demon` as `46829d6` (source identical to `736e57a`) and measured once:
+
+| Candidate | Board run | T | M | S | K |
+|---|---|---:|---:|---:|---:|
+| control `9fb5c93` | run-99e4e3237a66 / run-ec41ba8a226a / run-a829e7350f95 | 36.59 / 35.73 / 36.73 ms | 13.5-13.78 MB | 629 | 29.52 / 29.76 / 29.40 |
+| **R2 `736e57a`** | **run-a3e9f05bd3dc** | **36.09 ms** | **13.3 MB** | 656 | **29.63** |
+| R1 `7c64950` | none | N/A | N/A | 636 | N/A |
+
+**R2 gives no measurable board gain.** Its T is inside the control's 35.73-36.73 ms range, and K 29.63 is inside 29.40-29.76. The
+-8% seen locally (4 vCPUs, no SMT) did not transfer to the board's 12 SMT threads. The other session reverted `speed-demon` to the
+control (`c5b7898`) and tagged R2 `tc-r2-experiment`. This session did not push to `speed-demon` again. Lesson: on this workload
+the local VM's single-core instruction savings do not predict the board. The board seems bound by something else (memory
+latency, or SMT sharing of the lookup path), which matches P2 below: removing a prefetch hurt by 7%.
 
 ## Exact candidates (all on `origin/cloud/track-c-extreme-rewrite`, all recoverable)
 
@@ -28,7 +38,7 @@ Only `track-c/src/main.rs` differs from the control, plus documentation. `Cargo.
 * Earlier, on the same source: 200-byte blocks with 3,000-byte chunks, overflow checks with debug assertions, and valgrind
   memcheck (0 errors on tiny, adversarial, hostile and stress): all pass.
 
-## Comparison (local = KVM, 4 vCPUs of a Xeon, 80 interleaved runs, full seed 1; board = official)
+## Earlier comparison before the board run (local = KVM, 4 vCPUs of a Xeon, 80 interleaved runs, full seed 1; board = official)
 
 | | Board runs | Board T | Board M | Board K | Local median (4 threads) | Local instructions | Projected K |
 |---|---|---:|---:|---:|---:|---:|---:|
