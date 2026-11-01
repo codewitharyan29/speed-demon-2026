@@ -418,3 +418,22 @@ K 20.96, 66.07 pts. Local A/B differences carry over to the board (local 193 vs 
 | Each pass parses 16 lines into small arrays and issues a write-prefetch for every counter, then does the atomic increments (the passes were one cache miss per edge, one after the other) | pass 2 34.1 -> 24.5, pass 1 15.0 -> 13.1; total 192 -> 177 | kept; batch 32 is the same, 16 is smaller |
 | BFS: prefetch `s0[v]` when a node is queued, and `e0` for the node four places ahead in the queue | BFS 22.1 -> 19.1 | kept |
 | Prefetch `dist[v]` of every edge of a node before relaxing them | queries 111.7 vs 111.7 | rejected: no effect |
+
+## Step 27: coarse Dial buckets and paged distances
+
+Board run d123e7a (step 26): T 0.2489 s, M 82.0 MB, S 277, K 20.84. T was 4 ms above step 25's 0.2445 s although the local
+total was ~15 ms lower: the board's run-to-run spread is larger than the effects measured here, and the board keeps each
+team's best run. Local interleaved A/B (same container, alternating, median of 11-13) stays the instrument for small changes.
+
+| Change | Local result | Verdict |
+|---|---|---|
+| Dial buckets 16 distance units wide (key >> 4), nodes in a bucket in any order, a node is skipped when its own distance is in an earlier bucket, and t's distance is final once a later bucket is reached. The ring then covers every distance below 60000, so the "weight 4096..59999" special case disappears; no modulo; the next bucket is found with one `ctz` on the summary word | queries 103 -> 99 ms; widths 16 / 32 / 64 are equal (99 / 102 / 101) | kept (16) |
+| Distances in 512-entry pages taken from a per-worker bump pool on first write, page 0 shared and zero for unseen nodes, whole pages cleared at the end of a query (no `touched` list) | speed unchanged (181.7 vs 181.7 ms total), peak memory 74 -> 63 MB, query-phase memory 74 -> 36 MB | kept |
+| Prefetch `first[v]` when a node is queued | removing it costs +10 ms | kept |
+| Prefetch the adjacency row when a node is queued; stop work-stealing (own slice only) or limit it to 3 slices | 104 vs 103 ms; 124 / 112 vs 103 ms | rejected |
+| Return finished `e0` pages with `MADV_DONTNEED` during the scatter | peak 63 MB unchanged | rejected |
+
+Memory by phase (cgroup `memory.current` read at each barrier): 10 MB after pass 1, 30 after pass 2, 43 after the BFS, ~60 during
+the scatter, 43 after it, 36 while searching. The scatter writes `adj` at random positions, so all 20 MB of it is resident within
+a few ms while `e0` can only be released gradually: the peak is the five build arrays together and cannot be lowered by
+releasing `e0` early.
