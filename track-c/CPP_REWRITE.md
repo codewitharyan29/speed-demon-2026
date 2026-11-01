@@ -75,3 +75,15 @@ T at parity, as predicted locally (inside the control's range); M +0.1-0.4 MB; S
 gain is the source size, as estimated (+3.7% at equal M; the slightly higher M costs about 0.5%). Production was restored to the
 control's Track C at `4e11c91` (track-c/ identical to `669e396`; src/main.rs sha256 `27c953167c289741`). The board's "best" for
 Track C now records this run.
+
+## Experiment ledger after the official run (local only from here; no further board runs)
+
+Per-line profile of the C++ baseline (valgrind, full seed 1, 1,760 M instructions, about 530 per record): separator extraction
+51/record (9.7%), the three numbers about 75 (14%), per-record validation about 40 (7%), quote counts about 28 (5%), the lookup path
+about 120 (23%), the rest about 215. No single dominant avoidable cost. And the board has twice shown that instruction cuts barely
+move T (R2: -14% instructions, no gain; Candidate A: fewer instructions, slower). So no instruction-diet variant was built.
+
+| ID | Hypothesis | Source | Correct | Local T (4 threads, vs baseline in the same run) | RSS | S | K projection | Decision |
+|---|---|---|---|---:|---:|---:|---|---|
+| cx2 (= 6ec50ad) | baseline | `track-c/src/main.cpp` | 9/9, sanitizers | | 11.5 MB | 494 | **board 30.54** | baseline |
+| C-R (crm2) | a region map that stays in L2 (64-id bitmap + rank, 16 B per block, plus a dense country byte per region, 356 KB instead of 1 MB); the rank is computed and the country prefetched in `warm()`, so `resolve()` has no added dependent load | `docs/track-c-cpp-candidates/crm2_region_map.cpp` | 9/9 | +1.7% / +3.5% (CPU equal); 2 threads +1% | **-0.5 MB** (HWM 11.57 vs 12.04) | 546 | -1.5 to -2% at local T; positive only if the board's L2 misses on the 1 MB table cost about 1.5 ms or more (untested; analogy with board run 21) | not submitted |
