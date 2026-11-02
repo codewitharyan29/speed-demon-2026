@@ -379,15 +379,6 @@ impl Job {
             }
             let end = starts[id as usize];
             let (p50, p95, p99) = percentiles(&mut values[end - n..end]);
-            let mark = out.len();
-            out.extend_from_slice(prefix.as_bytes());
-            out.extend_from_slice(self.dict.key(id as usize));
-            for v in [n as u64, p50 as u64, p95 as u64, p99 as u64, errs, errs * 1_000_000 / n as u64] {
-                out.push(b' ');
-                number(&mut out, v);
-            }
-            out.push(b'\n');
-            out.truncate(mark);
             out.extend_from_slice(prefix.as_bytes());
             out.extend_from_slice(self.dict.key(id as usize));
             for v in [n as u64, p50 as u64, p95 as u64, p99 as u64, errs, errs * 1_000_000 / n as u64] {
