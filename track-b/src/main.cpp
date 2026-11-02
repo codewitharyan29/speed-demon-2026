@@ -19,11 +19,11 @@ using u32 = uint32_t;
 using u64 = uint64_t;
 
 constexpr int kThreads = 12, kChunks = 48, kSamples = 12, kDocBits = 14;
-constexpr u32 kCap = 1 << 14, kFlush = 384, kAhead = 16, kLines = 1 << 15;
+constexpr u32 kCap = 1 << 14, kFlush = 384, kAhead = 16, kLines = 1 << 14;
 constexpr u32 kOvfSize = 1 << 13, kOvfMask = kOvfSize - 1;
-constexpr u32 kOvfBase = kLines * 4, kMaxProv = kOvfBase + kOvfSize;
+constexpr u32 kOvfBase = kLines * 8, kMaxProv = kOvfBase + kOvfSize;
 constexpr u32 kMaxPairs = 300000, kMaxFound = 1 << 15;
-constexpr u64 kTag = ~0xFFFFFFFFULL, kPay = 0xFFFFFFFFULL, kTop = 1ULL << 63;
+constexpr u64 kTag = ~0x7FFFFFFFULL, kPay = 0x3FFFFFFFULL, kOvf = 1ULL << 30, kTop = 1ULL << 63;
 constexpr u64 kOnes = 0x0101010101010101ULL;
 
 struct File {
@@ -89,9 +89,8 @@ __attribute__((noinline)) u64 hash_bytes(const char* s, size_t len, bool lower) 
   return h | kTop;
 }
 
-alignas(64) u64 g_tab[kLines * 4 + 8];
+alignas(64) u64 g_tab[kLines * 8 + 8];
 alignas(64) u64 g_ovf[kOvfSize];
-alignas(64) u64 g_line_ovf[kLines / 64];
 u8* g_used;
 
 inline u32 line_of(u64 h) { return static_cast<u32>(h >> 17) & (kLines - 1); }
@@ -104,14 +103,16 @@ inline u64 ovf_find(u64 h) {
 }
 
 inline u64 lookup(u64 h, u32& slow) {
-  u32 ln = line_of(h);
-  const u64* l = g_tab + ln * 4;
+  const u64* l = g_tab + line_of(h) * 8;
   const __m256i t = _mm256_set1_epi64x(h & kTag), m = _mm256_set1_epi64x(kTag);
   __m256i a = _mm256_cmpeq_epi64(
       _mm256_and_si256(_mm256_load_si256(reinterpret_cast<const __m256i*>(l)), m), t);
-  u32 hit = _mm256_movemask_pd(_mm256_castsi256_pd(a));
-  u64 e = l[_tzcnt_u32(hit) & 3] & -static_cast<u64>(hit != 0);
-  slow = (hit == 0) & static_cast<u32>((g_line_ovf[ln >> 6] >> (ln & 63)) & 1);
+  __m256i b = _mm256_cmpeq_epi64(
+      _mm256_and_si256(_mm256_load_si256(reinterpret_cast<const __m256i*>(l + 4)), m), t);
+  u32 hit = _mm256_movemask_pd(_mm256_castsi256_pd(a)) |
+            (_mm256_movemask_pd(_mm256_castsi256_pd(b)) << 4);
+  u64 e = l[_tzcnt_u32(hit) & 7] & -static_cast<u64>(hit != 0);
+  slow = (hit == 0) & static_cast<u32>((l[(h >> 31) & 7] >> 30) & 1);
   return e;
 }
 
@@ -123,7 +124,7 @@ inline bool claim(u64* slot, u64 h, u32 id, u32& out) {
     return true;
   }
   if (((e ^ h) & kTag) == 0) {
-    out = static_cast<u32>(e & 0x7FFFFFFF);
+    out = static_cast<u32>(e & 0x3FFFF);
     return true;
   }
   return false;
@@ -131,12 +132,12 @@ inline bool claim(u64* slot, u64 h, u32 id, u32& out) {
 
 u32 intern(u64 h) {
   u32 ln = line_of(h);
-  u64* l = g_tab + ln * 4;
+  u64* l = g_tab + ln * 8;
   u32 id = 0;
-  for (int s = 0; s < 4; s++) {
-    if (claim(l + s, h, ln * 4 + s + 1, id)) return id;
+  for (int s = 0; s < 8; s++) {
+    if (claim(l + s, h, ln * 8 + s + 1, id)) return id;
   }
-  __atomic_fetch_or(&g_line_ovf[ln >> 6], 1ULL << (ln & 63), __ATOMIC_RELAXED);
+  __atomic_fetch_or(&l[(h >> 31) & 7], kOvf, __ATOMIC_RELAXED);
   for (u32 i = static_cast<u32>(h >> 31) & kOvfMask;; i = (i + 1) & kOvfMask) {
     if (claim(g_ovf + i, h, kOvfBase + i + 1, id)) return id;
   }
@@ -156,6 +157,7 @@ u32* g_qstart;
 u32* g_qlist;
 u32* g_tstart;
 u64* g_trig;
+u16* g_tmap;
 u32 g_nq;
 
 Query* g_piece[kThreads];
@@ -463,16 +465,82 @@ void scan(Worker& w, u64 from, u64 to, u32 wl, u32& nfound) {
   u64 carry_a = 0, carry_nl = 1, in_id = 0, open = ~0ULL;
   auto flush = [&]() {
     u32 end = w.dend[nd - 1], nslow = 0;
-    for (u32 i = 0; i < end; i++) {
-      __builtin_prefetch(g_tab + line_of(w.h[i + kAhead]) * 4);
+    u32 i = 0;
+    for (; i + 4 <= end; i += 4) {
+      __builtin_prefetch(g_tab + line_of(w.h[i + kAhead]) * 8);
+      __builtin_prefetch(g_tab + line_of(w.h[i + kAhead + 1]) * 8);
+      __builtin_prefetch(g_tab + line_of(w.h[i + kAhead + 2]) * 8);
+      __builtin_prefetch(g_tab + line_of(w.h[i + kAhead + 3]) * 8);
+
+      u64 h0 = w.h[i], h1 = w.h[i + 1], h2 = w.h[i + 2], h3 = w.h[i + 3];
+      const u64* l0 = g_tab + line_of(h0) * 8;
+      const u64* l1 = g_tab + line_of(h1) * 8;
+      const u64* l2 = g_tab + line_of(h2) * 8;
+      const u64* l3 = g_tab + line_of(h3) * 8;
+
+      const __m256i m = _mm256_set1_epi64x(kTag);
+      __m256i t0 = _mm256_set1_epi64x(h0 & kTag);
+      __m256i t1 = _mm256_set1_epi64x(h1 & kTag);
+      __m256i t2 = _mm256_set1_epi64x(h2 & kTag);
+      __m256i t3 = _mm256_set1_epi64x(h3 & kTag);
+
+      __m256i a0 = _mm256_cmpeq_epi64(
+          _mm256_and_si256(_mm256_load_si256(reinterpret_cast<const __m256i*>(l0)), m), t0);
+      __m256i b0 = _mm256_cmpeq_epi64(
+          _mm256_and_si256(_mm256_load_si256(reinterpret_cast<const __m256i*>(l0 + 4)), m), t0);
+      __m256i a1 = _mm256_cmpeq_epi64(
+          _mm256_and_si256(_mm256_load_si256(reinterpret_cast<const __m256i*>(l1)), m), t1);
+      __m256i b1 = _mm256_cmpeq_epi64(
+          _mm256_and_si256(_mm256_load_si256(reinterpret_cast<const __m256i*>(l1 + 4)), m), t1);
+      __m256i a2 = _mm256_cmpeq_epi64(
+          _mm256_and_si256(_mm256_load_si256(reinterpret_cast<const __m256i*>(l2)), m), t2);
+      __m256i b2 = _mm256_cmpeq_epi64(
+          _mm256_and_si256(_mm256_load_si256(reinterpret_cast<const __m256i*>(l2 + 4)), m), t2);
+      __m256i a3 = _mm256_cmpeq_epi64(
+          _mm256_and_si256(_mm256_load_si256(reinterpret_cast<const __m256i*>(l3)), m), t3);
+      __m256i b3 = _mm256_cmpeq_epi64(
+          _mm256_and_si256(_mm256_load_si256(reinterpret_cast<const __m256i*>(l3 + 4)), m), t3);
+
+      u32 hit0 = _mm256_movemask_pd(_mm256_castsi256_pd(a0)) |
+                 (_mm256_movemask_pd(_mm256_castsi256_pd(b0)) << 4);
+      u32 hit1 = _mm256_movemask_pd(_mm256_castsi256_pd(a1)) |
+                 (_mm256_movemask_pd(_mm256_castsi256_pd(b1)) << 4);
+      u32 hit2 = _mm256_movemask_pd(_mm256_castsi256_pd(a2)) |
+                 (_mm256_movemask_pd(_mm256_castsi256_pd(b2)) << 4);
+      u32 hit3 = _mm256_movemask_pd(_mm256_castsi256_pd(a3)) |
+                 (_mm256_movemask_pd(_mm256_castsi256_pd(b3)) << 4);
+
+      u64 e0 = l0[_tzcnt_u32(hit0) & 7] & -static_cast<u64>(hit0 != 0);
+      u64 e1 = l1[_tzcnt_u32(hit1) & 7] & -static_cast<u64>(hit1 != 0);
+      u64 e2 = l2[_tzcnt_u32(hit2) & 7] & -static_cast<u64>(hit2 != 0);
+      u64 e3 = l3[_tzcnt_u32(hit3) & 7] & -static_cast<u64>(hit3 != 0);
+
+      w.ids[i] = static_cast<u32>(e0 & 0x3FFFF);
+      w.ids[i + 1] = static_cast<u32>(e1 & 0x3FFFF);
+      w.ids[i + 2] = static_cast<u32>(e2 & 0x3FFFF);
+      w.ids[i + 3] = static_cast<u32>(e3 & 0x3FFFF);
+
+      u32 s0 = (hit0 == 0) & static_cast<u32>((l0[(h0 >> 31) & 7] >> 30) & 1);
+      u32 s1 = (hit1 == 0) & static_cast<u32>((l1[(h1 >> 31) & 7] >> 30) & 1);
+      u32 s2 = (hit2 == 0) & static_cast<u32>((l2[(h2 >> 31) & 7] >> 30) & 1);
+      u32 s3 = (hit3 == 0) & static_cast<u32>((l3[(h3 >> 31) & 7] >> 30) & 1);
+
+      if (__builtin_expect((s0 | s1 | s2 | s3) != 0, 0)) {
+        if (s0) w.slow[nslow++] = static_cast<u16>(i);
+        if (s1) w.slow[nslow++] = static_cast<u16>(i + 1);
+        if (s2) w.slow[nslow++] = static_cast<u16>(i + 2);
+        if (s3) w.slow[nslow++] = static_cast<u16>(i + 3);
+      }
+    }
+    for (; i < end; i++) {
       u32 slow;
-      w.ids[i] = static_cast<u32>(lookup(w.h[i], slow));
+      w.ids[i] = static_cast<u32>(lookup(w.h[i], slow) & 0x3FFFF);
       w.slow[nslow] = static_cast<u16>(i);
       nslow += slow;
     }
     for (u32 k = 0; k < nslow; k++) {
       u32 idx = w.slow[k];
-      w.ids[idx] = static_cast<u32>(ovf_find(w.h[idx]));
+      w.ids[idx] = static_cast<u32>(ovf_find(w.h[idx]) & 0x3FFFF);
     }
     u32 a = 0;
     for (u32 k = 0; k < nd; k++) {
@@ -481,7 +549,7 @@ void scan(Worker& w, u64 from, u64 to, u32 wl, u32& nfound) {
       w.stamp[0] = cur;
       if constexpr (kSample) {
         for (u32 i = a; i < b; i++) {
-          u32 id = w.ids[i] & 0x1FFFF;
+          u32 id = w.ids[i];
           u16 prev = w.stamp[id];
           if (prev != cur) {
             w.stamp[id] = cur;
@@ -491,8 +559,7 @@ void scan(Worker& w, u64 from, u64 to, u32 wl, u32& nfound) {
       } else {
         u64 bit = 1ULL << (local & 63);
         for (u32 i = a; i < b; i++) {
-          u32 x = w.ids[i];
-          u32 id = x & 0x1FFFF;
+          u32 id = w.ids[i];
           u16 prev = w.stamp[id];
           if (prev != cur) {
             w.stamp[id] = cur;
@@ -501,7 +568,7 @@ void scan(Worker& w, u64 from, u64 to, u32 wl, u32& nfound) {
             w.pairs[np] = (sid << kDocBits) | local;
             np += (sid < g_ns);
           }
-          u32 trig = x >> 17;
+          u32 trig = g_tmap[id];
           w.tp[nh] = (trig << 14) | i;
           nh += (trig != 0);
         }
@@ -512,14 +579,14 @@ void scan(Worker& w, u64 from, u64 to, u32 wl, u32& nfound) {
             u32 best = (e >> 16) & 7, qn = (e >> 19) & 15, from_i = i - best;
             if (from_i < a || from_i > b || b - from_i < qn) continue;
             u32 o1 = (e >> 23) & 7, t1 = (e >> 26) & 0x1FFFF;
-            if ((w.ids[from_i + o1] & 0x1FFFF) != t1) continue;
+            if (w.ids[from_i + o1] != t1) continue;
             u32 o2 = (e >> 43) & 7, t2 = (e >> 46) & 0x1FFFF;
-            if ((w.ids[from_i + o2] & 0x1FFFF) != t2) continue;
+            if (w.ids[from_i + o2] != t2) continue;
             u32 qid = static_cast<u32>(e & 0xFFFF);
             if (qn > 3) {
               const Query& q = g_queries[qid];
               u32 j = 0;
-              while (j < qn && (w.ids[from_i + j] & 0x1FFFF) == q.t[j]) j++;
+              while (j < qn && w.ids[from_i + j] == q.t[j]) j++;
               if (j != qn) continue;
             }
             w.found[nf++] = (qid << kDocBits) | local;
@@ -533,13 +600,17 @@ void scan(Worker& w, u64 from, u64 to, u32 wl, u32& nfound) {
     done += nd;
     nd = 0;
   };
-  auto emit = [&](u64 s, u32 len) {
-    const char* q = d + s;
-    u64 w0 = _bzhi_u64(load64(q) | (kOnes * 0x20), len << 3);
-    u64 w1 = _bzhi_u64(load64(q + 8) | (kOnes * 0x20),
-                       len > 8 ? (len - 8) << 3 : 0);
-    w.h[nt++] = __builtin_expect(len <= 16, 1) ? hash16(w0, w1)
-                                                : hash_bytes(q, len, true);
+  auto emit = [&](const char* q, u32 len) {
+    if (__builtin_expect(len <= 8, 1)) {
+      u64 w0 = _bzhi_u64(load64(q) | (kOnes * 0x20), len << 3);
+      w.h[nt++] = fold(w0 ^ K0, K1) | kTop;
+    } else if (__builtin_expect(len <= 16, 1)) {
+      u64 w0 = load64(q) | (kOnes * 0x20);
+      u64 w1 = _bzhi_u64(load64(q + 8) | (kOnes * 0x20), (len - 8) << 3);
+      w.h[nt++] = hash16(w0, w1);
+    } else {
+      w.h[nt++] = hash_bytes(q, len, true);
+    }
   };
   const __m256i k20 = _mm256_set1_epi8(0x20), k05 = _mm256_set1_epi8(5);
   const __m256i k101 = _mm256_set1_epi8(101), k70 = _mm256_set1_epi8(70);
@@ -571,8 +642,8 @@ void scan(Worker& w, u64 from, u64 to, u32 wl, u32& nfound) {
       u64 tab = t0 | (static_cast<u64>(t1) << 32);
       if (to - at < 64) tab &= (1ULL << (to - at)) - 1;
       u64 toggle = ((nl << 1) | carry_nl) | tab;
-      u64 idm = _mm_cvtsi128_si64(_mm_clmulepi64_si128(
-          _mm_set_epi64x(0, toggle), _mm_set1_epi8(-1), 0));
+      u64 idm = _mm_cvtsi128_si64(
+          _mm_clmulepi64_si128(_mm_set_epi64x(0, toggle), _mm_set1_epi8(-1), 0));
       idm ^= -in_id;
       in_id = idm >> 63;
       carry_nl = nl >> 63;
@@ -584,15 +655,18 @@ void scan(Worker& w, u64 from, u64 to, u32 wl, u32& nfound) {
     u32 nt0 = nt;
     u64 e = ends, s = starts;
     if (open != ~0ULL && e) {
-      emit(open, static_cast<u32>(at + _tzcnt_u64(e) - open));
+      u32 e_idx = _tzcnt_u64(e);
+      emit(d + open, static_cast<u32>(at + e_idx - open));
       e &= e - 1;
       open = ~0ULL;
     }
+    const char* block = d + at;
     while (e) {
-      u64 st = at + _tzcnt_u64(s), en = at + _tzcnt_u64(e);
+      u32 s_idx = _tzcnt_u64(s);
+      u32 e_idx = _tzcnt_u64(e);
       s &= s - 1;
       e &= e - 1;
-      emit(st, static_cast<u32>(en - st));
+      emit(block + s_idx, e_idx - s_idx);
     }
     if (s) open = at + _tzcnt_u64(s);
     if (__builtin_expect(nl != 0, 0)) {
@@ -879,9 +953,8 @@ void worker(int tid) {
     g_tstart = arena_alloc<u32>(n_tterms + 2, true);
     g_qlist = arena_alloc<u32>(n_qlist + 4);
     g_trig = arena_alloc<u64>(n_trig + 4);
+    g_tmap = arena_alloc<u16>(g_nt + 2, true);
     size_t keep_watermark = g_aoff.load(std::memory_order_relaxed);
-
-    u16* tmap = arena_alloc<u16>(g_nt + 2, true);
     for (int t = 0; t < kThreads; t++) {
       Query* pc = g_piece[t];
       u32 cnt = g_psize[t];
@@ -895,7 +968,7 @@ void worker(int tid) {
     u32 cur_t = 0;
     for (u32 f = 1; f <= g_nt; f++) {
       if (tdeg[f]) {
-        tmap[f] = static_cast<u16>(++cur_t);
+        g_tmap[f] = static_cast<u16>(++cur_t);
         g_tstart[cur_t + 1] = tdeg[f];
       }
     }
@@ -937,30 +1010,26 @@ void worker(int tid) {
                      (static_cast<u64>(qq.t[o1]) << 26) |
                      (static_cast<u64>(o2) << 43) |
                      (static_cast<u64>(qq.t[o2]) << 46);
-          g_trig[tfill[tmap[qq.t[best]]]++] = pack;
+          g_trig[tfill[g_tmap[qq.t[best]]]++] = pack;
         }
       }
     }
 
-    // Rewrite 4-slot table slots with final term IDs and trigger indices
+    // Rewrite 8-slot table slots with final term IDs
     for (u32 l = 0; l < kLines; l++) {
-      for (int s = 0; s < 4; s++) {
-        u64& e = g_tab[l * 4 + s];
+      for (int s = 0; s < 8; s++) {
+        u64& e = g_tab[l * 8 + s];
         if (e) {
-          u32 prov = static_cast<u32>(e & 0x7FFFFFFF);
-          u32 fin = g_fin[prov];
-          u32 trig = tmap[fin];
-          e = (e & kTag) | (static_cast<u64>(trig) << 17) | fin;
+          u32 prov = static_cast<u32>(e & 0x3FFFF);
+          e = (e & (kTag | kOvf)) | g_fin[prov];
         }
       }
     }
     for (u32 i = 0; i < kOvfSize; i++) {
       u64& e = g_ovf[i];
       if (e) {
-        u32 prov = static_cast<u32>(e & 0x7FFFFFFF);
-        u32 fin = g_fin[prov];
-        u32 trig = tmap[fin];
-        e = (e & kTag) | (static_cast<u64>(trig) << 17) | fin;
+        u32 prov = static_cast<u32>(e & 0x3FFFF);
+        e = (e & kTag) | g_fin[prov];
       }
     }
     g_aoff.store(keep_watermark, std::memory_order_relaxed);
@@ -1045,9 +1114,8 @@ void worker(int tid) {
         if (!qq.has_or) {
           bool any_missing = false;
           for (u32 j = 0; j < qq.n; j++) {
-            if (j == 0 || qq.ops[j - 1] == 'A') {
-              if (!has_term(qq.t[j])) { any_missing = true; break; }
-            }
+            if (j > 0 && qq.ops[j - 1] != 'A') break;
+            if (!has_term(qq.t[j])) { any_missing = true; break; }
           }
           if (any_missing) continue;
         } else if (qq.must && !has_term(qq.must)) {
@@ -1059,12 +1127,13 @@ void worker(int tid) {
         for (u32 k = 0; k + 1 < qq.n; k++) {
           u8 op = qq.ops[k];
           if (!run.dense && !run.n) {
-            if (!qq.has_or) break;
+            if (!qq.has_or) goto next_query;
             if (op != 'O') continue;
           }
           run.apply(op, operand(qq.t[k + 1]));
         }
         report(q, run, base);
+      next_query:;
       }
     };
     eval_slice(g_qstart[0], g_qstart[g_nd + 1]);
