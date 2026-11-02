@@ -223,9 +223,11 @@ struct Worker {
         (b[e5] ^ '\n'))
       return false;
     bool bom = b[s0] == 0xEF, neg = b[e4 + 1] == '-';
+    if (bom && (b[s0 + 1] != 0xBB || b[s0 + 2] != 0xBF)) return false;
     size_t p = s0 + 3 * bom, dot = e5 - (b[e5 - 1] == '\r') - 3;
     size_t whole = e4 + 1 + neg, qn = quotes(e2) - quotes(e1);
     size_t qt = quotes(e3) - quotes(e2), nq = qn != 0, tq = qt != 0;
+    if (e1 <= p || e4 == e3 + 1 || dot <= whole || e5 < e4 + 5) return false;
     i64 c = num(b + whole, dot - whole) * 100 + (b[dot + 1] - '0') * 10 +
             (b[dot + 2] - '0');
     size_t len = e2 - e1 - 1 - 2 * nq;
