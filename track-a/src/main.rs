@@ -277,7 +277,7 @@ impl Job {
     }
 
     /// Parses chunk `c` through `buf`, which holds one block plus the bytes carried over from the previous one.
-    fn parse_chunk(&self, c: usize, buf: &mut [u8], scratch: &mut [u8]) {
+    fn parse_chunk(&self, c: usize, buf: &mut [u8]) {
         let (first, hi) = (self.cut(c * CHUNK), self.cut((c + 1) * CHUNK));
         let (mut at, mut keep, mut lo) = (first, 0, HOURS);
         let mut cur: [usize; HOURS] = std::array::from_fn(|h| self.region(h, c));
@@ -292,14 +292,6 @@ impl Job {
             let (end, last) = (keep + n, at == hi);
             buf[end..end + SLACK].fill(0); // the parser may read past the last line
             // SAFETY: lines starting before `lim` are complete and have SLACK readable bytes after their start.
-            {
-                let mut cur2: [usize; HOURS] = std::array::from_fn(|h| scratch.as_mut_ptr() as usize + h * 16384);
-                let mut lo2 = HOURS;
-                unsafe {
-                    let lim = buf.as_ptr().add(if last { end } else { end - SLACK });
-                    scan(buf.as_ptr(), lim, &self.dict, &mut cur2, &mut lo2);
-                }
-            }
             let stop = unsafe {
                 let lim = buf.as_ptr().add(if last { end } else { end - SLACK });
                 scan(buf.as_ptr(), lim, &self.dict, &mut cur, &mut lo)
@@ -414,11 +406,10 @@ impl Job {
 
     fn work(&self) {
         let mut buf = vec![0u8; BLOCK + SLACK];
-        let mut scratch = vec![0u8; HOURS * 16384];
         while self.next_hour.load(SeqCst) < HOURS {
             let c = self.next_chunk.fetch_add(1, Relaxed);
             if c < self.chunks {
-                self.parse_chunk(c, &mut buf, &mut scratch);
+                self.parse_chunk(c, &mut buf);
             }
             while let Some(h) = self.claim_hour() {
                 let mut scratch = self.spare.lock().unwrap().pop().unwrap_or_else(|| Scratch {
