@@ -300,3 +300,18 @@ quantity; the measured loss is in data movement, not instructions.
 cx19b beats cx5 in both pairs by 0.94 ms on average (-2.7%), a margin that held when the two were measured next to each other, so the earlier
 claim stands in this form. cx22 against cx19b is a tie in T (its two runs span 33.6-34.7), its S (456 against 428) costs about 0.9% of K, so its K
 is level; M was lower in both of its runs (13.1-13.6 against 13.8-13.9), within the spread seen for one source (13.1-14.2). cx19b stays in production.
+
+## 13. Static-link A/B on the board (05:14-05:45 UTC, interleaved, cx19b source `b180dbe112729c5b` throughout)
+
+Dockerfile variants: dynamic = production (`-static-libgcc -static-libstdc++`, Dockerfile sha256 `26b132e3d3b93b2d`), static = `-static` instead
+(`06c053585bdcd2a5`). Order dyn, static, dyn, static, dyn, static, dyn. All gates passed.
+
+| Link | Runs (T ms / M MB / K) |
+|---|---|
+| dynamic | 34.391 / 13.88 / 32.099 (run-e88e154881df), 34.992 / 13.93 / 31.796 (run-4ffd95ea7946), 34.087 / 13.79 / 32.282 (run-67747fb028e4), 34.056 / 13.81 / 32.287 (run-00ac73916a92) |
+| static | 33.993 / 13.92 / 32.266 (run-e985e9eb83e9), 34.184 / 13.92 / 32.175 (run-4f6e991d833d), 34.504 / 13.71 / 32.123 (run-dbaf508d6968) |
+
+Means: dynamic T 34.382 (sd 0.434), M 13.85, K 32.116; static T 34.227 (sd 0.258), M 13.85, K 32.188. **M is identical (13.85 MB) and the T
+difference (-0.15 ms) is inside the spread: the 1.1 MB of file-backed pages that static linking removes locally is not what the board's M counts.** Not adopted;
+production keeps the dynamic link. This also tells us the board's M is not RSS: its run-to-run variation (13.05-14.20 MB over 20 runs of three sources)
+does not follow the binary's mapped pages.
