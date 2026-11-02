@@ -6,12 +6,21 @@
 // country are counted from the masks. A chunk starts at an LF followed by a
 // digit 1-9 or a BOM, which never happens inside a quoted field (spec 2.2). If
 // any record does not fit, the whole file is parsed again as one chunk.
-#include <bits/stdc++.h>
+#include <algorithm>
+#include <atomic>
+#include <barrier>
+#include <cstdio>
+#include <cstring>
 #include <fcntl.h>
 #include <immintrin.h>
+#include <memory>
+#include <mutex>
+#include <string>
 #include <sys/prctl.h>
 #include <sys/stat.h>
+#include <thread>
 #include <unistd.h>
+#include <vector>
 using namespace std;
 using u8 = uint8_t;
 using u32 = uint32_t;
@@ -25,9 +34,11 @@ static size_t n_rec, n_reg, max_id;
 static u8 *region; // region id -> country index (0: not a region)
 
 static void rd(int fd, void *dst, size_t n, size_t off) {
-  ssize_t k;
-  for (u8 *d = (u8 *)dst; n; d += k, n -= k, off += k)
-    if ((k = pread(fd, d, n, off)) <= 0) abort();
+  for (u8 *d = (u8 *)dst; n;) {
+    ssize_t k = pread(fd, d, n, off);
+    if (k <= 0) abort();
+    d += k, n -= k, off += k;
+  }
 }
 static u64 load8(const u8 *p) {
   u64 w;
@@ -51,8 +62,9 @@ static u64 num(const u8 *p, size_t n) {
 // word 1 is its offset in the spill area and word 2 its length), then its
 // bytes, zero padded. 1 readable byte before s, 32 after.
 static V key(const u8 *s, size_t len) {
-  V iota = _mm256_setr_epi64x(0x0706050403020100, 0x0F0E0D0C0B0A0908,
-                              0x1716151413121110, 0x1F1E1D1C1B1A1918);
+  V iota = _mm256_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+                            15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+                            28, 29, 30, 31);
   char l = char(min<size_t>(len, 31) + 1);
   V v = _mm256_loadu_si256((const V *)(s - 1));
   v = _mm256_and_si256(v, _mm256_cmpgt_epi8(_mm256_set1_epi8(l), iota));
@@ -98,9 +110,10 @@ struct Names {
     u32 hit = _mm_movemask_epi8(_mm_cmpeq_epi8(v, _mm_set1_epi8(h >> 56 | 1)));
     u32 free = _mm_movemask_epi8(_mm_cmpeq_epi8(v, _mm_setzero_si128()));
     hit &= ((free | 1 << 16) & -(free | 1 << 16)) - 1;
-    size_t p = (i + __builtin_ctz(hit | 1 << 16)) & (n - 1);
-    return hit ? _mm_prefetch((const char *)(e + p), _MM_HINT_ET0), u32(p + 1)
-               : 0;
+    if (!hit) return 0;
+    size_t p = (i + __builtin_ctz(hit)) & (n - 1);
+    _mm_prefetch((const char *)(e + p), _MM_HINT_ET0);
+    return u32(p + 1);
   }
   bool same(size_t i, const u8 *s, size_t len, V v) const {
     u64 k0 = e[i].k[0].load(ACQ);
@@ -122,7 +135,7 @@ struct Names {
         if (used.fetch_add(1, RX) >= n / 8 * 7 || spilled + len > cap)
           return full = true, e + n;
         if (tags[i].compare_exchange_strong(x, t)) {
-          tags[i < 16 ? n + i : i] = t; // the copy a search near the end reads
+          if (i < 16) tags[n + i] = t; // the copy a search near the end reads
           u64 k[4];
           if (len < 32) {
             _mm256_storeu_si256((V *)k, v);
@@ -217,9 +230,8 @@ struct Worker {
             (b[dot + 2] - '0');
     size_t len = e2 - e1 - 1 - 2 * nq;
     u64 reg = num(b + e3 + 1, e4 - e3 - 1);
-    r.id = num(b + p, e1 - p), r.cents = neg ? -c : c, r.name = b + e1 + 1 + nq;
-    r.len = u32(len), r.nb = u32(len - (qn / 2 - nq)), r.hint = 0;
-    r.tb = u32(e3 - e2 - 1 - tq - qt / 2);
+    r = {num(b + p, e1 - p), 0, neg ? -c : c, b + e1 + 1 + nq, 0, u32(len),
+         u32(len - (qn / 2 - nq)), u32(e3 - e2 - 1 - tq - qt / 2), 0};
     r.reg = reg > max_id ? 0 : u32(reg), r.hash = hsh(key(r.name, len), len);
     _mm_prefetch((const char *)(names->tags + (r.hash & (names->n - 1))), _MM_HINT_T0);
     _mm_prefetch((const char *)(region + r.reg), _MM_HINT_T0);
@@ -295,7 +307,7 @@ static string run(int bits, size_t chunk) {
   for (max_id = 0; t[++last] - '0' < 10u;) max_id = max_id * 10 + t[last] - '0';
   region = (u8 *)calloc(max_id + 1, 1), names = new Names(bits);
   static atomic<u8> idx[26 * 26 * 26];
-  memset((void *)idx, 0, sizeof idx);
+  for (auto &c : idx) c = 0;
   vector<int> codes;
   mutex mu;
   u8 h0[256];
@@ -321,8 +333,8 @@ static string run(int bits, size_t chunk) {
   };
   auto work = [&](size_t me) {
     for (size_t j; (j = job(0, pieces)) != SIZE_MAX;) { // "id,CCC\n" lines
-      auto cut = [&](size_t j) { return line_start(first + (n_reg - first) * j / pieces); };
-      size_t a = j ? cut(j) : first, len = (j + 1 == pieces ? n_reg : cut(j + 1)) - a;
+      size_t a = j ? line_start(first + (n_reg - first) * j / pieces) : first;
+      size_t len = (j + 1 == pieces ? n_reg : line_start(first + (n_reg - first) * (j + 1) / pieces)) - a;
       vector<u8> r(len + 16);
       rd(fd_reg, r.data(), len, a);
       for (size_t p = 0, i; p < len && !bad; p = i + 5) {
@@ -360,10 +372,8 @@ static string run(int bits, size_t chunk) {
   if (bad || names->full) return {};
   // Countries in the byte order of their codes, then _UNMATCHED (index 0).
   vector<pair<string, int>> order;
-  for (int c : codes) {
-    string nm = {char('A' + c / 676), char('A' + c / 26 % 26), char('A' + c % 26)};
-    order.push_back({nm, idx[c]});
-  }
+  for (int c : codes)
+    order.push_back({{char('A' + c / 676), char('A' + c / 26 % 26), char('A' + c % 26)}, idx[c]});
   sort(order.begin(), order.end()), order.push_back({"_UNMATCHED", 0});
   string out;
   auto money = [](i64 v) {

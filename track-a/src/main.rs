@@ -431,7 +431,13 @@ fn percentiles(v: &mut [u32]) -> (u32, u32, u32) {
     let n = v.len();
     let at = |p: usize| (p * n + 99) / 100 - 1;
     if n <= 32 {
-        v.sort_unstable();
+        for i in 1..n {
+            let mut j = i;
+            while j > 0 && v[j - 1] > v[j] {
+                v.swap(j - 1, j);
+                j -= 1;
+            }
+        }
         return (v[at(50)], v[at(95)], v[at(99)]);
     }
     // The median first: p95 and p99 are then found among the larger half only, which shrinks quickly.
