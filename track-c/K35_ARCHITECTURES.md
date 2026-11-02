@@ -241,3 +241,32 @@ cx5 recovery point: `66693b1` (main.cpp sha256 `e016cdf08682676b`), also the tre
 The best single official K is now 32.417. The honest expectation for this source is the two-run mean T 34.26 ms / K about 32.17,
 about 0.5 ms (1.5%) better than cx5, which is what a 3.7% reduction in instructions should give; the first run was at the lucky
 end. Promoted: speed-demon's Track C is cx19b. It is nowhere near K35 (needs T 28.8 ms).
+
+## 11. Round 3 (Nov 2, local VM unless marked): verification redesign, SSE numbers, mask-resident decode
+
+Sources: `docs/track-c-cpp-candidates/cx20_parity_chain.cpp`, `cx21_sse_numbers.cpp`, `cx22_mask_decode.cpp`,
+`cx22a_..._unsigned_fix.cpp`, `cx23_branchless_refill.cpp`; hostile generators `tools/c_hostile_lf.py`, `tools/c_hostile_fake_records.py`.
+
+| ID | Idea | Result |
+|---|---|---|
+| cx20 | **Chunk cuts verified by quote parity, per-record checks deleted.** A cut inside a quoted field leaves an odd number of quotes before it in its record, so chunk j holds an odd number of quotes exactly when one of its two cuts is such a cut; the xor of the chunk parities up to j says whether cut j+1 is. Every cut must be false-free (cut 0 is a record start, the file end too) or the whole file is parsed again as one chunk. Garbage from a false cut cannot corrupt memory: field lengths are clamped (`min`, `n & 31`) and the sums are unsigned. | Correct and exact. Tested with only the parity chain able to reject (the end-of-chunk check disabled): 6 hostile-LF files and 6 fake-record files (complete escaped records inside quoted notes) with 3,000-byte chunks and 200-byte blocks: 12/12 correct output, 360-500 flagged cuts per file, 0 false alarms on valid files. Instructions -3.8% vs cx19b, wall time equal (the separator-type check was nearly free in time). Kept as the base: protection of the chunk-cut assumption is now proven, not a heuristic. |
+| cx21 | cx20 + SSE number parse per field: 16-byte load, `pshufb` with a length-indexed table, `pmaddubsw`, `pmaddwd`, `packusdw`, `pmaddwd` | Instructions -8% vs cx19b; wall -0.5% to -2.5% at 4 threads (noise-sized). |
+| cx22 | cx21 + mask-resident decode: stage 1 stores one separator mask per 64-byte word, stage 2 takes each record's five separators from the masks (tzcnt/blsr), no separator array | Instructions -12.8% vs cx19b; branch mispredicts 622 k vs 327 k (word-boundary loop); local wall -3.1% mean at 4 threads in four rounds (-5.5, -1.2, -2.7, -3.0), -2.1% mean with the board's exact flags; 21 fixtures x 5 builds (normal, tiny blocks, ASan+UBSan, TSan) 0 failures. S 456. |
+| cx23 | cx22 with a branchless word advance | mispredicts back to 328 k but +10% slower: the five separators form a serial dependency chain (select, dependent load, tzcnt) |
+
+Where one thread's cycles go (`rdtsc` around the stages, cx21, full seed 1, 3.32 M records; includes ~25 cycles of timer overhead per call):
+read 32 cycles per record, structural pass 27, record parse 63, name table 78 (tag probe warm ~20-35, find ~20-30, locked update ~50-70, aggregates ~5-12).
+IPC of the whole run is about 3.6 in user code at 2.8 GHz (1.92 G instructions in about 190 ms of user time), which is why removing cheap, well
+predicted instructions barely changes time. A bare `lock bts` costs about 22 cycles in a loop against 10 for a plain read-modify-write on this CPU,
+the same for 64 hot lines and 131,072 random ones; the prefetch kind (write-intent, read, non-temporal) changes nothing.
+Finish spread of the workers at the end of the records phase: 0.1-0.3% (nothing to gain in scheduling).
+
+**Board drift.** cx19b measured T 33.983 ms (04:03 UTC), 34.530 (04:09) and then, for the identical source, 35.526 (04:37); cx22 measured 35.496
+(04:30). The earlier "spread 0.25 ms" came from runs in one window; across windows the board moves by about 1 ms, so comparisons made in different
+windows are not valid. Candidates are therefore compared in interleaved board sequences (section 12).
+
+## Memory (local VM)
+Peak RSS of cx21: 12.04 MB (4 threads) = 9.95 MB anonymous + 2.09 MB file-backed; an empty dynamic C++ process is already 1.3 MB file-backed.
+Linking statically (`-static` instead of `-static-libgcc -static-libstdc++`) gives 0.96 MB file-backed: -1.1 MB peak (1.2% -> about +1.6% of K if the board
+counts the same pages), and a 0.05-0.2 ms faster start. Timing of the full run was inconclusive (noisy VM). Board M varies by about 0.8 MB between runs of the
+same source (13.30-14.13 MB), which is as large as many of the time gains above.
