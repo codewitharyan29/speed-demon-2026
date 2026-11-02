@@ -55,14 +55,14 @@ static u64 heavy(const Ov &o, u32 edge) {
 
 struct Dial {
   u16 head[RING] = {}, fr = 0, used = 0;
-  u32 at = 0, pushes = 0;
+  u32 at = 0;
   u64 bits[RING / 64] = {}, top = 0, *__restrict pool;
   Dial(u64 *p) : pool(p) {}
   void push(u32 b, u32 node) {
     u16 h = head[b], i = fr ? fr : ++used;
     !h && (bits[b >> 6] |= 1ULL << (b & 63), top |= 1ULL << (b >> 6));
     fr = fr ? pool[i] >> 32 : 0;
-    pool[i] = node | (u64)h << 32, head[b] = i, pushes++;
+    pool[i] = node | (u64)h << 32, head[b] = i;
   }
   bool pop(u32 &b, u32 &node) {
     if (!top)
@@ -81,36 +81,39 @@ struct Dial {
     for (; top; top &= top - 1)
       for (u32 w = std::countr_zero(top); bits[w]; bits[w] &= bits[w] - 1)
         head[w << 6 | std::countr_zero(bits[w])] = 0;
-    fr = used = at = pushes = 0;
+    fr = used = at = 0;
   }
 };
 
 struct Dist {
   u16 *__restrict pt, *__restrict own, np = 1;
   u32 *__restrict pool;
-  u32 get(u32 v) { return pool[(u32)pt[v >> 9] << 9 | (v & 511)]; }
+  u32 get(u32 v) { return pool[(u32)pt[v >> 7] << 7 | (v & 127)]; }
   void set(u32 v, u32 x) {
-    u16 &p = pt[v >> 9];
-    !p && (own[np] = v >> 9, p = np++, 1);
-    pool[(u32)p << 9 | (v & 511)] = x;
+    u16 &p = pt[v >> 7];
+    !p && (own[np] = v >> 7, p = np++, 1);
+    pool[(u32)p << 7 | (v & 127)] = x;
   }
   void clear() {
     for (u32 i = 1; i < np; i++)
-      memset(pool + (i << 9), 0, 2048), pt[own[i]] = 0;
+      memset(pool + (i << 7), 0, 512), pt[own[i]] = 0;
     np = 1;
   }
 };
 
-static long slow(u32 s, u32 t, Dist &D) {
+static std::mutex smtx;
+static long slow(u32 s, u32 t) {
+  std::lock_guard g(smtx);
+  u32 P = (n >> 7) + 2, np = 1;
+  auto mem = anon<u64>(P * 257ULL);
   auto cell = [&](u32 v) {
-    u16 &p = D.pt[v >> 7];
-    !p && (D.own[p = D.np++] = v >> 7, 1);
-    return (u64 *)D.pool + ((size_t)p << 8 | (v & 127) << 1);
+    u16 &p = ((u16 *)mem)[v >> 7];
+    !p && (p = np++, 1);
+    return mem + P + ((size_t)p << 8 | (v & 127) << 1);
   };
   std::priority_queue<std::pair<u64, u32>> pq[2];
-  cell(s)[0] = cell(t)[1] = ~0ULL;
+  u64 mu = cell(s)[0] = cell(t)[1] = ~0ULL, low[2] = {};
   pq[0].push({~0ULL, s}), pq[1].push({~0ULL, t});
-  u64 mu = ~0ULL, low[2] = {};
   while (!pq[0].empty() && !pq[1].empty()) {
     u32 d = pq[0].size() > pq[1].size();
     auto [k, u] = pq[d].top();
@@ -129,7 +132,7 @@ static long slow(u32 s, u32 t, Dist &D) {
         vp[d ^ 1] && (mu = std::min(mu, nd + ~vp[d ^ 1]), 1);
     }
   }
-  return D.clear(), mu == ~0ULL ? -1 : mu;
+  return munmap(mem, P * 2056ULL + 4096), mu == ~0ULL ? -1 : (long)mu;
 }
 
 struct Side {
@@ -143,36 +146,38 @@ static long fast(u32 s, u32 t, Dist &D, Side &F, Side &R) {
   u32 b, u, mu = ~0u, big = 0;
   D.set(s, 0xFFFF), D.set(t, D.get(t) | 0xFFFF0000u);
   F.q.push(0, s), R.q.push(0, t), F.low = R.low = 0;
-  for (;;) {
-    u32 sh = F.q.pushes <= R.q.pushes ? 0 : 16;
-    Side &S = sh ? R : F;
-    if (!S.q.pop(b, u) || (S.low = b << 4, F.low + R.low >= mu))
-      break;
+  auto step = [&]<int SH>(Side &S, u32 olow) {
+    if (!S.q.pop(b, u) || (S.low = b << 4, S.low + olow >= mu))
+      return 0;
     if (u16 nh = S.q.head[b])
       __builtin_prefetch(S.adj + S.first[(u32)S.q.pool[nh]]);
-    u32 d = (u16) ~(D.get(u) >> sh);
-    if (d >> 4 != b)
-      continue;
-    u64 r;
-    memcpy(&r, S.first + u, 8);
-    for (u32 i = r, hi = r >> 32; i < hi; i++) {
-      u32 e = S.adj[i], v = e >> 11, w = e & 2047, x = D.get(v);
-      u64 nd = d + (__builtin_expect(w == 2047, 0) ? heavy(*S.ov, i) : w);
-      if (__builtin_expect(nd >= 60000, 0)) {
-        big = 1;
-        continue;
+    u32 d = (u16) ~(D.get(u) >> SH);
+    if (d >> 4 == b) {
+      u64 r;
+      memcpy(&r, S.first + u, 8);
+      for (u32 i = r, hi = r >> 32; i < hi; i++) {
+        u32 e = S.adj[i], v = e >> 11, w = e & 2047, x = D.get(v);
+        u64 nd = d + (__builtin_expect(w == 2047, 0) ? heavy(*S.ov, i) : w);
+        if (__builtin_expect(nd >= 60000, 0)) {
+          big = 1;
+          continue;
+        }
+        u16 inv = ~(u16)nd, mine = x >> SH, other = x >> (16 - SH);
+        if (inv > mine)
+          D.set(v, (x & ~(0xFFFFu << SH)) | (u32)inv << SH),
+              S.q.push(nd >> 4, v),
+              other && (mu = std::min(mu, (u32)nd + (u16)~other), 1),
+              __builtin_prefetch(S.first + v);
       }
-      u16 inv = ~(u16)nd, mine = x >> sh, other = x >> (16 ^ sh);
-      if (inv > mine)
-        D.set(v, (u32)inv << sh | (u32)other << (16 ^ sh)),
-            S.q.push(nd >> 4, v),
-            other && (mu = std::min(mu, (u32)nd + (u16)~other), 1),
-            __builtin_prefetch(S.first + v);
     }
-  }
+    return 1;
+  };
+  while (F.low <= R.low ? step.operator()<0>(F, R.low)
+                        : step.operator()<16>(R, F.low))
+    ;
   F.q.clear(), R.q.clear(), D.clear();
   long ans = mu < 60000 || (mu != ~0u && !big) ? (long)mu : -1;
-  return ans < 0 && big ? slow(s, t, D) : ans;
+  return ans < 0 && big ? slow(s, t) : ans;
 }
 
 int main() {
@@ -189,7 +194,7 @@ int main() {
   size_t tot = e4b / 4 + (n + 3) / 4 + (n / 64 + 2) * 2 + 8 * MSP + 1024;
   first = anon(n + 2), adj = anon(m), rfirst = e4 = anon(tot),
   radj = e4 + n + 2;
-  auto cnt = (u8 *)((char *)e4 + e4b);
+  auto cnt = (u8 *)e4 + e4b;
   auto vis = (u64 *)(((uintptr_t)(cnt + n + 15)) & ~7ULL);
   auto sp = (Sp *)(vis + n / 64 + 2), spt = sp + MSP;
   std::atomic<size_t> job = 0, seed = 0, rank = 0, spn = 0, cur[T * 8];
@@ -263,7 +268,7 @@ int main() {
             adj[dst] = e4[4 * (size_t)x + c],
             (adj[dst] & 2047) == 2047 &&
                 (ov0[tid].push_back({dst, heavy(ovs, 4 * x + c)}), 1);
-          *(u64 *)(e4 + 4 * (size_t)x) = id;
+          e4[4 * (size_t)x] = id | ((u32)cx << 24);
           if (cx > 4)
             for (auto *a = std::lower_bound(
                      sp, sp + nsp, x,
@@ -274,19 +279,20 @@ int main() {
         }
       }
     sync.arrive_and_wait();
+    !tid &&munmap((char *)e4 + e4b, tot * 4 + 4096 - e4b);
     for (size_t x = nlo; x < nhi; x++)
-      e4[4 * (size_t)e4[4 * x] + 2] = cnt[x];
+      first[x] = e4[4 * x];
     sync.arrive_and_wait();
-    if (!tid) {
-      munmap((char *)e4 + e4b, tot * 4 + 4096 - e4b);
-      for (u32 i = 0; i < n; i++)
-        first[i + 1] = first[i] + e4[4 * (size_t)i + 2];
-    }
+    !tid &&e4b > keep &&munmap((char *)e4 + keep, e4b - keep);
+    memset(rfirst + nlo, 0, (nhi - nlo + (tid == T - 1 ? 2 : 0)) * 4);
+    for (size_t x = nlo; x < nhi; x++)
+      radj[first[x] & 0xFFFFFF] = first[x] >> 24, first[x] &= 0xFFFFFF;
+    sync.arrive_and_wait();
     for (size_t i = (size_t)m * tid / T; i < (size_t)m * (tid + 1) / T; i++) {
-      __builtin_prefetch(e4 + 4 * (size_t)(adj[i + 16] >> 11));
-      u32 e = adj[i], v = e4[4 * (size_t)(e >> 11)];
+      __builtin_prefetch(first + (adj[i + 16] >> 11));
+      u32 e = adj[i], v = first[e >> 11];
       adj[i] = v << 11 | (e & 2047),
-      std::atomic_ref(e4[4 * (size_t)v + 1]).fetch_add(1, rx);
+      std::atomic_ref(rfirst[v + 2]).fetch_add(1, rx);
     }
     sync.arrive_and_wait();
     if (!tid) {
@@ -295,17 +301,13 @@ int main() {
       std::sort(ov.begin(), ov.end());
       const char *qp = map("/data/queries.txt", qlen), *qe = qp + qlen;
       while (qp < qe) {
-        u32 s = num(qp), t = num(qp), a = e4[4 * (size_t)s],
-            b = e4[4 * (size_t)t];
+        u32 s = num(qp), t = num(qp), a = first[s], b = first[t];
         ans.push_back(s == t ? 0 : -1);
-        if (s != t && e4[4 * (size_t)b + 1] && first[a + 1] > first[a])
+        if (s != t && rfirst[b + 2] && radj[a])
           work.push_back({a, b, (u32)ans.size() - 1});
       }
-      for (u32 v = 0, sum = rfirst[0] = 0; v < n; v++) {
-        u32 d = e4[4 * (size_t)v + 1];
-        rfirst[v + 1] = sum, sum += d;
-      }
-      e4b > keep &&munmap((char *)e4 + keep, e4b - keep);
+      std::partial_sum(radj, radj + n, first + 1), first[0] = 0;
+      std::partial_sum(rfirst + 1, rfirst + n + 2, rfirst + 1);
     }
     sync.arrive_and_wait();
     for (size_t u = nlo; u < nhi; u++)
@@ -320,8 +322,7 @@ int main() {
     if (!tid) {
       for (auto &v : ov0)
         rov.insert(rov.end(), v.begin(), v.end());
-      std::sort(rov.begin(), rov.end());
-      std::sort(work.begin(), work.end());
+      std::sort(rov.begin(), rov.end()), std::sort(work.begin(), work.end());
       for (u32 k = 0; k < T; k++)
         cur[k * 8] = k * work.size() / T;
     }

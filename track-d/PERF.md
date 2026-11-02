@@ -562,3 +562,15 @@ d >> 4 <= 3750 < 4096; keys never wrap around ring. pop() uses 1-cycle 	zcnt on 
 
 **Board run 18c1dcf (step 35): T 0.12248 s (122.48 ms), M 66.09 MB, S 349, K 29.953, 73.822 pts (Rank #9 of 117; +1.71 K, +1.27 pts over baseline).**
 
+## Step 36: Metric-ball balancing (F.low <= R.low), templated step<SH>, 512B Dist pages & LAP build false-sharing elimination
+
+| Change | Rationale | Observed / Expected Effect |
+|---|---|---|
+| **Metric-Ball Frontier Balancing** | Restores `F.low <= R.low` side selection instead of queue push count | Eliminates asymmetric search blowout past 60,000 and avoids false slow() fallbacks |
+| **Templated Generic Lambda `step<SH>`** | Replaces variable shift `x >> sh` and `x >> (16 ^ sh)` with compile-time template constants `<0>` and `<16>` | Removes runtime shift register dependency (%cl) in hot relaxation loop |
+| **512B Dist Pages (v >> 7)** | Pages shrunk from 2048B (512 u32s) to 512B (128 u32s) | Cuts D.clear() memset zeroing volume by 4x; trims active page footprint |
+| **Self-Unmapping Mutexed `slow()`** | Allocates isolated `anon<u64>` on demand and `munmap`s immediately upon return | Eliminates cross-query memory retention from rare overflow queries |
+| **LAP:build Cache-Line False Sharing Elimination** | Packs `id \| (cx << 24)` into `first[x]` after LAP:bfs and separates `first` from `rfirst` | Eliminates stride-4 false sharing between reading nid and incrementing indeg |
+| **Allocation Fix** | Sized scratch pool to `65 * P` u64s to properly back `P * 128` u32 pages + pt/own | Corrects dimensioning bug in 512B paging scheme; passes all datasets 100% bit-for-bit |
+
+
