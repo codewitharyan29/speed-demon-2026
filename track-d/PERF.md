@@ -539,3 +539,23 @@ bitset on every line and the first setter of each bit does an atomic OR, so thos
 
 The first version of this change crashed: freeing the old block in pieces left holes that the reverse arrays were then mapped
 into, and a later whole-block `munmap` unmapped them. Only the pages of `nid` itself are freed at that point now.
+
+
+## Step 35: Symmetric in-place CSR reverse graph inside e4, zero-alloc fallback, loop-free monotone Dial & S=349
+
+| Change | Rationale | Observed / Expected Effect |
+|---|---|---|
+| **In-Place Symmetric Reverse CSR** | Instead of separate 
+e4 (27.8 MB) + 
+cnt (3.5 MB) + 
+sp spill list, 
+first = e4 and 
+adj = e4 + n + 2. Reverse CSR is built in-place inside e4 pages | Saves 27.8 MB memory overlap; eliminates 
+sp sorting and binary search; unifies Side/expand |
+| **Zero-Alloc Bidirectional Fallback (slow)** | slow reuses calling thread's existing 2 KB Dist pages (128 u64-pairs per page) | Eliminates 14 MB heap allocations and cgroup memory spike on overflow queries |
+| **Loop-Free Monotone Dial (RING = 4096, POOL = 1 << 13)** | 
+d < 60000 guarantees 
+d >> 4 <= 3750 < 4096; keys never wrap around ring. pop() uses 1-cycle 	zcnt on 	op and its[w] | 2-cycle empty bucket jumping without while-loops or rotation |
+| **Single Thread Pool (std::jthread)** | 12 threads spawned once at start of main() with std::barrier across all phases | Saves ~6-8 ms of thread spawn/join latency across build phases |
+| **Sized Spill & Queue Pools** | Sized sp to 131,072 entries and POOL to 8,192 entries (L1D-resident) | Drops peak cgroup memory from 74 MB down to ~53-55 MB |
+| **Source Line Count Compaction** | Formatted with clang-format --style=LLVM to 342 non-comment lines ( = 349$ with Dockerfile) | $-52$ lines vs baseline ($-229$ lines vs SweetDreams), $+7.9\%$ score multiplier advantage |

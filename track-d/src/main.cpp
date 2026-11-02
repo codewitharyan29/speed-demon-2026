@@ -1,95 +1,51 @@
 #include <bits/stdc++.h>
 #include <fcntl.h>
-#include <immintrin.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+using u8 = uint8_t;
 using u16 = uint16_t;
 using u32 = uint32_t;
 using u64 = uint64_t;
-using Ov = std::vector<std::pair<u32, u64>>; // (edge index, weight) if >= 2047
-constexpr u32 NIL = ~0u, RING = 4096, POOL = 1 << 18, T = 12;
-constexpr u32 CHUNKS = 48;
+using Ov = std::vector<std::pair<u32, u64>>;
+constexpr u32 RING = 4096, POOL = 1 << 13, T = 12, CHUNKS = 48, MSP = 1 << 17;
 constexpr auto rx = std::memory_order_relaxed;
-static u32 n, m, *first, *adj; // CSR (renumbered): offsets and packed edges
-struct Sp {                    // an edge beyond the fourth of its node
+static u32 n, m, *first, *adj, *rfirst, *radj, *e4;
+struct Sp {
   u32 u, e;
   u64 w;
 };
-static Sp *rsp;
+static Ov ov, rov;
 
-// Sorts spilled edges by node: two counting passes over 11 bits each.
-static void sort_sp(Sp *a, size_t k) {
-  std::vector<Sp> t(k);
-  for (int sh = 0; sh < 22; sh += 11) {
-    u32 c[2049] = {};
-    for (size_t i = 0; i < k; i++)
-      c[(a[i].u >> sh & 2047) + 1]++;
-    std::partial_sum(c, c + 2049, c);
-    for (size_t i = 0; i < k; i++)
-      t[c[a[i].u >> sh & 2047]++] = a[i];
-    std::copy(t.begin(), t.end(), a);
-  }
-}
-static Ov ov;     // true weights of edges packed as 2047
-static u32 *re4;  // the graph with every edge reversed, four slots
-static u16 *rcnt; // per node, like the input; here: edges per node
-static size_t rn; // and the reversed edges beyond the fourth
-static Ov rov;    // true weights of reversed edges packed as 2047
-
-// Zeroed memory. Transparent huge pages are off: the sparse structures would
-// be charged in whole 2 MB pieces.
 template <class P = u32> static P *anon(size_t count) {
   void *p =
       mmap(0, count * sizeof(P) + 4096, 3, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   return madvise(p, count * sizeof(P) + 4096, MADV_NOHUGEPAGE), (P *)p;
 }
 
-// Maps a file read-only. A zero page follows it, so that reading eight bytes
-// at the very end is safe.
 static const char *map(const char *path, size_t &len) {
   struct stat st;
   int fd = open(path, O_RDONLY);
-  fstat(fd, &st);
-  len = st.st_size;
+  fstat(fd, &st), len = st.st_size;
   char *p = (char *)mmap(0, len + 4096, 1, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   return (const char *)mmap(p, len, 1, MAP_SHARED | MAP_FIXED, fd, 0);
 }
 
-// Reads digits and the one separator after them. Up to seven digits are
-// converted at once: a digit has bit 4 set, a space or newline has not.
-static u32 num(const char *&p) {
+static u64 num(const char *&p) {
   u64 w;
   memcpy(&w, p, 8);
   u64 sep = ~w & 0x1010101010101010ULL;
-  if (__builtin_expect(!sep || (sep & 0xFF) == 0x10, 0)) {
-    u32 x = 0; // eight digits or more
+  if (__builtin_expect(!sep, 0)) {
+    u64 x = 0;
     while (*p >= '0')
       x = x * 10 + *p++ - '0';
     return p++, x;
   }
   u32 len = std::countr_zero(sep) >> 3;
-  p += len + 1;
-  w <<= 64 - 8 * len;
+  p += len + 1, w <<= 64 - 8 * len;
   w = (w & 0x0F0F0F0F0F0F0F0FULL) * 2561 >> 8;
   w = (w & 0x00FF00FF00FF00FFULL) * 6553601 >> 16;
   return (w & 0x0000FFFF0000FFFFULL) * 42949672960001ULL >> 32;
-}
-
-// Just past the next newline, eight bytes at a time.
-static const char *next_line(const char *p, const char *e) {
-  for (u64 w, z; p + 8 <= e; p += 8) {
-    memcpy(&w, p, 8), w ^= 0x0A0A0A0A0A0A0A0AULL;
-    if ((z = (w - 0x0101010101010101ULL) & ~w & 0x8080808080808080ULL))
-      return p + (std::countr_zero(z) >> 3) + 1;
-  }
-  return (const char *)memchr(p, '\n', e - p) + 1;
-}
-
-template <class F> static void par(F f) {
-  std::vector<std::jthread> th;
-  for (u32 i = 0; i < T; i++)
-    th.emplace_back(f, i);
 }
 
 static u64 heavy(const Ov &o, u32 edge) {
@@ -97,83 +53,46 @@ static u64 heavy(const Ov &o, u32 edge) {
       ->second;
 }
 
-// Monotone priority queue: a ring of 4096 buckets (keys never span more than
-// 4095), a linked list per bucket in a pooled array, and a two-level bitmap to
-// jump to the next non-empty bucket.
 struct Dial {
-  u32 head[RING], fr = NIL, used = 0, at = 0;
-  u64 bits[RING / 64] = {}, top = 0, *pool;
-  Dial(u64 *p) : pool(p) { memset(head, 0xFF, sizeof head); }
+  u16 head[RING] = {}, fr = 0, used = 0;
+  u32 at = 0, pushes = 0;
+  u64 bits[RING / 64] = {}, top = 0, *__restrict pool;
+  Dial(u64 *p) : pool(p) {}
   void push(u32 b, u32 node) {
-    u32 h = head[b], i = fr != NIL ? fr : used++;
-    if (h == NIL)
-      bits[b / 64] |= 1ULL << b % 64, top |= 1ULL << b / 64;
-    fr = fr != NIL ? pool[i] >> 32 : fr;
-    pool[i] = node | (u64)h << 32, head[b] = i;
+    u16 h = head[b], i = fr ? fr : ++used;
+    !h && (bits[b >> 6] |= 1ULL << (b & 63), top |= 1ULL << (b >> 6));
+    fr = fr ? pool[i] >> 32 : 0;
+    pool[i] = node | (u64)h << 32, head[b] = i, pushes++;
   }
   bool pop(u32 &b, u32 &node) {
-    for (; top;) {
-      u32 h = head[at], w = at / 64;
-      if (h != NIL) {
-        u64 e = pool[h];
-        node = e, b = at, head[at] = e >> 32, pool[h] = (u64)fr << 32, fr = h;
-        if (head[at] == NIL && !(bits[w] &= ~(1ULL << at % 64)))
-          top &= ~(1ULL << w);
-        return 1;
-      }
-      if (u64 rest = bits[w] >> at % 64)
-        at += std::countr_zero(rest);
-      else {
-        u32 nw = std::countr_zero(top & -2ULL << w);
-        at = nw * 64 + std::countr_zero(bits[nw]);
-      }
+    if (!top)
+      return 0;
+    if (!head[at]) {
+      u32 w = at >> 6;
+      if (!(bits[w] &= ~(1ULL << (at & 63))) && !(top &= ~(1ULL << w)))
+        return 0;
+      w = std::countr_zero(top), at = w << 6 | std::countr_zero(bits[w]);
     }
-    return 0;
+    u64 h = head[at], e = pool[h];
+    node = e, b = at, head[at] = e >> 32, pool[h] = (u64)fr << 32, fr = h;
+    return 1;
   }
   void clear() {
     for (; top; top &= top - 1)
       for (u32 w = std::countr_zero(top); bits[w]; bits[w] &= bits[w] - 1)
-        head[w << 6 | std::countr_zero(bits[w])] = NIL;
-    fr = NIL, used = at = 0;
+        head[w << 6 | std::countr_zero(bits[w])] = 0;
+    fr = used = at = pushes = 0;
   }
 };
 
-// Exact 64-bit Dijkstra (a max-heap on ~distance) for the rare long answers.
-static long slow(u32 s, u32 t) {
-  auto inv = anon<u64>(n); // ~distance, 0 = unseen
-  std::priority_queue<std::pair<u64, u32>> pq;
-  long ans = -1;
-  for (inv[s] = ~0ULL, pq.push({~0ULL, s}); !pq.empty();) {
-    auto [k, u] = pq.top();
-    pq.pop();
-    if (k < inv[u])
-      continue;
-    if (u == t) {
-      ans = ~k;
-      break;
-    }
-    for (u32 i = first[u]; i < first[u + 1]; i++) {
-      u32 v = adj[i] >> 11, w = adj[i] & 2047;
-      u64 nk = k - (w == 2047 ? heavy(ov, i) : w);
-      if (nk > inv[v])
-        inv[v] = nk, pq.push({nk, v});
-    }
-  }
-  return munmap(inv, n * 8ull + 4096), ans;
-}
-
-// Distances of both directions, 16 bits each and stored inverted (0 = unseen):
-// the forward one in the low half of a word, the backward one in the high half.
-// Words live in 512-entry pages that are allocated on the first write; page 0
-// stays zero and backs every unseen page.
 struct Dist {
-  u32 *pt, *own, np = 1, *pool;
-  u32 get(u32 v) { return pool[pt[v >> 9] << 9 | v & 511]; }
+  u16 *__restrict pt, *__restrict own, np = 1;
+  u32 *__restrict pool;
+  u32 get(u32 v) { return pool[(u32)pt[v >> 9] << 9 | (v & 511)]; }
   void set(u32 v, u32 x) {
-    u32 &p = pt[v >> 9];
-    if (!p)
-      own[np] = v >> 9, p = np++;
-    pool[p << 9 | v & 511] = x;
+    u16 &p = pt[v >> 9];
+    !p && (own[np] = v >> 9, p = np++, 1);
+    pool[(u32)p << 9 | (v & 511)] = x;
   }
   void clear() {
     for (u32 i = 1; i < np; i++)
@@ -182,146 +101,145 @@ struct Dist {
   }
 };
 
-// One direction of the search: its own graph, queue and lower bound. The
-// forward graph is a CSR (first, adj); the reverse one has four slots per node
-// (adj, cnt) and the edges beyond the fourth in sp.
-struct Side {
-  const u32 *first, *adj;
-  const u16 *cnt;
-  const Sp *sp;
-  size_t nsp;
-  const Ov *ov;
-  Dial q;
-  u32 low = 0; // no node with a smaller distance is left to settle
-};
-
-// Relaxes the edges of node u, settled at distance d, and records any meeting
-// with the other direction in mu. SH is 0 for the forward half of a word.
-template <int SH>
-static void expand(Side &S, Dist &D, u32 u, u32 d, u32 &mu, bool &big) {
-  auto relax = [&](u32 e, u64 wt) {
-    u32 v = e >> 11, x = D.get(v);
-    u64 nd = d + wt;
-    if (__builtin_expect(nd >= 60000, 0)) {
-      big = 1; // too long for 16 bits
-      return;
-    }
-    u16 inv = ~(u16)nd, mine = x >> SH, other = x >> (16 - SH);
-    if (inv > mine) {
-      D.set(v, x & ~(0xFFFFu << SH) | inv << SH);
-      S.q.push(nd >> 4, v);
-      other && (mu = std::min(mu, (u32)nd + (u16)~other), 1);
-      if constexpr (SH)
-        _mm_prefetch((const char *)(S.adj + 4 * (size_t)v), _MM_HINT_T0),
-            _mm_prefetch((const char *)(S.cnt + v), _MM_HINT_T0);
-      else
-        _mm_prefetch((const char *)(S.first + v), _MM_HINT_T0);
-    }
+static long slow(u32 s, u32 t, Dist &D) {
+  auto cell = [&](u32 v) {
+    u16 &p = D.pt[v >> 7];
+    !p && (D.own[p = D.np++] = v >> 7, 1);
+    return (u64 *)D.pool + ((size_t)p << 8 | (v & 127) << 1);
   };
-  u32 lo, hi;
-  if constexpr (SH)
-    lo = 4 * u, hi = lo + std::min<u32>(S.cnt[u], 4);
-  else {
-    u64 r;
-    memcpy(&r, S.first + u, 8);
-    lo = r, hi = r >> 32;
+  std::priority_queue<std::pair<u64, u32>> pq[2];
+  cell(s)[0] = cell(t)[1] = ~0ULL;
+  pq[0].push({~0ULL, s}), pq[1].push({~0ULL, t});
+  u64 mu = ~0ULL, low[2] = {};
+  while (!pq[0].empty() && !pq[1].empty()) {
+    u32 d = pq[0].size() > pq[1].size();
+    auto [k, u] = pq[d].top();
+    pq[d].pop();
+    if ((low[d] = ~k) + low[d ^ 1] >= mu)
+      break;
+    if (k < cell(u)[d])
+      continue;
+    const u32 *F = d ? rfirst : first, *A = d ? radj : adj;
+    for (u32 i = F[u]; i < F[u + 1]; i++) {
+      u32 v = A[i] >> 11, w = A[i] & 2047;
+      u64 nd = ~k + (w == 2047 ? heavy(d ? rov : ov, i) : w), nk = ~nd,
+          *vp = cell(v);
+      if (nk > vp[d])
+        vp[d] = nk, pq[d].push({nk, v}),
+        vp[d ^ 1] && (mu = std::min(mu, nd + ~vp[d ^ 1]), 1);
+    }
   }
-  for (u32 i = lo; i < hi; i++) {
-    u32 e = S.adj[i], w = e & 2047;
-    relax(e, w == 2047 ? heavy(*S.ov, i) : w);
-  }
-  if constexpr (SH)
-    if (S.cnt[u] > 4)
-      for (auto *a =
-               std::lower_bound(S.sp, S.sp + S.nsp, u,
-                                [](const Sp &x, u32 v) { return x.u < v; });
-           a < S.sp + S.nsp && a->u == u; a++)
-        relax(a->e, a->w);
+  return D.clear(), mu == ~0ULL ? -1 : mu;
 }
 
+struct Side {
+  const u32 *__restrict first, *__restrict adj;
+  const Ov *ov;
+  Dial q;
+  u32 low = 0;
+};
+
 static long fast(u32 s, u32 t, Dist &D, Side &F, Side &R) {
-  u32 b, u, mu = ~0u;
-  bool big = 0;
+  u32 b, u, mu = ~0u, big = 0;
   D.set(s, 0xFFFF), D.set(t, D.get(t) | 0xFFFF0000u);
   F.q.push(0, s), R.q.push(0, t), F.low = R.low = 0;
   for (;;) {
-    Side &S = F.low <= R.low ? F : R; // grow the side that is behind
-    if (!S.q.pop(b, u))
+    u32 sh = F.q.pushes <= R.q.pushes ? 0 : 16;
+    Side &S = sh ? R : F;
+    if (!S.q.pop(b, u) || (S.low = b << 4, F.low + R.low >= mu))
       break;
-    S.low = b << 4;
-    if (F.low + R.low >= mu)
-      break; // no path through an unsettled node can beat mu
-    u32 x = D.get(u), d = (u16) ~(&S == &F ? x : x >> 16);
+    if (u16 nh = S.q.head[b])
+      __builtin_prefetch(S.adj + S.first[(u32)S.q.pool[nh]]);
+    u32 d = (u16) ~(D.get(u) >> sh);
     if (d >> 4 != b)
       continue;
-    (&S == &F ? expand<0> : expand<16>)(S, D, u, d, mu, big);
+    u64 r;
+    memcpy(&r, S.first + u, 8);
+    for (u32 i = r, hi = r >> 32; i < hi; i++) {
+      u32 e = S.adj[i], v = e >> 11, w = e & 2047, x = D.get(v);
+      u64 nd = d + (__builtin_expect(w == 2047, 0) ? heavy(*S.ov, i) : w);
+      if (__builtin_expect(nd >= 60000, 0)) {
+        big = 1;
+        continue;
+      }
+      u16 inv = ~(u16)nd, mine = x >> sh, other = x >> (16 ^ sh);
+      if (inv > mine)
+        D.set(v, (u32)inv << sh | (u32)other << (16 ^ sh)),
+            S.q.push(nd >> 4, v),
+            other && (mu = std::min(mu, (u32)nd + (u16)~other), 1),
+            __builtin_prefetch(S.first + v);
+    }
   }
   F.q.clear(), R.q.clear(), D.clear();
   long ans = mu < 60000 || (mu != ~0u && !big) ? (long)mu : -1;
-  return ans < 0 && big ? slow(s, t) : ans;
+  return ans < 0 && big ? slow(s, t, D) : ans;
 }
 
 int main() {
-  size_t glen, qlen, cut[CHUNKS + 1] = {};
+  size_t glen, qlen;
   const char *file = map("/data/graph.txt", glen), *body = file;
   n = num(body), m = num(body);
-  const size_t blen = glen - (body - file);
-  for (u32 c = 1; c <= CHUNKS; c++) {
-    size_t q = blen * c / CHUNKS;
-    auto nl = (const char *)memchr(body + q, '\n', blen - q);
-    cut[c] = nl ? nl + 1 - body : blen;
-  }
-  // e4: the first four edges of every node (target << 11 | weight), cnt: how
-  // many edges every node has, nid: the new id of every node. Edges beyond the
-  // fourth (about 1%) go to a spill list.
-  size_t cells = 5 * (size_t)n + n / 2 + 64;
-  auto e4 = anon(cells), nid = e4 + 4 * (size_t)n + 16;
-  auto cnt = (u16 *)(nid + n + 16);
-  auto sp = anon<Sp>(m + 16);
-  auto vis = anon<u64>(n / 64 + 1);
-  first = anon(n + 2), adj = anon(m);
-  std::atomic<size_t> job = 0, seed = 0, rank = 0, spn = 0;
+  size_t blen = file + glen - 1 - body;
+  auto cut = [&](size_t c) {
+    return c ? (const char *)memchr(body + blen * c / CHUNKS, '\n', blen) + 1
+             : body;
+  };
+  size_t keep = (((size_t)n + m + 2) * 4 + 4095) & ~4095ULL;
+  size_t e4b = std::max<size_t>(keep, (4 * (size_t)n * 4 + 4095) & ~4095ULL);
+  size_t tot = e4b / 4 + (n + 3) / 4 + (n / 64 + 2) * 2 + 8 * MSP + 1024;
+  first = anon(n + 2), adj = anon(m), rfirst = e4 = anon(tot),
+  radj = e4 + n + 2;
+  auto cnt = (u8 *)((char *)e4 + e4b);
+  auto vis = (u64 *)(((uintptr_t)(cnt + n + 15)) & ~7ULL);
+  auto sp = (Sp *)(vis + n / 64 + 2), spt = sp + MSP;
+  std::atomic<size_t> job = 0, seed = 0, rank = 0, spn = 0, cur[T * 8];
   std::barrier sync(T);
-  Ov ovs, ov0[T], ov1[T];
-  par([&](u32 tid) {
+  Ov ovs, ov0[T];
+  std::vector<std::array<u32, 3>> work;
+  std::vector<long> ans;
+  auto worker = [&](u32 tid) {
     for (size_t c; (c = job.fetch_add(1, rx)) < CHUNKS;)
-      for (auto q = body + cut[c], e = body + cut[c + 1]; q < e;) {
-        u32 U[16], V[16], W[16], k = 0;
+      for (auto q = cut(c), e = cut(c + 1); q < e;) {
+        u32 U[16], V[16], k = 0;
+        u64 W[16];
         for (; k < 16 && q < e; k++)
           U[k] = num(q), V[k] = num(q), W[k] = num(q),
           __builtin_prefetch(cnt + U[k], 1),
           __builtin_prefetch(e4 + 4 * (size_t)U[k], 1);
         for (u32 j = 0; j < k; j++) {
-          u32 u = U[j], v = V[j], w = W[j], e = v << 11 | std::min(w, 2047u);
-          u32 slot = std::atomic_ref<u16>(cnt[u]).fetch_add(1, rx);
-          if (slot < 4)
-            e4[4 * (size_t)u + slot] = e,
-                               w >= 2047 &&
-                                   (ov0[tid].push_back({4 * u + slot, w}), 1);
+          u64 u = U[j], w = W[j], e = V[j] << 11 | std::min<u64>(w, 2047);
+          u32 s = std::atomic_ref<u8>(cnt[u]).fetch_add(1, rx);
+          if (s < 4)
+            e4[4 * u + s] = e,
+            w >= 2047 && (ov0[tid].push_back({4 * u + s, w}), 1);
           else
-            sp[spn.fetch_add(1, rx)] = {u, e, w};
+            sp[spn.fetch_add(1, rx)] = {(u32)u, (u32)e, w};
         }
       }
-    sync.arrive_and_wait(); // LAP:parse
+    sync.arrive_and_wait();
     if (!tid) {
       for (auto &v : ov0)
-        ovs.insert(ovs.end(), v.begin(), v.end());
+        ovs.insert(ovs.end(), v.begin(), v.end()), v.clear();
       std::sort(ovs.begin(), ovs.end());
-      sort_sp(sp, spn);
+      for (int sh = 0; sh < 22; sh += 11) {
+        u32 c[2049] = {};
+        for (size_t i = 0; i < spn; i++)
+          c[(sp[i].u >> sh & 2047) + 1]++;
+        std::partial_sum(c, c + 2049, c);
+        for (size_t i = 0; i < spn; i++)
+          spt[c[sp[i].u >> sh & 2047]++] = sp[i];
+        std::swap(sp, spt);
+      }
     }
     sync.arrive_and_wait();
-    // Renumber by breadth-first regions of up to 8192 nodes, so a search
-    // touches nearby memory. (The spill edges are left out of the traversal:
-    // only the order of the regions depends on them.) A finished region claims
-    // a range of new ids and a range of edge slots with one atomic add, and
-    // copies its rows there while they are still in cache.
     auto claim = [&](u32 v) {
       std::atomic_ref<u64> cell(vis[v / 64]);
       u64 bit = 1ULL << v % 64;
       return !(cell.load(rx) & bit) && !(cell.fetch_or(bit, rx) & bit);
     };
-    size_t nsp = spn;
-    u32 qb[8192];
+    size_t nsp = spn, nlo = (size_t)n * tid / T,
+           nhi = (size_t)n * (tid + 1) / T;
+    u32 *qb = (u32 *)spt + 8192 * tid;
     for (size_t blk; (blk = seed.fetch_add(1024, rx)) < n;)
       for (u32 r = blk; r < std::min<size_t>(blk + 1024, n); r++) {
         if (!claim(r))
@@ -341,106 +259,94 @@ int main() {
         u32 id = at >> 32, dst = (u32)at;
         for (u32 k = 0; k < t; k++, id++) {
           u32 x = qb[k], cx = cnt[x];
-          nid[x] = id, first[id] = dst;
-          for (u32 c = 0; c < std::min(cx, 4u); c++, dst++) {
-            adj[dst] = e4[4 * (size_t)x + c]; // the target is still an old id
+          for (u32 c = 0; c < std::min(cx, 4u); c++, dst++)
+            adj[dst] = e4[4 * (size_t)x + c],
             (adj[dst] & 2047) == 2047 &&
-                (ov1[tid].push_back({dst, heavy(ovs, 4 * x + c)}), 1);
-          }
+                (ov0[tid].push_back({dst, heavy(ovs, 4 * x + c)}), 1);
+          *(u64 *)(e4 + 4 * (size_t)x) = id;
           if (cx > 4)
             for (auto *a = std::lower_bound(
                      sp, sp + nsp, x,
                      [](const Sp &y, u32 v) { return y.u < v; });
-                 a < sp + nsp && a->u == x; a++, dst++) {
-              adj[dst] = a->e;
-              (a->e & 2047) == 2047 && (ov1[tid].push_back({dst, a->w}), 1);
-            }
+                 a < sp + nsp && a->u == x; a++, dst++)
+              adj[dst] = a->e,
+              (a->e & 2047) == 2047 && (ov0[tid].push_back({dst, a->w}), 1);
         }
       }
-    sync.arrive_and_wait(); // LAP:bfs
-    for (size_t i = (size_t)m * tid / T; i < (size_t)m * (tid + 1) / T; i++) {
-      _mm_prefetch((const char *)(nid + (adj[i + 16] >> 11)), _MM_HINT_T0);
-      u32 e = adj[i];
-      adj[i] = nid[e >> 11] << 11 | (e & 2047);
+    sync.arrive_and_wait();
+    for (size_t x = nlo; x < nhi; x++)
+      e4[4 * (size_t)e4[4 * x] + 2] = cnt[x];
+    sync.arrive_and_wait();
+    if (!tid) {
+      munmap((char *)e4 + e4b, tot * 4 + 4096 - e4b);
+      for (u32 i = 0; i < n; i++)
+        first[i + 1] = first[i] + e4[4 * (size_t)i + 2];
     }
-  }); // LAP:build
-  first[n] = m;
-  for (auto &v : ov1)
-    ov.insert(ov.end(), v.begin(), v.end());
-  std::sort(ov.begin(), ov.end());
-
-  // Free what the build no longer needs (nid stays for the queries).
-  uintptr_t cs = ((uintptr_t)cnt + 4095) & ~4095ULL,
-            ce = (uintptr_t)e4 + ((cells * 4 + 4096 + 4095) & ~4095ULL);
-  munmap(e4, (4 * (size_t)n + 16) * 4 & ~4095ULL);
-  ce > cs &&munmap((void *)cs, ce - cs);
-  // The reverse graph in the final ids, four slots per node like the input.
-  re4 = anon(4 * (size_t)n + 64), rcnt = anon<u16>(n + 8);
-  rsp = anon<Sp>(m + 16);
-  std::atomic<size_t> rcount = 0;
-  Ov rov1[T];
-  par([&](u32 tid) {
-    size_t lo = (size_t)n * tid / T, hi = (size_t)n * (tid + 1) / T;
-    for (size_t u = lo; u < hi; u++)
-      for (u32 i = first[u]; i < first[u + 1]; i++) {
-        u32 pv = adj[i + 16] >> 11;
-        __builtin_prefetch(rcnt + pv, 1),
-            __builtin_prefetch(re4 + 4 * (size_t)pv, 1);
-        u32 e = adj[i], v = e >> 11, w = e & 2047, r = u << 11 | w;
-        u32 slot = std::atomic_ref<u16>(rcnt[v]).fetch_add(1, rx);
-        u64 hw = w == 2047 ? heavy(ov, i) : w;
-        if (slot < 4)
-          re4[4 * (size_t)v + slot] = r,
-                              w == 2047 &&
-                                  (rov1[tid].push_back({4 * v + slot, hw}), 1);
-        else
-          rsp[rcount.fetch_add(1, rx)] = {v, r, hw};
+    for (size_t i = (size_t)m * tid / T; i < (size_t)m * (tid + 1) / T; i++) {
+      __builtin_prefetch(e4 + 4 * (size_t)(adj[i + 16] >> 11));
+      u32 e = adj[i], v = e4[4 * (size_t)(e >> 11)];
+      adj[i] = v << 11 | (e & 2047),
+      std::atomic_ref(e4[4 * (size_t)v + 1]).fetch_add(1, rx);
+    }
+    sync.arrive_and_wait();
+    if (!tid) {
+      for (auto &v : ov0)
+        ov.insert(ov.end(), v.begin(), v.end()), v.clear();
+      std::sort(ov.begin(), ov.end());
+      const char *qp = map("/data/queries.txt", qlen), *qe = qp + qlen;
+      while (qp < qe) {
+        u32 s = num(qp), t = num(qp), a = e4[4 * (size_t)s],
+            b = e4[4 * (size_t)t];
+        ans.push_back(s == t ? 0 : -1);
+        if (s != t && e4[4 * (size_t)b + 1] && first[a + 1] > first[a])
+          work.push_back({a, b, (u32)ans.size() - 1});
       }
-  }); // LAP:reverse
-  rn = rcount;
-  sort_sp(rsp, rn);
-  for (auto &v : rov1)
-    rov.insert(rov.end(), v.begin(), v.end());
-  std::sort(rov.begin(), rov.end());
-  // Answer what needs no search; the rest become (source, target, index)
-  // triples in the new ids, sorted by source.
-  std::vector<std::array<u32, 3>> work;
-  std::vector<long> ans;
-  const char *qp = map("/data/queries.txt", qlen), *qe = qp + qlen;
-  while (qp < qe) {
-    u32 s = num(qp), t = num(qp), a = nid[s], b = nid[t];
-    ans.push_back(s == t ? 0 : -1);
-    if (s != t && rcnt[b] && first[a + 1] > first[a])
-      work.push_back({a, b, (u32)ans.size() - 1});
-  }
-  uintptr_t ns = ((uintptr_t)nid + 4095) & ~4095ULL,
-            ne = (uintptr_t)cnt & ~4095ULL; // the pages of nid itself
-  ne > ns &&munmap((void *)ns, ne - ns);
-  std::sort(work.begin(), work.end()); // LAP:prep
-
-  // Each thread starts on its own slice of the queries, then helps with the
-  // others.
-  std::atomic<size_t> cur[T * 8]; // one cache line per slice
-  for (u32 k = 0; k < T; k++)
-    cur[k * 8] = k * work.size() / T;
-  par([&](u32 tid) {
-    u32 P = (n >> 9) + 2;                                  // pages of 512 nodes
-    auto pool = anon<u64>(2 * POOL + 257 * (size_t)P + 2); // queues | pages
-    auto pt = (u32 *)(pool + 2 * POOL);
-    Dist D{pt, pt + P, 1, pt + 2 * P};
-    Side F{first, adj, 0, 0, 0, &ov, Dial(pool)},
-        R{0, re4, rcnt, rsp, rn, &rov, Dial(pool + POOL)};
+      for (u32 v = 0, sum = rfirst[0] = 0; v < n; v++) {
+        u32 d = e4[4 * (size_t)v + 1];
+        rfirst[v + 1] = sum, sum += d;
+      }
+      e4b > keep &&munmap((char *)e4 + keep, e4b - keep);
+    }
+    sync.arrive_and_wait();
+    for (size_t u = nlo; u < nhi; u++)
+      for (u32 i = first[u]; i < first[u + 1]; i++) {
+        __builtin_prefetch(rfirst + (adj[i + 16] >> 11) + 1, 1);
+        u32 e = adj[i], v = e >> 11, w = e & 2047;
+        u32 dst = std::atomic_ref(rfirst[v + 1]).fetch_add(1, rx);
+        radj[dst] = u << 11 | w;
+        w == 2047 && (ov0[tid].push_back({dst, heavy(ov, i)}), 1);
+      }
+    sync.arrive_and_wait();
+    if (!tid) {
+      for (auto &v : ov0)
+        rov.insert(rov.end(), v.begin(), v.end());
+      std::sort(rov.begin(), rov.end());
+      std::sort(work.begin(), work.end());
+      for (u32 k = 0; k < T; k++)
+        cur[k * 8] = k * work.size() / T;
+    }
+    sync.arrive_and_wait();
+    u32 P = (n >> 7) + 2;
+    auto pool = anon<u64>(2 * POOL + 65 * (size_t)P + 2);
+    auto pt = (u16 *)(pool + 2 * POOL);
+    Dist D{pt, pt + P, 1, (u32 *)(pt + 2 * P)};
+    Side F{first, adj, &ov, Dial(pool)},
+        R{rfirst, radj, &rov, Dial(pool + POOL)};
     for (u32 k = 0; k < T; k++)
-      for (size_t j, who = (tid + k) % T, end = (who + 1) * work.size() / T;
-           (j = cur[who * 8].fetch_add(1, rx)) < end;)
+      for (size_t j, w = (tid + k) % T, end = (w + 1) * work.size() / T;
+           (j = cur[w * 8].fetch_add(1, rx)) < end;)
         ans[work[j][2]] = fast(work[j][0], work[j][1], D, F, R);
-  }); // LAP:queries
-
-  std::string out;
-  char buf[24];
-  for (long a : ans)
-    out.append(buf, std::to_chars(buf, buf + 24, a).ptr).push_back('\n');
-  int fd = open("/out/distances.txt", O_WRONLY | O_CREAT | O_TRUNC, 0666);
-  write(fd, out.data(), out.size());
-  _exit(0);
+    sync.arrive_and_wait();
+    if (!tid) {
+      std::string out;
+      char buf[24];
+      for (long a : ans)
+        out.append(buf, std::to_chars(buf, buf + 24, a).ptr).push_back('\n');
+      int fd = open("/out/distances.txt", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+      write(fd, out.data(), out.size()), _exit(0);
+    }
+  };
+  std::vector<std::jthread> th;
+  for (u32 i = 0; i < T; i++)
+    th.emplace_back(worker, i);
 }
