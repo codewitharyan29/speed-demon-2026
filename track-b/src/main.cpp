@@ -865,6 +865,12 @@ void worker(int tid) {
         u32 best_m = 0;
         if (!qq.has_or) {
           best_m = qq.t[0];
+          for (u32 j = 1; j < qq.n; j++) {
+            if (qq.ops[j - 1] == 'A') {
+              u32 cand = qq.t[j];
+              if (g_dfall[cand] < g_dfall[best_m]) best_m = cand;
+            }
+          }
         } else {
           int lo = static_cast<int>(qq.n) - 2;
           while (lo >= 0 && qq.ops[lo] != 'O') lo--;
