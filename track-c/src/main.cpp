@@ -1,3 +1,4 @@
+#define READ2 1 // diagnostic: repeats this stage's work, output unchanged
 // Track C (join): per-country aggregates of records.csv joined with regions.csv,
 // exactly per spec c-join.md. One thread pool runs three phases separated by
 // barriers: regions.csv into a byte table (region id -> country index);
@@ -250,6 +251,9 @@ struct Worker {
       // The one worker that sets a bit counts the name for the country.
       u64 bit = 1ULL << (c & 63);
       counts[c] += !(e->mask[c >> 6].fetch_or(bit, RX) & bit);
+#ifdef TABLE2
+      { Entry *e2 = names->find(r.name, r.len, key(r.name, r.len), r.hash, 0); counts[c] += !(e2->mask[c >> 6].fetch_or(bit, RX) & bit); }
+#endif
       Agg &a = agg[c];
       a.count++, a.ids += r.id, a.sum += r.cents, a.nb += r.nb, a.tb += r.tb;
       a.lo = min(a.lo, r.cents), a.hi = max(a.hi, r.cents);
@@ -262,10 +266,20 @@ struct Worker {
   bool chunk(size_t lo, size_t hi) {
     for (size_t next = lo, keep = 0, now = 0;;) {
       size_t n = min(BLOCK, hi - next), end = keep + n, start = 0;
-      buf.resize(end + PAD + 1), rd(fd_rec, &buf[keep], n, next), next += n;
+      buf.resize(end + PAD + 1), rd(fd_rec, &buf[keep], n, next);
+#ifdef READ2
+      { static thread_local vector<u8> scratch(BLOCK); rd(fd_rec, scratch.data(), n, (next + n_rec / 2) % (n_rec - n)); }
+#endif
+      next += n;
       if (next == hi && buf[end - 1] != '\n') buf[end++] = '\n'; // unterminated
       memset(&buf[end], 0, PAD), structure(end);
+#ifdef STRUCT2
+      structure(end);
+#endif
       for (size_t k = 0; k + 5 <= seps; k += 5) {
+#ifdef PARSE2
+        { Rec scratch; if (!record(start, &at[k], scratch)) return false; asm volatile("" ::"r"(&scratch) : "memory"); }
+#endif
         if (!record(start, &at[k], b[now][bn[now]++])) return false;
         start = at[k + 4] + 1;
         if (bn[now] == BATCH) warm((now + 2) % 3), resolve((now + 1) % 3), now = (now + 1) % 3;
