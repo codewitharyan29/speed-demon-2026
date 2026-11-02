@@ -1,492 +1,400 @@
-//! Track A (ingest): per (hour, endpoint) request count, latency percentiles and 5xx rate.
-//!
-//! Workers take 1 MiB chunks of the log in order, read them in blocks and parse every line with AVX2/SWAR into a 4-byte
-//! record in a region private to (chunk, hour); endpoint ids come from one shared dictionary. The log is nearly in time
-//! order, so an hour is summarised, and its records released, as soon as the chunks still to come are expected not to
-//! contain it. That overlaps the summaries with the parsing of later hours. Every chunk checks the guess when it
-//! finishes; if it was wrong the whole input is processed again without guessing.
+// Track C (join): per-country aggregates of records.csv joined with regions.csv,
+// exactly per spec c-join.md. One thread pool runs three phases separated by
+// barriers: regions.csv into a byte table (region id -> country index);
+// records.csv in 1 MiB chunks, each parsed with a SIMD structural index and its
+// names looked up in batches in a shared table; then the distinct names per
+// country are counted from the masks. A chunk starts at an LF followed by a
+// digit 1-9 or a BOM, which never happens inside a quoted field (spec 2.2). If
+// any record does not fit, the whole file is parsed again as one chunk.
+#include <bits/stdc++.h>
+#include <fcntl.h>
+#include <immintrin.h>
+#include <sys/prctl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+using namespace std;
+using u8 = uint8_t;
+using u32 = uint32_t;
+using u64 = uint64_t;
+using i64 = int64_t;
+using V = __m256i;
+constexpr auto RX = memory_order_relaxed, ACQ = memory_order_acquire;
+constexpr size_t BLOCK = 32 << 10, PAD = 128, BATCH = 16;
+static int fd_rec, fd_reg;
+static size_t n_rec, n_reg, max_id;
+static u8 *region; // region id -> country index (0: not a region)
 
-use std::arch::x86_64::*;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
-use std::{fs::File, io::Write, os::unix::fs::FileExt, sync::Mutex, time::Duration};
-
-extern "C" {
-    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
-    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
-    fn prctl(option: i32, ...) -> i32;
-    fn mallopt(param: i32, value: i32) -> i32;
+static void rd(int fd, void *dst, size_t n, size_t off) {
+  ssize_t k;
+  for (u8 *d = (u8 *)dst; n; d += k, n -= k, off += k)
+    if ((k = pread(fd, d, n, off)) <= 0) abort();
+}
+static u64 load8(const u8 *p) {
+  u64 w;
+  memcpy(&w, p, 8);
+  return w;
+}
+// The n >= 1 digits at p (up to 8 at once, without a branch).
+static u64 num(const u8 *p, size_t n) {
+  if (n > 8) {
+    u64 v = 0;
+    for (size_t i = 0; i < n; i++) v = v * 10 + p[i] - '0';
+    return v;
+  }
+  u64 w = n ? load8(p) << (64 - 8 * n) : 0;
+  w = ((w & 0x0F0F0F0F0F0F0F0F) * 2561) >> 8;
+  w = ((w & 0x00FF00FF00FF00FF) * 6553601) >> 16;
+  return ((w & 0x0000FFFF0000FFFF) * 42949672960001) >> 32;
 }
 
-const CHUNK: usize = 1 << 20;
-const BLOCK: usize = 32 << 10; // bytes read at a time; small enough to stay in the core's cache while it is parsed
-const HOURS: usize = 72;
-const DONE: u32 = 1 << 8; // in a chunk's state; below it is 1 + the hour of the chunk's first line, or 0 before it starts
-const SLOTS: usize = 4096; // dictionary slots; the spec has at most 1,842 endpoints
-const STRIDE: usize = 128; // bytes per stored endpoint (at most 125) and, in the last one, its length
-/// A record is one `u32`: latency in bits 0..20, endpoint id in bits 20..31, 5xx flag in bit 31. A latency that does not
-/// fit (`SENT` or more) is stored as `SENT` and followed by a second word holding the whole latency.
-const SENT: u32 = (1 << 20) - 1;
-const SLACK: usize = 192; // bytes the parser may read past the start of a line
-/// Bytes reserved for the records of one (chunk, hour): the whole chunk could fall in a single hour, with two words per line.
-const REGION: usize = (((CHUNK + 256) / 40 + 4) * 8 + 8 + 4095) & !4095;
-const DAYS: [&str; 4] = ["2026-10-30", "2026-10-31", "2026-11-01", "2026-11-02"];
-
-type P = *const u8;
-type Cur = [usize; HOURS];
-
-fn zeros<T: Default>(n: usize) -> Vec<T> {
-    (0..n).map(|_| T::default()).collect()
+// A name's 32-byte key: byte 0 is its length + 1 (255 if longer than 31: then
+// word 1 is its offset in the spill area and word 2 its length), then its
+// bytes, zero padded. 1 readable byte before s, 32 after.
+static V key(const u8 *s, size_t len) {
+  V iota = _mm256_setr_epi64x(0x0706050403020100, 0x0F0E0D0C0B0A0908,
+                              0x1716151413121110, 0x1F1E1D1C1B1A1918);
+  char l = char(min<size_t>(len, 31) + 1);
+  V v = _mm256_loadu_si256((const V *)(s - 1));
+  v = _mm256_and_si256(v, _mm256_cmpgt_epi8(_mm256_set1_epi8(l), iota));
+  return _mm256_insert_epi8(v, l, 0);
+}
+static u64 hsh(V v, u64 len) {
+  __m128i x = _mm256_castsi256_si128(v) ^ _mm256_extracti128_si256(v, 1);
+  u64 a = _mm_cvtsi128_si64(x), b = _mm_extract_epi64(x, 1);
+  auto r = (unsigned __int128)(a ^ 0x9E3779B97F4A7C15) *
+           (b ^ 0xA0761D6478BD642F ^ len);
+  return u64(r) ^ u64(r >> 64);
 }
 
-/// 64-bit hash of all `len` bytes at `s` (nonzero); `s` must have 128 readable bytes. The first 64 bytes are always
-/// hashed as four independent AES blocks, so short and long endpoints take the same branch-free path.
-unsafe fn hash(s: *const u8, len: usize) -> u64 {
-    let base = _mm256_set1_epi64x(0x0706_0504_0302_0100);
-    let step = 0x0808_0808_0808_0808;
-    let iota = _mm256_add_epi8(base, _mm256_setr_epi64x(0, step, 2 * step, 3 * step));
-    let k1 = 0x9E37_79B9_7F4A_7C15u64 as i64;
-    let k2 = 0xD6E8_FEB8_6659_FD93u64 as i64;
-    let key = |i: i64| _mm_set_epi64x(k1 ^ i, k2 ^ i * 0x517C_C1B7);
-    let live = |o: usize| _mm256_cmpgt_epi8(_mm256_set1_epi8(len as i32 as i8 - o as i8), iota);
-    let block = |o: usize| _mm256_and_si256(_mm256_loadu_si256(s.add(o) as _), live(o));
-    let (aes, xor) = (|a, b| _mm_aesenc_si128(a, b), |a, b| _mm_xor_si128(a, b));
-    let lo = |v| _mm256_castsi256_si128(v);
-    let hi = |v| _mm256_extracti128_si256(v, 1);
-    let (v0, v1) = (block(0), block(32));
-    let t = |x, i| aes(x, key(i));
-    let p = aes(xor(t(lo(v0), 1), t(hi(v0), 2)), key(5));
-    let q = aes(xor(t(lo(v1), 3), t(hi(v1), 4)), key(6));
-    let mut r = aes(xor(p, q), key(7));
-    let mut o = 64;
-    while o < len {
-        let x = _mm_and_si128(_mm_loadu_si128(s.add(o) as _), lo(live(o)));
-        r = aes(xor(r, x), key(8));
-        o += 16;
+// A distinct name and a mask of the countries it occurred in, in one line. The
+// key's word 0 is stored last with release: a reader who sees it nonzero sees
+// the whole key.
+struct alignas(64) Entry {
+  atomic<u64> k[4], mask[4];
+};
+// Every distinct name, shared: entries placed by the hash; tags[i] holds 8
+// bits of the hash of the name in e[i] (0: free).
+struct Names {
+  size_t n, cap;
+  atomic<u8> *tags;
+  Entry *e;
+  u8 *spill;
+  alignas(128) atomic<size_t> used{0}, spilled{0};
+  atomic<bool> full{false};
+  explicit Names(int bits) : n(size_t(1) << bits), cap(n * 256) {
+    tags = (atomic<u8> *)calloc(n + 16, 1); // calloc zeroes lazily
+    e = (Entry *)(((uintptr_t)calloc(n + 2, 64) + 63) & ~uintptr_t(63));
+    spill = (u8 *)calloc(cap, 1);
+  }
+  // Prefetches for writing the entry a lookup of hash h will most likely
+  // read; returns its index + 1 (0: none yet).
+  u32 warm(u64 h) const {
+    size_t i = h & (n - 1);
+    // 16 tags in one load; a tag written meanwhile is seen old or new, and any
+    // hit is checked again by find(), so the load is done as one instruction
+    // the compiler does not reorder or split.
+    __m128i v;
+    asm volatile("vmovdqu %1, %0" : "=x"(v) : "m"(*(const char(*)[16])(tags + i)));
+    u32 hit = _mm_movemask_epi8(_mm_cmpeq_epi8(v, _mm_set1_epi8(h >> 56 | 1)));
+    u32 free = _mm_movemask_epi8(_mm_cmpeq_epi8(v, _mm_setzero_si128()));
+    hit &= ((free | 1 << 16) & -(free | 1 << 16)) - 1;
+    size_t p = (i + __builtin_ctz(hit | 1 << 16)) & (n - 1);
+    return hit ? _mm_prefetch((const char *)(e + p), _MM_HINT_ET0), u32(p + 1)
+               : 0;
+  }
+  bool same(size_t i, const u8 *s, size_t len, V v) const {
+    u64 k0 = e[i].k[0].load(ACQ);
+    if (len > 31)
+      return (k0 & 255) == 255 && e[i].k[2].load(RX) == len &&
+             !memcmp(spill + e[i].k[1].load(RX), s, len);
+    if (k0 != u64(_mm256_extract_epi64(v, 0))) return false; // or unwritten
+    V x = _mm256_cmpeq_epi8(_mm256_load_si256((const V *)e[i].k), v);
+    return _mm256_movemask_epi8(x) == -1;
+  }
+  // The entry of name s[0..len) (key v, hash h), added if new.
+  Entry *find(const u8 *s, size_t len, V v, u64 h, u32 hint) {
+    if (hint && same(hint - 1, s, len, v)) return e + hint - 1;
+    u8 t = h >> 56 | 1;
+    for (size_t i = h & (n - 1);; i = (i + 1) & (n - 1)) {
+      u8 x = tags[i].load(ACQ);
+      if (!x) {
+        // Keep 1/8 of the table free, so that every search ends.
+        if (used.fetch_add(1, RX) >= n / 8 * 7 || spilled + len > cap)
+          return full = true, e + n;
+        if (tags[i].compare_exchange_strong(x, t)) {
+          tags[i < 16 ? n + i : i] = t; // the copy a search near the end reads
+          u64 k[4];
+          if (len < 32) {
+            _mm256_storeu_si256((V *)k, v);
+          } else {
+            k[1] = spilled.fetch_add(len, RX), k[0] = 255, k[2] = len, k[3] = 0;
+            memcpy(spill + k[1], s, len);
+          }
+          for (int j = 3; j >= 0; j--) e[i].k[j].store(k[j], j ? RX : memory_order_release);
+          return e + i;
+        }
+        used.fetch_sub(1, RX);
+      }
+      if (x == t) {
+        while (!e[i].k[0].load(ACQ)) _mm_pause(); // another worker writes it
+        if (same(i, s, len, v)) return e + i;
+      }
     }
-    let r = aes(xor(r, _mm_set1_epi64x(len as i64)), key(9));
-    (_mm_cvtsi128_si64(r) ^ _mm_extract_epi64(r, 1)) as u64 | 1
+  }
+};
+static Names *names;
+
+struct Agg {
+  u64 count = 0, ids = 0, nb = 0, tb = 0;
+  i64 sum = 0, lo = INT64_MAX, hi = INT64_MIN;
+};
+struct Rec {
+  u64 id, hash;
+  i64 cents;
+  const u8 *name;
+  u32 reg, len, nb, tb, hint;
+};
+
+struct Worker {
+  vector<u8> buf;
+  unique_ptr<u32[]> at; // separator positions, never zeroed
+  size_t at_cap = 0, seps = 0;
+  vector<u64> qw; // quote bits of each 64-byte word
+  vector<u32> qb; // quotes before each word
+  Rec b[3][BATCH];
+  size_t bn[3] = {};
+  Agg agg[256];
+  u64 counts[256] = {};
+  u32 quotes(size_t p) const {
+    return qb[p / 64] + __builtin_popcountll(qw[p / 64] & ((1ULL << p % 64) - 1));
+  }
+  // Stage 1: commas and LFs outside quotes in buf[0..end) go to `at`. A quote
+  // toggles being inside quotes, and so does each half of a "" pair, so the
+  // bytes inside are the prefix XOR of the quote bits (a carry-less product).
+  void structure(size_t end) {
+    size_t words = (end + 63) / 64, cnt = 0;
+    if (at_cap < words * 64 + 8) at.reset(new u32[at_cap = words * 64 + 8]);
+    qw.resize(words + 1), qb.resize(words + 1);
+    u64 inside = 0;
+    u32 seen = 0, *out = at.get();
+    for (size_t w = 0; w < words; w++) {
+      V lo = _mm256_loadu_si256((const V *)&buf[64 * w]);
+      V hi = _mm256_loadu_si256((const V *)&buf[64 * w + 32]);
+      auto bits = [&](char c) {
+        V x = _mm256_set1_epi8(c);
+        u64 l = u32(_mm256_movemask_epi8(_mm256_cmpeq_epi8(lo, x)));
+        return l | u64(u32(_mm256_movemask_epi8(_mm256_cmpeq_epi8(hi, x)))) << 32;
+      };
+      u64 q = bits('"');
+      __m128i m = _mm_clmulepi64_si128(_mm_set_epi64x(0, q), _mm_set1_epi8(-1), 0);
+      u64 in = _mm_cvtsi128_si64(m) ^ inside, sep = (bits(',') | bits('\n')) & ~in;
+      inside = u64(i64(in) >> 63);
+      size_t k = __builtin_popcountll(sep);
+      for (int j = 0; j < 8; j++, sep &= sep - 1) // more than 8 is rare
+        out[cnt + j] = u32(64 * w + __builtin_ctzll(sep | 1ULL << 63));
+      for (size_t j = 8; j < k; j++, sep &= sep - 1)
+        out[cnt + j] = u32(64 * w + __builtin_ctzll(sep));
+      cnt += k, qw[w] = q, qb[w] = seen, seen += __builtin_popcountll(q);
+    }
+    qw[words] = 0, qb[words] = seen, seps = cnt;
+  }
+  // Stage 2: the record at s0 with separators s[0..5) into r; false if they
+  // are not ",,,,\n". An unquoted field has no quotes; a quoted one has two
+  // delimiters and two more per "" pair. A name is looked up by its bytes as
+  // written: writing a value with every " doubled is one to one, so two names
+  // are equal exactly when these bytes are.
+  bool record(size_t s0, const u32 *s, Rec &r) {
+    const u8 *b = buf.data();
+    size_t e1 = s[0], e2 = s[1], e3 = s[2], e4 = s[3], e5 = s[4];
+    if ((b[e1] ^ ',') | (b[e2] ^ ',') | (b[e3] ^ ',') | (b[e4] ^ ',') |
+        (b[e5] ^ '\n'))
+      return false;
+    bool bom = b[s0] == 0xEF, neg = b[e4 + 1] == '-';
+    size_t p = s0 + 3 * bom, dot = e5 - (b[e5 - 1] == '\r') - 3;
+    size_t whole = e4 + 1 + neg, qn = quotes(e2) - quotes(e1);
+    size_t qt = quotes(e3) - quotes(e2), nq = qn != 0, tq = qt != 0;
+    i64 c = num(b + whole, dot - whole) * 100 + (b[dot + 1] - '0') * 10 +
+            (b[dot + 2] - '0');
+    size_t len = e2 - e1 - 1 - 2 * nq;
+    u64 reg = num(b + e3 + 1, e4 - e3 - 1);
+    r.id = num(b + p, e1 - p), r.cents = neg ? -c : c, r.name = b + e1 + 1 + nq;
+    r.len = u32(len), r.nb = u32(len - (qn / 2 - nq)), r.hint = 0;
+    r.tb = u32(e3 - e2 - 1 - tq - qt / 2);
+    r.reg = reg > max_id ? 0 : u32(reg), r.hash = hsh(key(r.name, len), len);
+    _mm_prefetch((const char *)(names->tags + (r.hash & (names->n - 1))), _MM_HINT_T0);
+    _mm_prefetch((const char *)(region + r.reg), _MM_HINT_T0);
+    return true;
+  }
+  void warm(int k) {
+    for (size_t i = 0; i < bn[k]; i++) b[k][i].hint = names->warm(b[k][i].hash);
+  }
+  void resolve(int k) {
+    for (size_t i = 0; i < bn[k]; i++) {
+      Rec &r = b[k][i];
+      u8 c = region[r.reg];
+      Entry *e = names->find(r.name, r.len, key(r.name, r.len), r.hash, r.hint);
+      // The one worker that sets a bit counts the name for the country.
+      u64 bit = 1ULL << (c & 63);
+      counts[c] += !(e->mask[c >> 6].fetch_or(bit, RX) & bit);
+      Agg &a = agg[c];
+      a.count++, a.ids += r.id, a.sum += r.cents, a.nb += r.nb, a.tb += r.tb;
+      a.lo = min(a.lo, r.cents), a.hi = max(a.hi, r.cents);
+    }
+    bn[k] = 0;
+  }
+  // The records between the record starts lo and hi; false if one does not
+  // fit. Three batches are in flight: one is parsed while the one before has
+  // its tags read and its entry prefetched, and the one before that resolved.
+  bool chunk(size_t lo, size_t hi) {
+    for (size_t next = lo, keep = 0, now = 0;;) {
+      size_t n = min(BLOCK, hi - next), end = keep + n, start = 0;
+      buf.resize(end + PAD + 1), rd(fd_rec, &buf[keep], n, next), next += n;
+      if (next == hi && buf[end - 1] != '\n') buf[end++] = '\n'; // unterminated
+      memset(&buf[end], 0, PAD), structure(end);
+      for (size_t k = 0; k + 5 <= seps; k += 5) {
+        if (!record(start, &at[k], b[now][bn[now]++])) return false;
+        start = at[k + 4] + 1;
+        if (bn[now] == BATCH) warm((now + 2) % 3), resolve((now + 1) % 3), now = (now + 1) % 3;
+      }
+      for (int k : {1, 2, 0}) warm((now + k) % 3), resolve((now + k) % 3);
+      if (next == hi) return start == end;
+      keep = end - start, memmove(&buf[0], &buf[start], keep);
+    }
+  }
+};
+
+// Start of the first record at or after cut: an LF then a digit 1-9 or a BOM.
+static size_t record_start(size_t cut) {
+  u8 b[512];
+  for (size_t at = cut - 1; at + 1 < n_rec; at += 511) {
+    size_t n = min<size_t>(n_rec - at, 512);
+    rd(fd_rec, b, n, at);
+    for (size_t k = 0; k + 1 < n; k++)
+      if (b[k] == '\n' && (u8(b[k + 1] - '1') < 9 || b[k + 1] == 0xEF))
+        return at + k + 1;
+  }
+  return n_rec;
+}
+// The start of the first line of regions.csv at or after at.
+static size_t line_start(size_t at) {
+  u8 b[64];
+  size_t n = min<size_t>(n_reg - at + 1, 64);
+  rd(fd_reg, b, n, at - 1);
+  u8 *p = (u8 *)memchr(b, '\n', n);
+  return p ? at + (p - b) : n_reg;
 }
 
-/// Endpoint dictionary shared by all workers: open addressing keyed by the full 64-bit hash of the endpoint.
-/// Lookups are lock-free and never touch the key bytes; inserts run under a lock.
-struct Dict(Vec<AtomicU64>, Vec<AtomicU32>, usize, Mutex<usize>); // hashes, ids, bytes of the endpoints, count
-
-impl Dict {
-    fn new() -> Self {
-        let keys = vec![0u8; SLOTS * STRIDE].leak().as_ptr() as usize;
-        Dict(zeros(SLOTS), zeros(SLOTS), keys, Mutex::new(0))
-    }
-
-    fn ptr(&self, id: usize) -> *mut u8 {
-        (self.2 + id * STRIDE) as _
-    }
-
-    /// The bytes of endpoint `id`.
-    fn key(&self, id: usize) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.ptr(id), *self.ptr(id).add(STRIDE - 1) as usize) }
-    }
-
-    /// Id of the endpoint at `s` (`len` bytes, hash `h`), adding it if it is new.
-        unsafe fn lookup(&self, s: *const u8, len: usize, h: u64) -> u32 {
-        let mut slot = (h >> 40) as usize % SLOTS;
-        loop {
-            let v = self.0[slot].load(Acquire);
-            if v == h {
-                return self.1[slot].load(Relaxed);
-            }
-            if v == 0 {
-                return self.insert(s, len, h, slot);
-            }
-            slot = (slot + 1) % SLOTS;
+// The output; empty if the fast path gives up (bits: name table size).
+static string run(int bits, size_t chunk) {
+  // regions.csv: a header, then "id,CCC\n" lines by ascending id.
+  u8 h[64], t[64];
+  if (n_reg < 64) return {};
+  rd(fd_reg, h, 64, 0), rd(fd_reg, t, 64, n_reg - 64);
+  size_t first = (u8 *)memchr(h, '\n', 64) - h + 1, last = 62, pieces = 48;
+  while (last && t[last] != '\n') last--;
+  for (max_id = 0; t[++last] - '0' < 10u;) max_id = max_id * 10 + t[last] - '0';
+  region = (u8 *)calloc(max_id + 1, 1), names = new Names(bits);
+  static atomic<u8> idx[26 * 26 * 26];
+  memset((void *)idx, 0, sizeof idx);
+  vector<int> codes;
+  mutex mu;
+  u8 h0[256];
+  size_t hn = min<size_t>(n_rec, 256);
+  rd(fd_rec, h0, hn, 0);
+  u8 *nl = (u8 *)memchr(h0, '\n', hn); // the header has no quotes
+  if (!nl) return {};
+  // Cuts every `chunk` bytes, then (past 85% of the file) every chunk / 8, so that the workers finish together.
+  vector<size_t> cuts{0}, starts;
+  while (cuts.back() < n_rec) cuts.push_back(cuts.back() + (cuts.back() < n_rec / 20 * 17 ? chunk : chunk / 8));
+  size_t chunks = cuts.size() - 1, threads = thread::hardware_concurrency();
+  starts.resize(chunks + 1);
+  cpu_set_t set;
+  if (!sched_getaffinity(0, sizeof set, &set)) threads = CPU_COUNT(&set);
+  threads = max<size_t>(threads, 1);
+  atomic<size_t> next[4] = {0, 0, 0, 0};
+  atomic<bool> bad{false};
+  barrier sync((ptrdiff_t)threads);
+  vector<Worker> ws(threads);
+  auto job = [&](int phase, size_t n) {
+    size_t j = next[phase].fetch_add(1, RX);
+    return j < n ? j : SIZE_MAX;
+  };
+  auto work = [&](size_t me) {
+    for (size_t j; (j = job(0, pieces)) != SIZE_MAX;) { // "id,CCC\n" lines
+      auto cut = [&](size_t j) { return line_start(first + (n_reg - first) * j / pieces); };
+      size_t a = j ? cut(j) : first, len = (j + 1 == pieces ? n_reg : cut(j + 1)) - a;
+      vector<u8> r(len + 16);
+      rd(fd_reg, r.data(), len, a);
+      for (size_t p = 0, i; p < len && !bad; p = i + 5) {
+        u64 x = load8(&r[p]) ^ 0x2C2C2C2C2C2C2C2C;
+        u64 z = (x - 0x0101010101010101) & ~x & 0x8080808080808080;
+        u8 *cm = z ? &r[p] + __builtin_ctzll(z) / 8 : (u8 *)memchr(&r[p], ',', len - p);
+        i = cm ? cm - r.data() : p;
+        u64 id = num(&r[p], i - p);
+        int c0 = r[i + 1] - 'A', c1 = r[i + 2] - 'A', c2 = r[i + 3] - 'A';
+        if (i == p || i + 4 > len || r[i + 4] != '\n' || !id || id > max_id ||
+            unsigned(c0) > 25 || unsigned(c1) > 25 || unsigned(c2) > 25) {
+          bad = true;
+          break;
         }
-    }
-
-    #[cold]
-    #[inline(never)]
-    unsafe fn insert(&self, s: *const u8, len: usize, h: u64, mut slot: usize) -> u32 {
-        let mut count = self.3.lock().unwrap();
-        while self.0[slot].load(Acquire) != 0 {
-            if self.0[slot].load(Acquire) == h {
-                return self.1[slot].load(Relaxed); // another worker added it first
-            }
-            slot = (slot + 1) % SLOTS;
+        int code = c0 * 676 + c1 * 26 + c2;
+        if (!idx[code].load(RX)) {
+          lock_guard g(mu);
+          if (codes.size() == 255) bad = true;
+          else if (!idx[code]) codes.push_back(code), idx[code] = u8(codes.size());
         }
-        let id = *count;
-        std::ptr::copy_nonoverlapping(s, self.ptr(id), len);
-        *self.ptr(id).add(STRIDE - 1) = len as u8;
-        self.1[slot].store(id as u32, Relaxed);
-        self.0[slot].store(h, Release);
-        *count += 1;
-        id as u32
+        region[id] = idx[code].load(RX);
+      }
     }
+    for (size_t j; (j = job(1, chunks + 1)) != SIZE_MAX;)
+      starts[j] = !j ? nl - h0 + 1 : j == chunks ? n_rec : record_start(cuts[j]);
+    sync.arrive_and_wait();
+    for (size_t j; !bad && (j = job(2, chunks)) != SIZE_MAX;)
+      if (starts[j] < starts[j + 1] && !ws[me].chunk(starts[j], starts[j + 1]))
+        bad = true;
+  };
+  vector<thread> pool;
+  for (size_t i = 1; i < threads; i++) pool.emplace_back(work, i);
+  work(0);
+  for (auto &th : pool) th.join();
+  if (bad || names->full) return {};
+  // Countries in the byte order of their codes, then _UNMATCHED (index 0).
+  vector<pair<string, int>> order;
+  for (int c : codes) {
+    string nm = {char('A' + c / 676), char('A' + c / 26 % 26), char('A' + c % 26)};
+    order.push_back({nm, idx[c]});
+  }
+  sort(order.begin(), order.end()), order.push_back({"_UNMATCHED", 0});
+  string out;
+  auto money = [](i64 v) {
+    u64 a = v < 0 ? -v : v;
+    return (v < 0 ? "-" : "") + to_string(a / 100) + (a % 100 < 10 ? ".0" : ".") + to_string(a % 100);
+  };
+  for (auto &[name, c] : order) {
+    Agg t;
+    u64 d = 0;
+    for (auto &w : ws) {
+      Agg &a = w.agg[c];
+      t.count += a.count, t.ids += a.ids, t.sum += a.sum, t.nb += a.nb, t.tb += a.tb;
+      t.lo = min(t.lo, a.lo), t.hi = max(t.hi, a.hi), d += w.counts[c];
+    }
+    if (t.count)
+      out += name + " " + to_string(t.count) + " " + to_string(t.ids) + " " + money(t.sum) + " " + money(t.lo) + " " +
+             money(t.hi) + " " + to_string(d) + " " + to_string(t.nb) + " " + to_string(t.tb) + "\n";
+  }
+  return out;
 }
 
-/// The 8 digits in `w` (first digit in the lowest byte) as a number; padding bytes must be zero.
-fn digits8(w: u64) -> u64 {
-    let w = (w & 0x0F0F_0F0F_0F0F_0F0F).wrapping_mul(2561) >> 8;
-    let w = (w & 0x00FF_00FF_00FF_00FF).wrapping_mul(6553601) >> 16;
-    (w & 0x0000_FFFF_0000_FFFF).wrapping_mul(42949672960001) >> 32
-}
-
-/// Parses the latency at `p` (1..=10 digits then a byte below '0'); returns it and its digit count.
-unsafe fn latency(p: *const u8) -> (u32, usize) {
-    let below = _mm_cmplt_epi8(_mm_loadu_si128(p as _), _mm_set1_epi8(b'0' as i8));
-    let n = (_mm_movemask_epi8(below) as u32).trailing_zeros() as usize;
-    let v = if n <= 8 {
-        digits8((p as *const u64).read_unaligned() << (8 * (8 - n)))
-    } else {
-        let hi = (0..n - 8).fold(0, |a, i| a * 10 + (*p.add(i) & 15) as u64);
-        hi * 100_000_000 + digits8((p.add(n - 8) as *const u64).read_unaligned())
-    };
-    (v as u32, n)
-}
-
-/// Hour 0..72 of the log from the 8 bytes "MM-DDTHH" of the timestamp (year and minutes are fixed).
-fn hour_index(key: u64) -> usize {
-    let d = |i: u32| ((key >> (8 * i)) & 0xFF) as i32 - 48;
-    let day = d(3) * 10 + d(4);
-    let days = if d(1) == 0 { day - 30 } else { day + 1 };
-    ((days * 24 + d(6) * 10 + d(7) - 18) as usize).min(HOURS - 1)
-}
-
-/// Parses the lines starting before `lim` and appends their records to the per-hour cursors `cur`; `lo` is lowered to the
-/// earliest hour seen. Returns where it stopped. Every line must have `SLACK` readable bytes after its start.
-unsafe fn scan(mut p: P, lim: P, dict: &Dict, cur: &mut Cur, lo: &mut usize) -> P {
-    let (mut last, mut hour) = (0, 0);
-    let space = _mm256_set1_epi8(b' ' as i8);
-    while p < lim {
-        let key = (p.add(5) as *const u64).read_unaligned();
-        if key != last {
-            (last, hour) = (key, hour_index(key));
-            *lo = (*lo).min(hour);
-        }
-        // Bit i of `spaces` is set if the byte i after the timestamp is a space: method, endpoint, status, latency.
-        let w = p.add(28);
-        let find = |q: *const u8| _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256(q as _), space)) as u32 as u64;
-        let spaces = find(w) | find(w.add(32)) << 32;
-        let start = spaces.trailing_zeros() as usize + 1;
-        let mut end = (spaces & spaces.wrapping_sub(1)).trailing_zeros() as usize; // 64: no second space yet
-        if end == 64 {
-            end = (64..).step_by(32).find(|&o| find(w.add(o)) != 0).unwrap();
-            end += find(w.add(end)).trailing_zeros() as usize;
-        }
-        let id = dict.lookup(w.add(start), end - start, hash(w.add(start), end - start));
-        let failed = *w.add(end + 1) == b'5';
-        let (lat, digits) = latency(w.add(end + 5));
-        let word = lat.min(SENT) | (id | (failed as u32) << 11) << 20;
-        (cur[hour] as *mut u64).write_unaligned(word as u64 | (lat as u64) << 32);
-        cur[hour] += if lat < SENT { 4 } else { 8 };
-        p = w.add(end + 5 + digits + 1);
-    }
-    p
-}
-
-/// Calls `f(key, latency)` for each record in `regions` (address and word count of each); `key` is the endpoint id with the
-/// 5xx flag in bit 11.
-fn each_record(regions: &[(usize, usize)], mut f: impl FnMut(u32, u32)) {
-    for &(at, n) in regions {
-        let word = |i: usize| unsafe { ((at + i * 4) as *const u32).read_unaligned() };
-        let mut i = 0;
-        while i < n {
-            let w = word(i);
-            let wide = w & SENT == SENT;
-            f(w >> 20, if wide { word(i + 1) } else { w & SENT });
-            i += 1 + wide as usize;
-        }
-    }
-}
-
-/// Per-worker buffers for `summarise`: per endpoint the count with the 5xx count above bit 32, and where its group of
-/// values starts; and the values of the hour grouped by endpoint.
-struct Scratch(Vec<u64>, Vec<usize>, Vec<u32>);
-
-/// State shared by all workers.
-struct Job {
-    input: File,
-    len: usize,
-    chunks: usize,
-    arena: usize,
-    guess: bool, // finish hours early; false once the guess has failed
-    state: Vec<AtomicU32>,
-    counts: Vec<AtomicU32>,
-    dict: Dict,
-    next_chunk: AtomicUsize,
-    next_hour: AtomicUsize,
-    bad: AtomicBool,
-    /// Endpoints that occur in an hour summarised so far, and the same ones in the byte order of their names.
-    seen: Mutex<(Vec<bool>, Vec<u16>)>,
-    /// Buffers for `summarise` that are not in use; only a few hours are summarised at a time.
-    spare: Mutex<Vec<Scratch>>,
-    /// The summary file, the next hour to write to it, and the lines of the hours that wait for earlier ones.
-    out: Mutex<(File, usize, Vec<Option<Vec<u8>>>)>,
-}
-
-impl Job {
-    fn new(data: &str, out: &str, guess: bool) -> Self {
-        let input = File::open(format!("{data}/requests.log")).expect("open input");
-        let len = input.metadata().unwrap().len() as usize;
-        let chunks = len.div_ceil(CHUNK);
-        std::fs::create_dir_all(out).unwrap();
-        // PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE: only the touched parts are backed.
-        let size = chunks * HOURS * REGION;
-        let arena = unsafe { mmap(std::ptr::null_mut(), size, 3, 0x4022, -1, 0) } as usize;
-        let summary = File::create(format!("{out}/summary.txt")).unwrap();
-        Job {
-            input,
-            len,
-            chunks,
-            arena,
-            guess,
-            state: zeros(chunks),
-            counts: zeros(chunks * HOURS),
-            dict: Dict::new(),
-            next_chunk: AtomicUsize::new(0),
-            next_hour: AtomicUsize::new(0),
-            bad: AtomicBool::new(false),
-            seen: Mutex::new((vec![false; SLOTS], Vec::new())),
-            spare: Mutex::new(Vec::new()),
-            out: Mutex::new((summary, 0, vec![None; HOURS])),
-        }
-    }
-
-    /// Address of the records of chunk `c` in hour `h`; an hour's regions are contiguous so they can be released at once.
-    fn region(&self, h: usize, c: usize) -> usize {
-        self.arena + (h * self.chunks + c) * REGION
-    }
-
-    /// Start of the first line that begins at or after byte `i`.
-    fn cut(&self, i: usize) -> usize {
-        if i == 0 || i >= self.len {
-            return i.min(self.len);
-        }
-        let mut buf = [0u8; 256]; // longer than any line
-        let n = (self.len - (i - 1)).min(buf.len());
-        self.read(&mut buf[..n], i - 1);
-        let nl = buf[..n].iter().position(|&c| c == 10);
-        nl.map_or(self.len, |k| i + k)
-    }
-
-    fn read(&self, buf: &mut [u8], at: usize) {
-        self.input.read_exact_at(buf, at as u64).unwrap();
-    }
-
-    /// Parses chunk `c` through `buf`, which holds one block plus the bytes carried over from the previous one.
-    fn parse_chunk(&self, c: usize, buf: &mut [u8]) {
-        let (first, hi) = (self.cut(c * CHUNK), self.cut((c + 1) * CHUNK));
-        let (mut at, mut keep, mut lo) = (first, 0, HOURS);
-        let mut cur: [usize; HOURS] = std::array::from_fn(|h| self.region(h, c));
-        loop {
-            let n = (BLOCK - keep).min(hi - at);
-            self.read(&mut buf[keep..keep + n], at);
-            if at == first && n > 0 {
-                let key = u64::from_le_bytes(buf[5..13].try_into().unwrap());
-                self.state[c].store(1 + hour_index(key) as u32, Relaxed);
-            }
-            at += n;
-            let (end, last) = (keep + n, at == hi);
-            buf[end..end + SLACK].fill(0); // the parser may read past the last line
-            // SAFETY: lines starting before `lim` are complete and have SLACK readable bytes after their start.
-            let stop = unsafe {
-                let lim = buf.as_ptr().add(if last { end } else { end - SLACK });
-                scan(buf.as_ptr(), lim, &self.dict, &mut cur, &mut lo)
-            };
-            if last {
-                break;
-            }
-            keep = end - (stop as usize - buf.as_ptr() as usize);
-            buf.copy_within(end - keep..end, 0);
-        }
-        for (h, at) in cur.iter().enumerate() {
-            self.counts[h * self.chunks + c].store(((at - self.region(h, c)) / 4) as u32, SeqCst);
-        }
-        // An hour already handed out cannot take this chunk's records any more: the guess was wrong.
-        if lo < self.next_hour.load(SeqCst) {
-            self.bad.store(true, Relaxed);
-        }
-        self.state[c].fetch_or(DONE, Release);
-    }
-
-    /// The next hour to summarise, if it can be done now: the hours before the guessed first hour of the chunks to come.
-    fn claim_hour(&self) -> Option<usize> {
-        let busy = self.state.iter().position(|s| s.load(Acquire) & DONE == 0);
-        let early = |p: usize| (self.state[p].load(Relaxed) as usize & 0xFF).saturating_sub(1 + 2);
-        let limit = busy.map_or(HOURS, |p| if self.guess { early(p) } else { 0 });
-        let nh = &self.next_hour;
-        let h = nh.load(SeqCst);
-        (h < limit && nh.compare_exchange(h, h + 1, SeqCst, SeqCst).is_ok()).then_some(h)
-    }
-
-    /// Endpoint ids in the byte order of their endpoints, including every endpoint with a nonzero count.
-    fn endpoint_order(&self, counts: &[u64]) -> Vec<u16> {
-        let mut guard = self.seen.lock().unwrap();
-        let (seen, order) = &mut *guard;
-        let before = order.len();
-        for id in (0..counts.len()).filter(|&id| counts[id] != 0) {
-            if !std::mem::replace(&mut seen[id], true) {
-                order.push(id as u16);
-            }
-        }
-        if order.len() > before {
-            order.sort_by(|&a, &b| self.dict.key(a as usize).cmp(self.dict.key(b as usize)));
-        }
-        order.clone()
-    }
-
-    /// The summary lines of hour `h`; releases its records.
-    fn summarise(&self, h: usize, scratch: &mut Scratch) -> Vec<u8> {
-        let count = |c: usize| self.counts[h * self.chunks + c].load(SeqCst) as usize;
-        let regions: Vec<_> = (0..self.chunks).filter(|&c| count(c) > 0).map(|c| (self.region(h, c), count(c))).collect();
-        let Scratch(counts, starts, values) = scratch;
-        let total = regions.iter().map(|r| r.1).sum();
-        values.resize(values.len().max(total), 0);
-        let low = |key: u32| (key & 0x7FF) as usize;
-        each_record(&regions, |key, _| counts[low(key)] += 1 + ((key as u64 >> 11) << 32));
-        let order = self.endpoint_order(&counts[..*self.dict.3.lock().unwrap()]);
-        let mut sum = 0;
-        for &id in &order {
-            starts[id as usize] = sum;
-            sum += (counts[id as usize] as u32) as usize;
-        }
-        each_record(&regions, |key, lat| {
-            let slot = &mut starts[low(key)];
-            values[*slot] = lat;
-            *slot += 1;
-        });
-        if let (Some(first), Some(last)) = (regions.first(), regions.last()) {
-            // MADV_DONTNEED: the records are not needed any more, so the output can reuse their memory.
-            unsafe { madvise(first.0 as _, last.0 + REGION - first.0, 4) };
-        }
-        let mut out: Vec<u8> = Vec::with_capacity(1 << 17);
-        let abs = h + 18;
-        let prefix = format!("{}T{:02}:00:00Z ", DAYS[abs / 24], abs % 24);
-        for &id in &order {
-            let c = counts[id as usize];
-            let (n, errs) = (c as u32 as usize, c >> 32);
-            counts[id as usize] = 0;
-            if n == 0 {
-                continue;
-            }
-            let end = starts[id as usize];
-            let (p50, p95, p99) = percentiles(&mut values[end - n..end]);
-            let [p50, p95, p99] = [p50, p95, p99].map(u64::from);
-            out.reserve(512); // a line has at most 21 + 125 + 6 * 21 bytes; the stores below run up to 32 bytes past it
-            // SAFETY: the reserved capacity covers the line and the stores past its end; a key has STRIDE bytes.
-            unsafe {
-                let (key, base) = (self.dict.ptr(id as usize), out.as_mut_ptr());
-                let mut p = base.add(out.len());
-                std::ptr::copy_nonoverlapping(prefix.as_ptr(), p, 21);
-                p = p.add(21);
-                for o in (0..*key.add(STRIDE - 1) as usize).step_by(32) {
-                    _mm256_storeu_si256(p.add(o) as _, _mm256_loadu_si256(key.add(o) as _));
-                }
-                p = p.add(*key.add(STRIDE - 1) as usize);
-                for v in [n as u64, p50, p95, p99, errs, errs * 1_000_000 / n as u64] {
-                    *p = b' ';
-                    p = put(p.add(1), v);
-                }
-                *p = b'\n';
-                out.set_len(p.add(1).offset_from(base) as usize);
-            }
-        }
-        out
-    }
-
-    /// Hands over the lines of hour `h` and writes every hour that is now complete, in order. The last write ends the process.
-    fn publish(&self, h: usize, lines: Vec<u8>) {
-        let mut guard = self.out.lock().unwrap();
-        let (file, next, pending) = &mut *guard;
-        pending[h] = Some(lines);
-        while *next < HOURS && pending[*next].is_some() {
-            file.write_all(&pending[*next].take().unwrap()).unwrap();
-            *next += 1;
-        }
-        if *next == HOURS && !self.bad.load(Relaxed) {
-            std::process::exit(0);
-        }
-    }
-
-    fn work(&self) {
-        let mut buf = vec![0u8; BLOCK + SLACK];
-        while self.next_hour.load(SeqCst) < HOURS {
-            let c = self.next_chunk.fetch_add(1, Relaxed);
-            if c < self.chunks {
-                self.parse_chunk(c, &mut buf);
-            }
-            while let Some(h) = self.claim_hour() {
-                let new = || Scratch(vec![0; SLOTS], vec![0; SLOTS], Vec::new());
-                let mut scratch = self.spare.lock().unwrap().pop().unwrap_or_else(new);
-                let lines = self.summarise(h, &mut scratch);
-                self.spare.lock().unwrap().push(scratch);
-                self.publish(h, lines);
-            }
-            if c >= self.chunks {
-                std::thread::sleep(Duration::from_micros(50)); // the chunks still being parsed decide what comes next
-            }
-        }
-    }
-}
-
-/// Nearest-rank p50, p95 and p99 of `v`, which it reorders.
-fn percentiles(v: &mut [u32]) -> (u32, u32, u32) {
-    let n = v.len();
-    let at = |p: usize| (p * n + 99) / 100 - 1;
-    if n <= 32 {
-        for i in 1..n {
-            let mut j = i;
-            while j > 0 && v[j - 1] > v[j] {
-                v.swap(j - 1, j);
-                j -= 1;
-            }
-        }
-        return (v[at(50)], v[at(95)], v[at(99)]);
-    }
-    // The median first: p95 and p99 are then found among the larger half only, which shrinks quickly.
-    let (_, p50, upper) = v.select_nth_unstable(at(50));
-    let (_, p95, upper) = upper.select_nth_unstable(at(95) - at(50) - 1);
-    let p99 = *upper.select_nth_unstable(at(99) - at(95) - 1).1;
-    (*p50, *p95, p99)
-}
-
-/// Writes `v` in decimal at `p` and returns the end. The eight digits are made at once with multiplications, then the leading zeros are shifted out.
-#[inline(always)]
-unsafe fn put(p: *mut u8, v: u64) -> *mut u8 {
-    if v >= 100_000_000 {
-        let s = v.to_string(); // absurd values only
-        std::ptr::copy_nonoverlapping(s.as_ptr(), p, s.len());
-        return p.add(s.len());
-    }
-    let w = v / 10_000 | (v % 10_000) << 32; // two numbers below 10^4, one in each half
-    let h = (w.wrapping_mul(5243) >> 19) & 0x0000_007F_0000_007F; // each divided by 100
-    let y = h | (w - h * 100) << 16; // four numbers below 100
-    let t = (y.wrapping_mul(103) >> 10) & 0x000F_000F_000F_000F; // each divided by 10
-    let z = t | (y - t * 10) << 8; // the eight digits, first digit in the lowest byte
-    let lead = ((z | 1 << 63).trailing_zeros() / 8).min(7); // leading zero digits, keeping the last digit
-    (p as *mut u64).write_unaligned((z | 0x3030_3030_3030_3030) >> (8 * lead));
-    p.add(8 - lead as usize)
-}
-
-fn main() {
-    unsafe {
-        // PR_SET_THP_DISABLE: the records are sparse, so with transparent huge pages every touched 2 MiB would be backed.
-        prctl(41, 1u64, 0u64, 0u64, 0u64);
-        // M_MMAP_THRESHOLD, fixed: the buffers of the hours are returned when freed instead of piling up in malloc arenas.
-        mallopt(-3, 1 << 16);
-    }
-    let args: Vec<String> = std::env::args().collect();
-    let arg = |name: &str, default: &str| {
-        let pos = args.iter().position(|a| a == name);
-        pos.map_or(default, |i| &args[i + 1]).to_string()
-    };
-    let (data, out) = (arg("--data", "/data"), arg("--out", "/out"));
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
-    // The first pass ends the process unless a chunk found the guess wrong.
-    for guess in [true, false] {
-        let job = Job::new(&data, &out, guess);
-        std::thread::scope(|s| {
-            for _ in 1..threads {
-                s.spawn(|| job.work());
-            }
-            job.work();
-        });
-    }
+int main() {
+  prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0); // huge pages would back sparse tables
+  fd_reg = open("/data/regions.csv", O_RDONLY), fd_rec = open("/data/records.csv", O_RDONLY);
+  struct stat st;
+  if (fd_reg < 0 || fd_rec < 0) return 1;
+  fstat(fd_reg, &st), n_reg = st.st_size, fstat(fd_rec, &st), n_rec = st.st_size;
+  // If the fast path gives up: one chunk, and a table that can hold a name per record.
+  string out = run(17, 1 << 20);
+  if (out.empty()) out = run(22, max<size_t>(n_rec, 1));
+  int fd = open("/out/aggregates.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (out.empty() || fd < 0 || write(fd, out.data(), out.size()) != (ssize_t)out.size()) return 1;
+  _exit(0);
 }
