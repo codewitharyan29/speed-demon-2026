@@ -573,4 +573,7 @@ d >> 4 <= 3750 < 4096; keys never wrap around ring. pop() uses 1-cycle 	zcnt on 
 | **LAP:build Cache-Line False Sharing Elimination** | Packs `id \| (cx << 24)` into `first[x]` after LAP:bfs and separates `first` from `rfirst` | Eliminates stride-4 false sharing between reading nid and incrementing indeg |
 | **Allocation Fix** | Sized scratch pool to `65 * P` u64s to properly back `P * 128` u32 pages + pt/own | Corrects dimensioning bug in 512B paging scheme; passes all datasets 100% bit-for-bit |
 
+**Board run c31c0dd (step 36): T 0.12826 s (128.26 ms), M 65.43 MB, S 350, K 29.317, 73.356 pts (Rank #9 retained; memory dropped to 65.43 MB).**
+
+
 
