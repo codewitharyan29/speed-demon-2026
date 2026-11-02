@@ -157,3 +157,41 @@ marginal cost is an upper bound on what a stage can give back, and assumes its r
   structure -40% and table path -30% (-8.7 ms) K 36.9.
 * **Next experiment:** cut the record-parse stage (about 300 of 540 instructions per record) by 40% or more with real instruction
   reductions, then the table path; measure with cachegrind first, then wall time, then a board run if K is projected above 31.9.
+
+## 7. Two more board diagnostics, Nov 2 (approved; correct output; never promoted)
+
+| Run | Commit | Source sha256 (first 16) | Board T | M | S |
+|---|---|---|---:|---:|---:|
+| diag_regions2 `run-f357e2cac587` | `58dcca3` | `f78c34bc77747b96` | 35.498 ms | 13.91 MB | 453 |
+| diag_random_entry `run-9ecc068437c0` | `9ac7e0f` | `94e0fafe325cd55c` | 39.461 ms | 14.19 MB | 454 |
+| cx5 restored `run-50a0990a2092` | `851376d` (tree = `830b2e6`) | `e016cdf08682676b` | 35.179 ms | 13.73 MB | 432 |
+
+All gates passed (correctness against the reference included). Locally the same builds give the published full hash `d8088b1c...` and
+pass 36/36 fixtures. `diag_regions2` runs the regions phase twice (its writes are idempotent). `diag_random_entry` prefetches one more
+random entry line per record at the same pipeline stage as the real one and reads one word of it afterwards (no writes).
+
+**cx5 reference, now 5 runs of the identical source: 34.514, 34.706, 34.699, 34.773, 35.179 ms; mean 34.774, sd 0.246, range 0.67.**
+(The earlier table used four runs and a mean of 34.673; with the fifth run the marginals of section 5 change by 0.1 ms: read2 +3.11,
+struct2 +4.12, parse2 +11.49, table2 +7.81.)
+
+| Diagnostic | Marginal vs the cx5 mean | Share of T | vs the cx5 spread |
+|---|---:|---:|---|
+| regions phase repeated | +0.72 ms | 2.1% | 0.32 ms above the slowest cx5 run, 2.9 sd: at the edge of noise |
+| one extra random entry line per record | +4.69 ms | 13.5% | 4.28 ms above the slowest cx5 run: well outside noise |
+
+Sum of the six marginals: 31.94 ms = 92% of T; 2.8 ms unattributed (startup, tail, effects that do not add).
+
+**What these numbers do and do not say.** A repeated phase or an extra access estimates the marginal cost of adding that work to
+a run that is already doing everything else; it does not isolate hardware cache misses from line-ownership transfers (the extra
+read may pull a line out of another core's cache), from the 6 extra instructions per record, or from memory-level parallelism that
+the extra stream steals from the real one. Stages overlap, so marginal costs need not sum to T (here they do, to within 8%).
+The extra line read is a *read* of a line that other threads write: it measures miss plus transfer, not misses alone.
+
+**Decision.**
+* Regions: 0.7 ms at most (K +0.3 if it were free). Not significant; no work on region setup.
+* Entry line: one random 64-byte line per record is worth up to 4.7 ms (K up to 34.25 if it cost nothing, which no exact table can
+  achieve). A cache-conscious layout can only recover part of it. Because 90% of (name, country) pairs are first occurrences, there
+  is no reuse to exploit, and a table small enough to stay in L2 (1.25 MB per core pair) cannot hold 100,000 exact names; only a
+  sharded table (architecture A) could, at a measured-instruction cost of about +3.5 ms. Realistic gain: 0-1.5 ms. Not pursued now.
+* The measured bottleneck is the record parse (11.5 ms, 33%) and, behind it, the lookup path (7.8 ms) and the structural pass
+  (4.1 ms). Work continues on the parse.
