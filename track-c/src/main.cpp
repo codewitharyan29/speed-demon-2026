@@ -1,3 +1,4 @@
+#define REGIONS2 1 // diagnostic: repeats the regions phase; output unchanged
 // Track C (join): per-country aggregates of records.csv joined with regions.csv,
 // exactly per spec c-join.md. One thread pool runs three phases separated by
 // barriers: regions.csv into a byte table (region id -> country index);
@@ -241,6 +242,9 @@ struct Worker {
   }
   void warm(int k) {
     for (size_t i = 0; i < bn[k]; i++) b[k][i].hint = names->warm(b[k][i].hash);
+#ifdef RANDOM_ENTRY
+    for (size_t i = 0; i < bn[k]; i++) _mm_prefetch((const char *)(names->e + ((b[k][i].hash >> 20) & (names->n - 1))), _MM_HINT_T0);
+#endif
   }
   void resolve(int k) {
     for (size_t i = 0; i < bn[k]; i++) {
@@ -250,6 +254,9 @@ struct Worker {
       // The one worker that sets a bit counts the name for the country.
       u64 bit = 1ULL << (c & 63);
       counts[c] += !(e->mask[c >> 6].fetch_or(bit, RX) & bit);
+#ifdef RANDOM_ENTRY
+      { u64 x = names->e[(r.hash >> 20) & (names->n - 1)].mask[3].load(RX); asm volatile("" ::"r"(x)); }
+#endif
       Agg &a = agg[c];
       a.count++, a.ids += r.id, a.sum += r.cents, a.nb += r.nb, a.tb += r.tb;
       a.lo = min(a.lo, r.cents), a.hi = max(a.hi, r.cents);
@@ -334,7 +341,14 @@ static string run(int bits, size_t chunk) {
     return j < n ? j : SIZE_MAX;
   };
   auto work = [&](size_t me) {
-    for (size_t j; (j = job(0, pieces)) != SIZE_MAX;) { // "id,CCC\n" lines
+#ifdef REGIONS2
+    for (int rep = 0; rep < 2; rep++)
+#endif
+    for (size_t j; (j = job(
+#ifdef REGIONS2
+                       rep ? 3 :
+#endif
+                       0, pieces)) != SIZE_MAX;) { // "id,CCC\n" lines
       size_t a = j ? line_start(first + (n_reg - first) * j / pieces) : first;
       size_t len = (j + 1 == pieces ? n_reg : line_start(first + (n_reg - first) * (j + 1) / pieces)) - a;
       vector<u8> r(len + 16);
