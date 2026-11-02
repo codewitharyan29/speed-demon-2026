@@ -24,7 +24,7 @@ using u64 = uint64_t;
 constexpr int kThreads = 12, kChunks = 48, kSamples = 12, kDocBits = 14;
 constexpr u32 kCap = 1 << 14, kFlush = 384, kAhead = 16, kHalf = 12288;
 constexpr u32 kBuckets = kHalf * 2, kProvMask = (1 << 17) - 1;
-constexpr u32 kMaxProv = 1 << 17, kMaxPairs = 229376;
+constexpr u32 kMaxProv = 1 << 17, kMaxPairs = 524288;
 
 constexpr u64 kTag = ~0x1FFFFULL, kPay = 0x1FFFFULL, kTop = 1ULL << 17;
 constexpr u64 kOnes = 0x0101010101010101ULL;
@@ -908,12 +908,13 @@ void worker(int tid) {
   w.start = arena_alloc<u32>(g_ns + 2);
   w.present = arena_alloc<u64>(g_pwords + 2);
   w.rows = arena_alloc<u64>((size_t)(g_nd + 1) * max_wl);
-  w.pairs = arena_alloc<u32>(kMaxPairs);
-  w.post = arena_alloc<u16>(kMaxPairs);
   Run& run = w.run;
   run.list = arena_alloc<u16>((1 << kDocBits) + 64);
   run.tmp = arena_alloc<u16>((1 << kDocBits) + 64);
   run.bits = arena_alloc<u64>((1 << kDocBits) / 64 + 8);
+  g_bar.arrive_and_wait();
+  w.pairs = arena_alloc<u32>(kMaxPairs);
+  w.post = arena_alloc<u16>(kMaxPairs);
 
   for (;;) {
     int c = g_next.fetch_add(1, std::memory_order_relaxed);
@@ -1051,7 +1052,7 @@ void worker(int tid) {
 int main() {
   prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
   g_arena = static_cast<u8*>(
-      mmap(nullptr, 64ULL << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+      mmap(nullptr, 96ULL << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
   g_aoff.store(8ULL << 20, std::memory_order_relaxed);
   g_q = map_file("/data/queries.txt");
   g_d = map_file("/data/docs.txt");
