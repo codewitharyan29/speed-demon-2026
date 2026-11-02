@@ -521,12 +521,11 @@ void scan(Worker& w, u64 from, u64 to, u32 wl, u32& nfound) {
       w.ids[i + 2] = static_cast<u32>(e2 & 0x3FFFF);
       w.ids[i + 3] = static_cast<u32>(e3 & 0x3FFFF);
 
-      u32 s0 = (hit0 == 0) & static_cast<u32>((l0[(h0 >> 31) & 7] >> 30) & 1);
-      u32 s1 = (hit1 == 0) & static_cast<u32>((l1[(h1 >> 31) & 7] >> 30) & 1);
-      u32 s2 = (hit2 == 0) & static_cast<u32>((l2[(h2 >> 31) & 7] >> 30) & 1);
-      u32 s3 = (hit3 == 0) & static_cast<u32>((l3[(h3 >> 31) & 7] >> 30) & 1);
-
-      if (__builtin_expect((s0 | s1 | s2 | s3) != 0, 0)) {
+      if (__builtin_expect((hit0 & hit1 & hit2 & hit3) == 0, 0)) {
+        u32 s0 = (hit0 == 0) & static_cast<u32>((l0[(h0 >> 31) & 7] >> 30) & 1);
+        u32 s1 = (hit1 == 0) & static_cast<u32>((l1[(h1 >> 31) & 7] >> 30) & 1);
+        u32 s2 = (hit2 == 0) & static_cast<u32>((l2[(h2 >> 31) & 7] >> 30) & 1);
+        u32 s3 = (hit3 == 0) & static_cast<u32>((l3[(h3 >> 31) & 7] >> 30) & 1);
         if (s0) w.slow[nslow++] = static_cast<u16>(i);
         if (s1) w.slow[nslow++] = static_cast<u16>(i + 1);
         if (s2) w.slow[nslow++] = static_cast<u16>(i + 2);
@@ -551,6 +550,7 @@ void scan(Worker& w, u64 from, u64 to, u32 wl, u32& nfound) {
       if constexpr (kSample) {
         for (u32 i = a; i < b; i++) {
           u32 id = w.ids[i];
+          if (!id) continue;
           u16 prev = w.stamp[id];
           if (prev != cur) {
             w.stamp[id] = cur;
@@ -561,6 +561,7 @@ void scan(Worker& w, u64 from, u64 to, u32 wl, u32& nfound) {
         u64 bit = 1ULL << (local & 63);
         for (u32 i = a; i < b; i++) {
           u32 id = w.ids[i];
+          if (!id) continue;
           u16 prev = w.stamp[id];
           if (prev != cur) {
             w.stamp[id] = cur;
@@ -570,8 +571,9 @@ void scan(Worker& w, u64 from, u64 to, u32 wl, u32& nfound) {
             np += (sid < g_ns);
           }
           u32 trig = g_tmap[id];
-          w.tp[nh] = (trig << 14) | i;
-          nh += (trig != 0);
+          if (__builtin_expect(trig != 0, 0)) {
+            w.tp[nh++] = (trig << 14) | i;
+          }
         }
         for (u32 ti = 0; ti < nh; ti++) {
           u32 tp = w.tp[ti], i = tp & 0x3FFF, trig = tp >> 14;
