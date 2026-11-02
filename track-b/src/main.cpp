@@ -1,12 +1,4 @@
-// Track B (index), C++ version. Standard library plus x86 intrinsics and Linux system calls only.
-//
-// Design: the queries are parsed in 12 pieces at once and every distinct term is numbered in a small hash table
-// (one 64-byte line per bucket: seven 44-bit-tag entries and an overflow word). A 1% sample of the corpus gives
-// document frequencies: BOOL terms in over 1/32 of the documents become bitsets, the other BOOL terms posting
-// lists, and each phrase gets its rarest term as a trigger. The corpus is scanned in 48 chunks, each indexed and
-// answered on its own: an AVX2 pass finds the tokens (the document id on every line is masked off), a second loop
-// looks the hashes up, a third records which terms each document contains, and phrases are checked around their
-// trigger terms. Every BOOL query is then evaluated on the chunk's documents, strictly left to right.
+// Track B (index), C++23 version. Standard library plus x86 intrinsics and Linux system calls only.
 #include <fcntl.h>
 #include <immintrin.h>
 #include <sys/mman.h>
@@ -18,17 +10,13 @@
 #include <atomic>
 #include <barrier>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
 
-#ifdef SD_PHASES
-#include <x86intrin.h>
-#include <cstdio>
-#include <ctime>
-#endif
 namespace {
 using u8 = uint8_t;
 using u16 = uint16_t;
@@ -36,55 +24,23 @@ using u32 = uint32_t;
 using u64 = uint64_t;
 
 constexpr int kThreads = 12, kChunks = 48, kSamples = 12, kDocBits = 14;
-constexpr u32 kCap = 1 << 15, kFlush = 384, kAhead = 16, kLines = 1 << 14;
-constexpr u64 kTag = ~0xFFFFFULL, kPay = 0x3FFFF, kTop = 1ULL << 63;
+constexpr u32 kCap = 1 << 14, kFlush = 384, kAhead = 16, kLines = 1 << 14;
+constexpr u64 kTag = ~0xFFFFFULL, kPay = 0x3FFFFULL, kOvfBit = 1ULL << 18, kTop = 1ULL << 63;
 constexpr u64 kOnes = 0x0101010101010101ULL;
-
-// The bytes of a token's first and second word that belong to it, by its length (all of them from 16 on).
-struct Masks {
-  u64 m[32][2];
-  constexpr Masks() : m() {
-    for (int len = 0; len < 32; len++) {
-      m[len][0] = len >= 8 ? ~0ULL : (1ULL << 8 * len) - 1;
-      m[len][1] = len >= 16 ? ~0ULL : len <= 8 ? 0 : (1ULL << 8 * (len - 8)) - 1;
-    }
-  }
-};
-constexpr Masks kMasks;
-#define kMask kMasks.m
-
-#ifdef SD_PHASES
-double now() { timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec * 1e-6; }
-double g_ph[16];
-u64 g_tc[16];
-u64 g_cy[kThreads][8];
-thread_local int t_tid;
-#define PH(i) if (tid == 0) g_ph[i] = now(), g_tc[i] = __rdtsc();
-#define CY(i) g_cy[tid][i] += __rdtsc();
-#define CYS(i) g_cy[tid][i] -= __rdtsc();
-#define CYT(i) g_cy[t_tid][i] += __rdtsc();
-#define CYTS(i) g_cy[t_tid][i] -= __rdtsc();
-#else
-#define PH(i)
-#define CY(i)
-#define CYS(i)
-#define CYT(i)
-#define CYTS(i)
-#endif
 
 struct File {
   const char* p;
   size_t n;
 };
 
-// Maps a file read-only with a zero page after it, so that reads past the end are safe.
 File map_file(const char* path) {
   int fd = open(path, O_RDONLY);
   struct stat st;
   fstat(fd, &st);
   size_t n = st.st_size;
   char* r = (char*)mmap(nullptr, n + 8192, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  mmap(r, n, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0);
+  if (n > 0) mmap(r, n, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0);
+  close(fd);
   return {r, n};
 }
 
@@ -102,10 +58,8 @@ inline u64 fold(u64 a, u64 b) {
 }
 constexpr u64 K0 = 0xA0761D6478BD642FULL, K1 = 0xE7037ED1A0B428DBULL, K2 = 0x8EBC6AF09C88C6E3ULL;
 
-// The hash of a token of up to 16 lower-cased bytes, given as two zero-padded words.
 inline u64 hash16(u64 w0, u64 w1) { return fold(w0 ^ K0, w1 ^ K1) | kTop; }
 
-// The same hash for any length (the queries, and the rare corpus tokens over 16 bytes).
 u64 hash_bytes(const char* s, size_t len, bool lower) {
   char b[32] = {};
   memcpy(b, s, std::min<size_t>(len, 32));
@@ -115,12 +69,10 @@ u64 hash_bytes(const char* s, size_t len, bool lower) {
   memcpy(w, b, 32);
   u64 h = fold(w[0] ^ K0, w[1] ^ K1);
   if (len > 16) h = fold(h ^ w[2], w[3] ^ K2);
-  if (len > 32) h = fold(h, len * K2);  // never equal to a term of at most 32 bytes
+  if (len > 32) h = fold(h, len * K2);
   return h | kTop;
 }
 
-// ---- The term table. Bucket = 64 bytes: seven entries (44-bit tag of the hash | 18-bit payload) and a word that is
-// non-zero if an entry of this bucket had to go to the overflow table. The bucket comes from the hash's low bits.
 alignas(64) u64 g_tab[kLines * 8 + 8];
 u64 g_ovf[8192];
 
@@ -131,26 +83,17 @@ u64 ovf_find(u64 h) {
   }
 }
 
-// The entry of the term with hash h, or 0. If its bucket overflowed and the term is not in it, `slow` is set to 1 and the
-// caller has to ask ovf_find (kept out of the loops: a branch on this is hard to predict and costs a lot).
 inline u64 lookup(u64 h, u32& slow) {
   const u64* l = g_tab + (h & (kLines - 1)) * 8;
   const __m256i t = _mm256_set1_epi64x(h & kTag), m = _mm256_set1_epi64x(kTag);
   __m256i a = _mm256_cmpeq_epi64(_mm256_and_si256(_mm256_load_si256((const __m256i*)l), m), t);
   __m256i b = _mm256_cmpeq_epi64(_mm256_and_si256(_mm256_load_si256((const __m256i*)(l + 4)), m), t);
-  u32 hit = (_mm256_movemask_pd(_mm256_castsi256_pd(a)) | _mm256_movemask_pd(_mm256_castsi256_pd(b)) << 4) & 0x7F;
-  u64 e = l[_tzcnt_u32(hit | 0x80)] & -(u64)(hit != 0);
-  slow = (hit == 0) & (l[7] != 0);
+  u32 hit = _mm256_movemask_pd(_mm256_castsi256_pd(a)) | (_mm256_movemask_pd(_mm256_castsi256_pd(b)) << 4);
+  u64 e = l[_tzcnt_u32(hit) & 7] & -(u64)(hit != 0);
+  slow = (hit == 0) & (u32)(l[h >> 14 & 7] >> (18 + (h >> 17 & 1)) & 1);
   return e;
 }
-inline u64 lookup(u64 h) {
-  u32 slow;
-  u64 e = lookup(h, slow);
-  return slow ? ovf_find(h) : e;
-}
 
-// Finds the term with hash h or adds it (any thread, at the same time), and returns its provisional id: the term's
-// place in the table plus one (the overflow table's places come after the buckets').
 constexpr u32 kOvfBase = kLines * 8, kMaxProv = kOvfBase + 8192;
 bool claim(u64* slot, u64 h, u32 id, u32& out) {
   u64 e = 0, want = (h & kTag) | id;
@@ -160,29 +103,33 @@ bool claim(u64* slot, u64 h, u32 id, u32& out) {
 u32 intern(u64 h) {
   u64* l = g_tab + (h & (kLines - 1)) * 8;
   u32 id = 0;
-  for (int s = 0; s < 7; s++)
+  for (int s = 0; s < 8; s++)
     if (claim(l + s, h, (h & (kLines - 1)) * 8 + s + 1, id)) return id;
-  __atomic_store_n(l + 7, 1, __ATOMIC_RELAXED);
+  __atomic_fetch_or(l + (h >> 14 & 7), 1ULL << (18 + (h >> 17 & 1)), __ATOMIC_RELAXED);
   for (u32 i = (h >> 20) & 8191;; i = (i + 1) & 8191)
     if (claim(g_ovf + i, h, kOvfBase + i + 1, id)) return id;
 }
-u8 g_used[kMaxProv + 1];  // by provisional id: bit 0 = in a BOOL query, bit 1 = in a phrase
+u8 g_used[kMaxProv + 1];
 
-// ---- Queries.
 struct Query {
   u32 t[8];
   u8 ops[8];
   u8 n, phrase, has_or;
-  u32 bi;  // for a BOOL query: its place among the BOOL queries
+  u32 bi;
+};
+struct BoolQuery {
+  u32 t[8];
+  u32 qid;
+  u8 ops[8];
+  u8 n, has_or;
 };
 std::unique_ptr<Query[]> g_queries;
-std::vector<u32> g_bool;  // the numbers of the BOOL queries
-u32 g_nq;
+std::unique_ptr<BoolQuery[]> g_bqueries;
+u32 g_nq, g_nbq;
 
 std::vector<Query> g_piece[kThreads];
 size_t g_psize[kThreads];
 
-// Boundary i of n equal parts of f, moved to the start of the next line.
 u64 cut(const File& f, int i, int n) {
   if (i == 0) return 0;
   if (i == n) return f.n;
@@ -197,12 +144,12 @@ void parse(int tid, std::vector<Query>& out) {
     const char* e = (const char*)memchr(p, '\n', end - p);
     Query q = {};
     q.phrase = p[0] == 'P';
-    p += q.phrase ? 8 : 5;  // "PHRASE \"" or "BOOL "
+    p += q.phrase ? 8 : 5;
     for (;;) {
       const char* s = p;
       while (p < e && *p != ' ' && *p != '"') p++;
       u32 id = q.t[q.n++] = intern(hash_bytes(s, p - s, false));
-      if (!(g_used[id] & 1 + q.phrase)) __atomic_fetch_or(&g_used[id], 1 + q.phrase, __ATOMIC_RELAXED);
+      if (!(g_used[id] & (1 + q.phrase))) __atomic_fetch_or(&g_used[id], 1 + q.phrase, __ATOMIC_RELAXED);
       if (p >= e || *p == '"') break;
       p++;
       if (!q.phrase) {
@@ -217,7 +164,6 @@ void parse(int tid, std::vector<Query>& out) {
   }
 }
 
-// ---- The result of a set operation on one chunk's documents: a sorted list of chunk-local ids, or a bitset.
 struct Opnd {
   const u16* l;
   const u64* b;
@@ -226,7 +172,29 @@ struct Opnd {
 
 inline bool has(const u64* b, u32 d) { return b[d >> 6] >> (d & 63) & 1; }
 
+u32 intersect_gallop(const u16* a, u32 na, const u16* b, u32 nb, u16* out) {
+  if (na > nb) std::swap(a, b), std::swap(na, nb);
+  u32 n = 0, j = 0;
+  for (u32 i = 0; i < na && j < nb; i++) {
+    u16 target = a[i];
+    if (b[j] < target) {
+      u32 step = 1;
+      while (j + step < nb && b[j + step] < target) step <<= 1;
+      u32 lo = j + (step >> 1), hi = std::min(j + step, nb - 1);
+      while (lo < hi) {
+        u32 mid = (lo + hi) >> 1;
+        if (b[mid] < target) lo = mid + 1;
+        else hi = mid;
+      }
+      j = lo;
+    }
+    if (b[j] == target) out[n++] = target, j++;
+  }
+  return n;
+}
+
 u32 combine(u8 op, const u16* a, u32 na, const u16* b, u32 nb, u16* out) {
+  if (op == 'A' && (na * 8 < nb || nb * 8 < na)) return intersect_gallop(a, na, b, nb, out);
   u32 i = 0, j = 0, n = 0;
   while (i < na && j < nb) {
     if (a[i] < b[j]) {
@@ -241,11 +209,11 @@ u32 combine(u8 op, const u16* a, u32 na, const u16* b, u32 nb, u16* out) {
       n += op != 'N';
     }
   }
-  if (op != 'A') {
+  if (op != 'A' && i < na) {
     memcpy(out + n, a + i, (na - i) * 2);
     n += na - i;
   }
-  if (op == 'O') {
+  if (op == 'O' && j < nb) {
     memcpy(out + n, b + j, (nb - j) * 2);
     n += nb - j;
   }
@@ -255,33 +223,44 @@ u32 combine(u8 op, const u16* a, u32 na, const u16* b, u32 nb, u16* out) {
 struct Run {
   u16 *list, *tmp;
   u64* bits;
+  const u16* cur_l;
+  const u64* cur_b;
   u32 n, wl;
   bool dense;
 
   void start(const Opnd& x) {
     dense = x.b != nullptr;
     n = x.n;
-    if (dense)
-      memcpy(bits, x.b, wl * 8);
-    else
-      memcpy(list, x.l, n * 2);
+    cur_l = x.l;
+    cur_b = x.b;
   }
   void apply(u8 op, const Opnd& x) {
+    if (!x.b && !x.n) {
+      if (op == 'A') dense = false, n = 0;
+      return;
+    }
     if (!dense) {
-      if (n == 0 && op != 'O') return;
+      if (n == 0) {
+        if (op == 'O') start(x);
+        return;
+      }
       if (!x.b) {
-        n = combine(op, list, n, x.l, x.n, tmp);
+        n = combine(op, cur_l, n, x.l, x.n, tmp);
         std::swap(list, tmp);
+        cur_l = list;
       } else if (op != 'O') {
         u32 k = 0;
         for (u32 i = 0; i < n; i++) {
-          list[k] = list[i];
-          k += has(x.b, list[i]) == (op == 'A');
+          u16 d = cur_l[i];
+          list[k] = d;
+          k += has(x.b, d) == (op == 'A');
         }
         n = k;
+        cur_l = list;
       } else {
         memcpy(bits, x.b, wl * 8);
-        for (u32 i = 0; i < n; i++) bits[list[i] >> 6] |= 1ULL << (list[i] & 63);
+        for (u32 i = 0; i < n; i++) bits[cur_l[i] >> 6] |= 1ULL << (cur_l[i] & 63);
+        cur_b = bits;
         dense = true;
       }
     } else if (!x.b) {
@@ -289,74 +268,95 @@ struct Run {
         n = 0;
         for (u32 i = 0; i < x.n; i++) {
           list[n] = x.l[i];
-          n += has(bits, x.l[i]);
+          n += has(cur_b, x.l[i]);
         }
+        cur_l = list;
         dense = false;
       } else {
-        for (u32 i = 0; i < x.n; i++) {
-          u64 bit = 1ULL << (x.l[i] & 63);
-          u64& w = bits[x.l[i] >> 6];
-          w = op == 'O' ? w | bit : w & ~bit;
+        if (cur_b != bits) {
+          memcpy(bits, cur_b, wl * 8);
+          cur_b = bits;
         }
+        if (op == 'O')
+          for (u32 i = 0; i < x.n; i++) bits[x.l[i] >> 6] |= 1ULL << (x.l[i] & 63);
+        else
+          for (u32 i = 0; i < x.n; i++) bits[x.l[i] >> 6] &= ~(1ULL << (x.l[i] & 63));
       }
     } else {
-      for (u32 i = 0; i < wl; i++) {
-        u64 y = x.b[i];
-        bits[i] = op == 'A' ? bits[i] & y : op == 'O' ? bits[i] | y : bits[i] & ~y;
-      }
+      if (op == 'A')
+        for (u32 i = 0; i < wl; i++) bits[i] = cur_b[i] & x.b[i];
+      else if (op == 'O')
+        for (u32 i = 0; i < wl; i++) bits[i] = cur_b[i] | x.b[i];
+      else
+        for (u32 i = 0; i < wl; i++) bits[i] = cur_b[i] & ~x.b[i];
+      cur_b = bits;
     }
   }
-  // The set's size and the sum of its (chunk-local) ids.
   void size_sum(u64& c, u64& s) const {
     c = s = 0;
     if (!dense) {
       c = n;
-      for (u32 i = 0; i < n; i++) s += list[i];
+      for (u32 i = 0; i < n; i++) s += cur_l[i];
       return;
     }
-    static const u64 kHas[6] = {0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL, 0xF0F0F0F0F0F0F0F0ULL,
-                                0xFF00FF00FF00FF00ULL, 0xFFFF0000FFFF0000ULL, 0xFFFFFFFF00000000ULL};
-    for (u32 i = 0; i < wl; i++) {
-      u64 w = bits[i], k = __builtin_popcountll(w), within = 0;
-      for (int j = 0; j < 6; j++) within += (u64)__builtin_popcountll(w & kHas[j]) << j;
-      c += k;
-      s += i * 64 * k + within;
+    const __m256i m0f = _mm256_set1_epi8(0x0F), zero = _mm256_setzero_si256();
+    const __m256i pop_lut = _mm256_setr_epi8(0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4, 0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4);
+    const __m256i slo_lut = _mm256_setr_epi8(0, 0, 1, 1, 2, 2, 3, 3, 3, 3, 4, 4, 5, 5, 6, 6, 0, 0, 1, 1, 2, 2, 3, 3, 3, 3, 4, 4, 5, 5, 6, 6);
+    const __m256i shi_lut = _mm256_setr_epi8(0, 4, 5, 9, 6, 10, 11, 15, 7, 11, 12, 16, 13, 17, 18, 22, 0, 4, 5, 9, 6, 10, 11, 15, 7, 11, 12, 16, 13, 17, 18, 22);
+    const __m256i bidx = _mm256_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31);
+    __m256i acc_c = zero, acc_s = zero, acc_bw = zero, vi = zero, vstep = _mm256_set1_epi64x(256);
+    u32 i = 0;
+    for (; i + 4 <= wl; i += 4) {
+      __m256i v = _mm256_loadu_si256((const __m256i*)(cur_b + i));
+      __m256i lo = _mm256_and_si256(v, m0f), hi = _mm256_and_si256(_mm256_srli_epi16(v, 4), m0f);
+      __m256i cb = _mm256_add_epi8(_mm256_shuffle_epi8(pop_lut, lo), _mm256_shuffle_epi8(pop_lut, hi));
+      __m256i sb = _mm256_add_epi8(_mm256_shuffle_epi8(slo_lut, lo), _mm256_shuffle_epi8(shi_lut, hi));
+      __m256i cw = _mm256_sad_epu8(cb, zero);
+      acc_c = _mm256_add_epi64(acc_c, cw);
+      acc_s = _mm256_add_epi64(acc_s, _mm256_add_epi64(_mm256_sad_epu8(sb, zero), _mm256_mul_epu32(cw, vi)));
+      acc_bw = _mm256_add_epi16(acc_bw, _mm256_maddubs_epi16(cb, bidx));
+      vi = _mm256_add_epi64(vi, vstep);
     }
+    __m256i bw32 = _mm256_madd_epi16(acc_bw, _mm256_set1_epi16(1));
+    alignas(32) u64 tc[4], ts[4];
+    alignas(32) u32 tbw[8];
+    _mm256_store_si256((__m256i*)tc, acc_c);
+    _mm256_store_si256((__m256i*)ts, acc_s);
+    _mm256_store_si256((__m256i*)tbw, bw32);
+    c = tc[0] + tc[1] + tc[2] + tc[3];
+    u64 bw_sum = (u64)tbw[0] + tbw[1] + tbw[2] + tbw[3] + tbw[4] + tbw[5] + tbw[6] + tbw[7];
+    s = (ts[0] + ts[1] + ts[2] + ts[3]) + (bw_sum << 3);
+    for (; i < wl; i++)
+      for (u64 w = cur_b[i]; w; w &= w - 1) c++, s += i * 64 + _tzcnt_u64(w);
   }
-  // Up to ten smallest ids (chunk-local), ascending.
   u32 smallest(u32* out) const {
     u32 k = 0;
     if (!dense) {
-      for (; k < n && k < 10; k++) out[k] = list[k];
+      for (; k < n && k < 10; k++) out[k] = cur_l[k];
       return k;
     }
     for (u32 i = 0; i < wl && k < 10; i++)
-      for (u64 w = bits[i]; w && k < 10; w &= w - 1) out[k++] = i * 64 + _tzcnt_u64(w);
+      for (u64 w = cur_b[i]; w && k < 10; w &= w - 1) out[k++] = i * 64 + _tzcnt_u64(w);
     return k;
   }
 };
 
-// ---- Results, by query: each thread adds its chunks' counts and sums into its own arrays (added up at the end); the
-// ten smallest ids so far (and in the eleventh slot how many there are) are shared.
 u32* g_first;
-u64* g_pack;  // per phrase query: count and sum so far
+u64* g_pack;
 std::mutex g_mu[64];
 
-// Adds one chunk's answer for query q: the chunk's documents are base + the ids in `run`.
 void report(u32 q, const Run& run, u32 base, u64* acc, bool shared) {
   u64 c, s;
-  CYTS(5) run.size_sum(c, s);
-  CYT(5)
+  run.size_sum(c, s);
+
   if (!c) return;
   u32 cand[20], k = 0, m = 0;
-  // Count (20 bits) and sum of ids (above them) add up in one word.
   u64 packed = c | (s + c * base) << 20;
   if (shared)
     __atomic_fetch_add(acc, packed, __ATOMIC_RELAXED);
   else
     *acc += packed;
   u32* f = g_first + q * 11;
-  // No lock when the ten smallest are known and all below this chunk (they only ever get smaller).
   if (__atomic_load_n(&f[10], __ATOMIC_RELAXED) == 10 && __atomic_load_n(&f[9], __ATOMIC_RELAXED) <= base) return;
   std::lock_guard<std::mutex> lock(g_mu[q & 63]);
   if (f[10] == 10 && f[9] <= base) return;
@@ -369,18 +369,16 @@ void report(u32 q, const Run& run, u32 base, u64* acc, bool shared) {
   memcpy(f, cand, f[10] * 4);
 }
 
-// ---- The classes of the terms, fixed after the sample. Ids: 0 = not a query term; 1..g_nd = BOOL terms with a
-// bitset; then the other BOOL terms (g_ns of them, which get postings); then the terms that only phrases use.
 u32 g_nd, g_ns, g_nt;
-std::vector<u32> g_tstart, g_trig;  // by term: the phrases it triggers, as query << 3 | its place in the phrase
+std::vector<u32> g_tstart;
+std::vector<u64> g_trig;
 
-// ---- One thread's buffers.
 struct Worker {
   u64* h;
   u32 *ids, *tp, *dend, *uniq, *slow;
   u16* stamp;
   u32 *df, *start, *pairs, pcap;
-  u64* acc;  // per BOOL query: this thread's count and sum so far
+  u64* acc;
   u16* post;
   u32 postcap;
   u64* rows;
@@ -394,17 +392,13 @@ T* alloc(size_t n) {
   return (T*)calloc(n ? n : 1, sizeof(T));
 }
 
-// Splits the text of b[from..to] (whole lines) into tokens and indexes them document by document. In sample mode
-// only the document frequency of every term is counted; otherwise the chunk's bitset rows, pairs (term, document) and
-// phrase matches are recorded. The first line's number is first_doc; local document numbers count from `base`.
 template <bool kSample>
-void scan(Worker& w, u64 from, u64 to, u32 first_doc, u32 base, u32 wl) {
+void scan(Worker& w, u64 from, u64 to, u32 wl) {
   const char* d = g_d.p;
-  u32 nt = 0, nd = 0, done = 0, np = 0;
+  u32 nt = 0, nd = 0, done = 0, np = 0, bmax = g_nd + g_ns;
   u64 carry_a = 0, carry_nl = 1, in_id = 0, open = ~0ULL;
   auto flush = [&]() {
-    CYTS(2) u32 end = w.dend[nd - 1], nslow = 0;
-    // Look up every token (id, and bit 17 if the term triggers phrases); the lines are prefetched a few tokens ahead.
+    u32 end = w.dend[nd - 1], nslow = 0;
     for (u32 i = 0; i < end; i++) {
       __builtin_prefetch(g_tab + (w.h[i + kAhead] & (kLines - 1)) * 8);
       u32 slow;
@@ -413,52 +407,56 @@ void scan(Worker& w, u64 from, u64 to, u32 first_doc, u32 base, u32 wl) {
       nslow += slow;
     }
     for (u32 k = 0; k < nslow; k++) w.ids[w.slow[k]] = ovf_find(w.h[w.slow[k]]) & kPay;
-    CYT(2) CYTS(3) u32 a = 0;
+    u32 a = 0;
     for (u32 k = 0; k < nd; k++) {
       u32 b = w.dend[k], local = done + k, nu = 0, nh = 0;
       u16 cur = local + 1;
       w.stamp[0] = cur;
-      // The distinct terms of the document, in order of first occurrence (a miss is id 0, which counts as seen).
       for (u32 i = a; i < b; i++) {
         u32 x = w.ids[i], id = x & (kSample ? kPay : 0x1FFFF);
-        u16 prev = w.stamp[id];
-        w.stamp[id] = cur;
-        w.uniq[nu] = id;
+        u32 bid = (!kSample && id > bmax) ? 0 : id;
+        u16 prev = w.stamp[bid];
+        w.stamp[bid] = cur;
+        w.uniq[nu] = bid;
         nu += prev != cur;
         w.tp[nh] = i;
-        nh += !kSample & x >> 17;
+        nh += (!kSample) & (x >> 17);
       }
       if constexpr (kSample) {
         for (u32 j = 0; j < nu; j++) w.df[w.uniq[j]]++;
       } else {
         if (np + nu + 1 > w.pcap) {
-          w.pcap *= 2;
+          w.pcap = std::max(w.pcap + (w.pcap >> 1), np + nu + 16384);
           w.pairs = (u32*)realloc(w.pairs, w.pcap * 4);
         }
         u64 bit = 1ULL << (local & 63);
         for (u32 j = 0; j < nu; j++) {
-          u32 id = w.uniq[j], sid = id - g_nd - 1;
+          u32 id = w.uniq[j];
           w.rows[(id <= g_nd ? id : 0) * wl + (local >> 6)] |= bit;
-          w.pairs[np] = sid << kDocBits | local;
-          np += sid < g_ns;
+          w.pairs[np] = (id - g_nd - 1) << kDocBits | local;
+          np += id > g_nd;
         }
-        // Phrases whose trigger term occurs in this document.
         for (u32 ti = 0; ti < nh; ti++) {
           u32 i = w.tp[ti], t = w.ids[i] & 0x1FFFF;
           for (u32 x = g_tstart[t]; x < g_tstart[t + 1]; x++) {
-            u32 e = g_trig[x], from_i = i - (e & 7);
-            const Query& q = g_queries[e >> 3];
-            if (from_i < a || from_i > b || b - from_i < q.n) continue;
-            u32 j = 0;
-            while (j < q.n && (w.ids[from_i + j] & 0x1FFFF) == q.t[j]) j++;
-            if (j == q.n) w.found.push_back((e >> 3) << kDocBits | local);
+            u64 e = g_trig[x];
+            u32 from_i = i - (e & 7), len = (e >> 3) & 15;
+            if (from_i < a || from_i > b || b - from_i < len) continue;
+            if ((w.ids[from_i + ((e >> 7) & 7)] & 0x1FFFF) != ((e >> 10) & 0x1FFFF)) continue;
+            u32 qid = e >> 27;
+            if (len > 2) {
+              const Query& q = g_queries[qid];
+              u32 j = 0;
+              while (j < len && (w.ids[from_i + j] & 0x1FFFF) == q.t[j]) j++;
+              if (j != len) continue;
+            }
+            w.found.push_back(qid << kDocBits | local);
           }
         }
       }
       a = b;
     }
-    CYT(3)
-    // Keep the tokens of the unfinished document.
+
     memmove(w.h, w.h + end, (nt - end) * 8);
     nt -= end;
     done += nd;
@@ -466,15 +464,15 @@ void scan(Worker& w, u64 from, u64 to, u32 first_doc, u32 base, u32 wl) {
   };
   auto emit = [&](u64 s, u32 len) {
     const char* q = d + s;
-    u64 w0 = (load64(q) | kOnes * 0x20) & kMask[len & 31][0], w1 = (load64(q + 8) | kOnes * 0x20) & kMask[len & 31][1];
+    u64 w0 = _bzhi_u64(load64(q) | kOnes * 0x20, len << 3);
+    u64 w1 = _bzhi_u64(load64(q + 8) | kOnes * 0x20, len > 8 ? (len - 8) << 3 : 0);
     w.h[nt++] = len > 16 ? hash_bytes(q, len, true) : hash16(w0, w1);
   };
   const __m256i k20 = _mm256_set1_epi8(0x20), k60 = _mm256_set1_epi8(0x60), k7B = _mm256_set1_epi8(0x7B),
                 k2F = _mm256_set1_epi8(0x2F), k3A = _mm256_set1_epi8(0x3A), k0A = _mm256_set1_epi8(10),
                 k09 = _mm256_set1_epi8(9);
   for (u64 at = from; at < to; at += 64) {
-    // Masks for 64 bytes: alphanumeric, newline, tab.
-    u64 alnum = 0, nl = 0, tab = 0;
+    u64 alnum = 0, nl = 0;
     for (int half = 0; half < 2; half++) {
       __m256i v = _mm256_loadu_si256((const __m256i*)(d + at + 32 * half));
       __m256i lo = _mm256_or_si256(v, k20);
@@ -482,24 +480,26 @@ void scan(Worker& w, u64 from, u64 to, u32 first_doc, u32 base, u32 wl) {
       __m256i digit = _mm256_and_si256(_mm256_cmpgt_epi8(v, k2F), _mm256_cmpgt_epi8(k3A, v));
       alnum |= (u64)(u32)_mm256_movemask_epi8(_mm256_or_si256(letter, digit)) << (32 * half);
       nl |= (u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, k0A)) << (32 * half);
-      tab |= (u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, k09)) << (32 * half);
     }
     if (to - at < 64) {
       u64 valid = (1ULL << (to - at)) - 1;
-      alnum &= valid, nl &= valid, tab &= valid;
+      alnum &= valid, nl &= valid;
     }
-    // The document id (from the start of a line to its tab) is not a token: mask it off.
-    u64 toggle = (nl << 1 | carry_nl) | tab;
-    u64 idm = _mm_cvtsi128_si64(_mm_clmulepi64_si128(_mm_set_epi64x(0, toggle), _mm_set1_epi8(-1), 0));
-    idm ^= -in_id;
-    in_id = idm >> 63;
-    carry_nl = nl >> 63;
-    alnum &= ~idm;
+    if (__builtin_expect((nl | carry_nl | in_id) != 0, 0)) {
+      u64 tab = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i*)(d + at)), k09)) |
+                (u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i*)(d + at + 32)), k09)) << 32;
+      if (to - at < 64) tab &= (1ULL << (to - at)) - 1;
+      u64 toggle = (nl << 1 | carry_nl) | tab;
+      u64 idm = _mm_cvtsi128_si64(_mm_clmulepi64_si128(_mm_set_epi64x(0, toggle), _mm_set1_epi8(-1), 0));
+      idm ^= -in_id;
+      in_id = idm >> 63;
+      carry_nl = nl >> 63;
+      alnum &= ~idm;
+    }
     u64 prev = alnum << 1 | carry_a;
     u64 starts = alnum & ~prev, ends = ~alnum & prev;
     carry_a = alnum >> 63;
     u32 nt0 = nt;
-    // The k-th end closes the k-th start, or a token still open from the previous block.
     u64 e = ends, s = starts;
     if (open != ~0ULL && e) {
       emit(open, at + _tzcnt_u64(e) - open);
@@ -513,10 +513,9 @@ void scan(Worker& w, u64 from, u64 to, u32 first_doc, u32 base, u32 wl) {
       emit(st, en - st);
     }
     if (s) open = at + _tzcnt_u64(s);
-    // Document ends: the number of tokens that ended up to the newline.
     for (u64 n = nl; n; n &= n - 1) {
       u32 pos = _tzcnt_u64(n);
-      w.dend[nd++] = nt0 + __builtin_popcountll(ends & (2ULL << pos) - 1);
+      w.dend[nd++] = nt0 + __builtin_popcountll(ends & ((2ULL << pos) - 1));
     }
     if (nt >= kFlush || nd > 100) {
       if (nd) flush();
@@ -524,18 +523,17 @@ void scan(Worker& w, u64 from, u64 to, u32 first_doc, u32 base, u32 wl) {
   }
   if (nd) flush();
   if constexpr (!kSample) {
-    // The chunk's postings by term (a counting sort of the pairs, which are in document order).
-    CYTS(4)
+
     u32* start = w.start;
     memset(start, 0, (g_ns + 1) * 4);
     for (u32 i = 0; i < np; i++) start[w.pairs[i] >> kDocBits]++;
     for (u32 i = 1; i <= g_ns; i++) start[i] += start[i - 1];
     if (np > w.postcap) {
-      w.postcap = np * 2;
+      w.postcap = np + (np >> 3) + 1024;
       w.post = (u16*)realloc(w.post, w.postcap * 2);
     }
     for (u32 i = np; i-- > 0;) w.post[--start[w.pairs[i] >> kDocBits]] = w.pairs[i] & ((1 << kDocBits) - 1);
-    CYT(4)
+
   }
 }
 
@@ -546,15 +544,30 @@ std::atomic<u32> g_next{0};
 u64 g_osz[kThreads];
 int g_fd;
 
+struct Digits {
+  char d[200];
+  constexpr Digits() : d() {
+    for (int i = 0; i < 100; i++) {
+      d[i * 2] = '0' + i / 10;
+      d[i * 2 + 1] = '0' + i % 10;
+    }
+  }
+};
+constexpr Digits kDigits;
+
 inline u8* put(u8* o, u64 x) {
-  u8 buf[20];
-  int i = 20;
-  do {
-    buf[--i] = '0' + x % 10;
-    x /= 10;
-  } while (x);
-  memcpy(o, buf + i, 20 - i);
-  return o + 20 - i;
+  u8 buf[24];
+  int i = 24;
+  while (x >= 100) {
+    u64 r = (x % 100) * 2;
+    x /= 100;
+    i -= 2;
+    memcpy(buf + i, kDigits.d + r, 2);
+  }
+  if (x < 10) buf[--i] = '0' + x;
+  else i -= 2, memcpy(buf + i, kDigits.d + x * 2, 2);
+  memcpy(o, buf + i, 24 - i);
+  return o + 24 - i;
 }
 
 u32 first_doc(u64 at) {
@@ -564,27 +577,28 @@ u32 first_doc(u64 at) {
 }
 
 void worker(int tid) {
-  // ---- Parse this thread's piece of the queries; every term is numbered as it is found.
   std::vector<Query>& pc = g_piece[tid];
-  PH(0)
-#ifdef SD_PHASES
-  t_tid = tid;
-#endif
+
   parse(tid, pc);
   g_psize[tid] = pc.size();
   g_bar.arrive_and_wait();
-  PH(1)
-  u32 nq = 0;
+
+  if (tid == 0) {
+    u32 nq = 0;
+    for (int t = 0; t < kThreads; t++) nq += g_psize[t];
+    g_nq = nq;
+    g_queries.reset(new Query[nq ? nq : 1]);
+    g_first = alloc<u32>((nq ? nq : 1) * 11);
+    g_pack = alloc<u64>(nq ? nq : 1);
+  }
+  g_bar.arrive_and_wait();
   {
     u32 o = 0;
     for (int t = 0; t < tid; t++) o += g_psize[t];
     memcpy(&g_queries[o], pc.data(), pc.size() * sizeof(Query));
-    for (int t = 0; t < kThreads; t++) nq += g_psize[t];
-    g_nq = nq;
     std::vector<Query>().swap(pc);
   }
 
-  // ---- The sample: document frequencies of the terms in the first 12/1152 of the corpus.
   Worker w = {};
   w.df = alloc<u32>(kMaxProv + 1);
   w.stamp = alloc<u16>(kMaxProv + 1);
@@ -596,20 +610,17 @@ void worker(int tid) {
   w.dend = alloc<u32>(256);
   g_workers[tid] = &w;
   u64 sa = cut(g_d, tid, 96 * kSamples), sb = cut(g_d, tid + 1, 96 * kSamples);
-  scan<true>(w, sa, sb, first_doc(sa), 0, 0);
+  scan<true>(w, sa, sb, 0);
   g_bar.arrive_and_wait();
-  PH(3)
+
   {
     size_t per = (kMaxProv + kThreads) / kThreads;
     for (size_t i = per * tid; i < std::min<size_t>(per * (tid + 1), kMaxProv + 1); i++)
       for (int t = 0; t < kThreads; t++) g_dfall[i] += g_workers[t]->df[i];
   }
   g_bar.arrive_and_wait();
-  PH(4)
 
-  // ---- Classes, ids and triggers (one thread, a few thousand steps per term).
   if (tid == 0) {
-    // The sample's document count: the id of the first line after it.
     u64 end = cut(g_d, kSamples, 96 * kSamples);
     u32 seen = end >= g_d.n ? g_ndocs : first_doc(end);
     auto dense = [&](u32 p) { return (g_used[p] & 1) && (u64)g_dfall[p] * 32 >= seen; };
@@ -624,15 +635,31 @@ void worker(int tid) {
     for (u32 p = 1; p <= kMaxProv; p++)
       if (g_used[p]) g_fin[p] = dense(p) ? 1 + a++ : (g_used[p] & 1) ? nd + 1 + b++ : nd + ns + 1 + c++;
     g_nt = nd + ns + c;
-    // Each phrase is checked where its rarest term occurs.
-    std::vector<std::pair<u32, u32>> by_term;
+    std::vector<std::pair<u32, u64>> by_term;
+    std::vector<u32> ntrig(kMaxProv + 1, 0);
+    u32 nbq = 0;
+    for (u32 q = 0; q < g_nq; q++) nbq += !g_queries[q].phrase;
+    g_nbq = nbq;
+    g_bqueries.reset(new BoolQuery[nbq ? nbq : 1]);
+    u32 bi = 0;
     for (u32 q = 0; q < g_nq; q++) {
-      const Query& qq = g_queries[q];
-      if (!qq.phrase) continue;
+      Query& qq = g_queries[q];
+      if (!qq.phrase) {
+        qq.bi = bi++;
+        continue;
+      }
       u32 best = 0;
       for (u32 i = 1; i < qq.n; i++)
-        if (g_dfall[qq.t[i]] < g_dfall[qq.t[best]]) best = i;
-      by_term.push_back({g_fin[qq.t[best]], q << 3 | best});
+        if ((u64)g_dfall[qq.t[i]] * 4 + ntrig[qq.t[i]] < (u64)g_dfall[qq.t[best]] * 4 + ntrig[qq.t[best]]) best = i;
+      ntrig[qq.t[best]]++;
+      u32 sec = best;
+      if (qq.n > 1) {
+        sec = best == 0 ? 1 : 0;
+        for (u32 i = 0; i < qq.n; i++)
+          if (i != best && g_dfall[qq.t[i]] < g_dfall[qq.t[sec]]) sec = i;
+      }
+      u64 entry = ((u64)q << 27) | ((u64)g_fin[qq.t[sec]] << 10) | ((u64)sec << 7) | ((u64)qq.n << 3) | best;
+      by_term.push_back({g_fin[qq.t[best]], entry});
     }
     g_tstart.assign(g_nt + 2, 0);
     for (auto& e : by_term) g_tstart[e.first + 1]++;
@@ -640,8 +667,6 @@ void worker(int tid) {
     g_trig.resize(by_term.size());
     std::vector<u32> fill(g_tstart.begin(), g_tstart.end());
     for (auto& e : by_term) g_trig[fill[e.first]++] = e.second;
-    for (u32 q = 0; q < g_nq; q++)
-      if (!g_queries[q].phrase) g_queries[q].bi = g_bool.size(), g_bool.push_back(q);
     g_pay.assign(kMaxProv + 1, 0);
     for (u32 p = 1; p <= kMaxProv; p++) {
       u32 f = g_fin[p];
@@ -649,33 +674,45 @@ void worker(int tid) {
     }
   }
   g_bar.arrive_and_wait();
-  PH(5)
-  // Rewrite the table with the final ids, and the queries.
+
   {
     u32 per = kLines / kThreads + 1;
     for (u32 l = per * tid; l < std::min<u32>(per * (tid + 1), kLines); l++)
-      for (int s = 0; s < 7; s++) {
+      for (int s = 0; s < 8; s++) {
         u64& e = g_tab[l * 8 + s];
-        if (e) e = (e & kTag) | g_pay[e & kPay];
+        if (e & kTag) e = (e & ~kPay) | g_pay[e & kPay];
       }
     if (tid == 0)
       for (u64& e : g_ovf)
         if (e) e = (e & kTag) | g_pay[e & kPay];
     u32 qa = g_nq / kThreads * tid, qb = tid == kThreads - 1 ? g_nq : g_nq / kThreads * (tid + 1);
-    for (u32 q = qa; q < qb; q++)
-      for (u32 j = 0; j < g_queries[q].n; j++) g_queries[q].t[j] = g_fin[g_queries[q].t[j]];
+    for (u32 q = qa; q < qb; q++) {
+      Query& qq = g_queries[q];
+      for (u32 j = 0; j < qq.n; j++) qq.t[j] = g_fin[qq.t[j]];
+      if (!qq.phrase) {
+        BoolQuery& bq = g_bqueries[qq.bi];
+        memcpy(bq.t, qq.t, 32);
+        memcpy(bq.ops, qq.ops, 8);
+        bq.qid = q;
+        bq.n = qq.n;
+        bq.has_or = qq.has_or;
+      }
+    }
   }
   g_bar.arrive_and_wait();
-  PH(6)
 
-  // ---- The scan: chunks of whole lines, each indexed and answered on its own.
+  if (tid == 0) {
+    std::vector<u32>().swap(g_dfall);
+    std::vector<u32>().swap(g_fin);
+    std::vector<u32>().swap(g_pay);
+  }
   free(w.df);
   w.df = nullptr;
   free(w.stamp);
-  w.stamp = alloc<u16>(g_nt + 1);
+  w.stamp = alloc<u16>(g_nd + g_ns + 2);
   w.start = alloc<u32>(g_ns + 2);
   w.pcap = 1 << 16;
-  w.acc = alloc<u64>(g_bool.size());
+  w.acc = alloc<u64>(g_nbq);
   w.pairs = alloc<u32>(w.pcap);
   w.postcap = 1 << 16;
   w.post = alloc<u16>(w.postcap);
@@ -698,45 +735,44 @@ void worker(int tid) {
     } else {
       memset(w.rows, 0, (g_nd + 1) * wl * 8);
     }
-    memset(w.stamp, 0, (g_nt + 1) * 2);
+    memset(w.stamp, 0, (g_nd + g_ns + 1) * 2);
     w.found.clear();
     run.wl = wl;
-    CYS(0) scan<false>(w, from, to, base, base, wl);
-    CY(0) CYS(1)
+    scan<false>(w, from, to, wl);
+
     const u32* start = w.start;
     auto operand = [&](u32 t) {
       if (t <= g_nd) return Opnd{nullptr, w.rows + (size_t)t * wl, 0};
       u32 sid = t - g_nd - 1;
       return Opnd{w.post + start[sid], nullptr, start[sid + 1] - start[sid]};
     };
-    // Phrases found while scanning, each document once.
     std::sort(w.found.begin(), w.found.end());
     w.found.erase(std::unique(w.found.begin(), w.found.end()), w.found.end());
     for (size_t i = 0; i < w.found.size();) {
       u32 q = w.found[i] >> kDocBits;
       run.dense = false;
       run.n = 0;
+      run.cur_l = run.list;
       for (; i < w.found.size() && w.found[i] >> kDocBits == q; i++) run.list[run.n++] = w.found[i] & ((1 << kDocBits) - 1);
       report(q, run, base, &g_pack[q], true);
     }
-    // Every BOOL query, on this chunk's documents.
-    for (u32 q : g_bool) {
-      const Query& qq = g_queries[q];
+    for (u32 bi = 0; bi < g_nbq; bi++) {
+      const BoolQuery& qq = g_bqueries[bi];
       Opnd x = operand(qq.t[0]);
       if (x.b == nullptr && x.n == 0 && !qq.has_or) continue;
       run.start(x);
       for (u32 k = 0; k + 1 < qq.n; k++) run.apply(qq.ops[k], operand(qq.t[k + 1]));
-      report(q, run, base, &w.acc[qq.bi], false);
+      report(qq.qid, run, base, &w.acc[bi], false);
     }
-    CY(1)
-  }
-  g_bar.arrive_and_wait();
-  PH(7)
 
-  // ---- Output: each thread adds up the counts and sums of a twelfth of the queries, formats them, and writes them at
-  // their place in the file.
+  }
+  free(w.rows), free(w.post), free(w.pairs), free(w.start), free(w.stamp);
+  free(w.h), free(w.ids), free(w.tp), free(w.uniq), free(w.slow), free(w.dend);
+  free(run.list), free(run.tmp), free(run.bits);
+  g_bar.arrive_and_wait();
+
   u32 q0 = (u64)g_nq * tid / kThreads, q1 = (u64)g_nq * (tid + 1) / kThreads;
-  u8 *buf = (u8*)malloc((size_t)(q1 - q0) * 144 + 64), *o = buf;  // not calloc: it would touch all of it
+  u8 *buf = (u8*)malloc((size_t)(q1 - q0) * 144 + 64), *o = buf;
   for (u32 q = q0; q < q1; q++) {
     u64 packed = g_pack[q];
     for (int x = 0; x < kThreads && !g_queries[q].phrase; x++) packed += g_workers[x]->acc[g_queries[q].bi];
@@ -752,7 +788,7 @@ void worker(int tid) {
   }
   g_osz[tid] = o - buf;
   if (tid == 0) g_fd = open("/out/results.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-  PH(8)
+
   g_bar.arrive_and_wait();
   off_t at = 0;
   for (int x = 0; x < tid; x++) at += g_osz[x];
@@ -763,39 +799,18 @@ void worker(int tid) {
   }
   g_bar.arrive_and_wait();
   if (tid == 0) {
-    PH(9)
-#ifdef SD_PHASES
-    {
-      FILE* f = fopen("/proc/self/status", "r");
-      char line[256];
-      while (f && fgets(line, sizeof line, f))
-        if (!strncmp(line, "VmHWM", 5) || !strncmp(line, "VmRSS", 5) || !strncmp(line, "RssAnon", 7) || !strncmp(line, "RssFile", 7)) fputs(line, stderr);
-    }
-    for (int i = 1; i < 10; i++) fprintf(stderr, "phase %d: %.2f ms (at %.2f)\n", i, g_ph[i] - g_ph[i - 1], g_ph[i] - g_ph[0]);
-    double a = 0, b = 0, tpm = (g_tc[9] - g_tc[0]) / (g_ph[9] - g_ph[0]);
-    for (int t = 0; t < kThreads; t++) a += g_cy[t][0], b += g_cy[t][1];
-    fprintf(stderr, "scan %.1f ms/thread, eval %.1f ms/thread (tsc)\n", a / kThreads / tpm, b / kThreads / tpm);
-    double l = 0, r = 0;
-    for (int t = 0; t < kThreads; t++) l += g_cy[t][2], r += g_cy[t][3];
-    fprintf(stderr, "  lookup loop %.1f ms/thread, record loop %.1f ms/thread (incl. sample)\n", l / kThreads / tpm, r / kThreads / tpm);
-    double c4 = 0, c5 = 0;
-    for (int t = 0; t < kThreads; t++) c4 += g_cy[t][4], c5 += g_cy[t][5];
-    fprintf(stderr, "  counting sort %.1f ms/thread, size_sum %.1f ms/thread\n", c4 / kThreads / tpm, c5 / kThreads / tpm);
-#endif
+
     _exit(0);
   }
 }
 }  // namespace
 
 int main() {
+  prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
   g_q = map_file("/data/queries.txt");
   g_d = map_file("/data/docs.txt");
   const char* last = (const char*)memrchr(g_d.p, '\n', g_d.n - 1);
   g_ndocs = first_doc(last ? last + 1 - g_d.p : 0) + 1;
-  size_t maxq = g_q.n / 7 + 16;  // a query takes at least 7 bytes
-  g_queries.reset(new Query[maxq]);
-  g_first = alloc<u32>(maxq * 11);
-  g_pack = alloc<u64>(maxq);
   g_dfall.assign(kMaxProv + 1, 0);
   std::thread th[kThreads - 1];
   for (int i = 0; i < kThreads - 1; i++) th[i] = std::thread(worker, i + 1);
