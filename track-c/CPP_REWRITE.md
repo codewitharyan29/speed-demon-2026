@@ -138,3 +138,42 @@ What this shows: TLB misses on the name table are not a measurable part of the p
 by giving up the one-line-per-lookup property, which every board result so far has rewarded. Not tried, with reasons: mmap input
 (three board measurements on Track A, all slower, including per-chunk populate), block/batch/chunk size sweeps (the VM's L2 and
 fill-buffer limits differ from the board's SMT pairs, so a locally neutral setting would have no basis for a board run).
+
+## K35 mission (Nov 2): three architectures, measured; no candidate beats cx5
+
+Target arithmetic with the official `scoring.py` (T_ref 14.44 s; cx5 gives 31.87 from T 34.514 ms, M 14.139 MB, S 432):
+
+| Target | T needed at M 14.14 MB, S 432 | at M 11 MB | at M 9.3 MB |
+|---|---:|---:|---:|
+| K 33 | 32.2 ms | 35.6 | 38.1 |
+| **K 35** | **28.6 ms (-17%)** | 31.6 | 33.8 |
+| K 38 | 24.3 ms | 26.8 | 28.7 |
+| K 40 | 21.9 ms | 24.2 | 25.9 |
+
+The board leader (K 48.5: T 17.4 ms, M 9.32 MB, S 451) has about 1.2 MB over the 8.1 MB process floor, so its design holds no 8 MB name table.
+
+**Where cx5's time goes** (1 thread, local KVM, full seed 1, 215 ms; valid builds only. An earlier stage-removal series was discarded: an empty output starts the exact fallback, which reads the file twice):
+
+| Part | ms | Basis |
+|---|---:|---|
+| process, regions, chunk starts | 6 | exit after phase 1 |
+| `pread` of 202 MB (32 KiB blocks) | 40 | bare pread loop (`rd.cpp` style): 35-43 ms on cpus 0-3 |
+| structural pass + record parse + aggregates | about 90 | no-table build 136 minus the above |
+| name table: prefetch, tag probe, entry compare, mask update | 79 | cx5 215 minus no-table build 136 |
+| of which the locked `bts` | 12 | plain read-modify-write build: 215 -> 203 (4 threads: 70.0 -> 64.5 wall) |
+
+Instructions per record (cachegrind, full seed 1): 538 (structure about 198, record parse and warm about 284, lookup and aggregate about 44); 0.38 mispredicts per record.
+
+| Arch | Candidate | Result (vs cx5 in the same run) | Decision |
+|---|---|---|---|
+| A: parser | cx12 (`cx12_lf_first_parser.cpp`): stage 1 finds only the record-ending LFs (quote-aware), stage 2 finds the last two commas from the terminator backwards and the name end and quote counts from one 64-byte window; 9/9 correct, S 462 | 1 thread +13% (236.6 vs 208.9 ms CPU); instructions equal (204 M vs 200 M on the sample) | rejected: not fewer instructions, and a long dependent chain per record |
+| A | cx13: cx12 split into three passes over the block's records | 1 thread +4% (216.8 vs 207.5), 4 threads +4%; 9/9 correct, S 481 | rejected |
+| A | cx14: record starts by LF + digit/BOM (no quote tracking in the fast path; the exact fallback keeps the quote-aware pass; wrong splits fail the quote parity checks, hostile-LF passes) | 1 thread +4%, 4 threads +3%; 9/9 correct, S 498 | rejected: halving stage 1 does not show in time |
+| B: lookup | table work is 79 ms of 215 (37%) | upper bound if the whole table path were free: -37% T (K about 38.5). Not reachable: identity must stay exact, so every record needs one random entry line | analysis |
+| B | batch size sweep 6, 8, 12, 16, 24, 32 | flat within noise (12: -0.3%, 24: -0.9% at 1 thread; 4 threads equal) | rejected |
+| B | hash-only identity (no key compare, 40-byte entries): about -4 MB M (+6% K) | not exact; not built | rejected on exactness |
+| C: parallel | cx15 (`cx15_batched_locks.cpp`): resolve does all 16 lookups first, then the 16 locked ORs together | 1 thread +4% worse, 4 threads equal (251.99 vs 251.27 CPU) | rejected |
+| C | atomic-free mask (plain RMW, valid only on one thread, build `PLAIN`) | upper bound of any lock-free scheme: -5.5% at 1 thread, -8% at 4 threads. O2 (owner rings, `docs/track-c-locality`) costs +10% locally, more than it can recover | rejected |
+| read path | mmap vs pread, bare read loop (`rd.cpp` style) | local: pread 35.1 ms (1 thread) / 9.5 (4); mmap 25.3 / 6.8; mmap + MAP_POPULATE 17.5 / 5.1. Track A measured mmap slower on the board three times (parse in place, per-chunk populate) | not repeated |
+
+Conclusion. Nothing here crosses K 33, let alone K 35: the largest modelled gains stack to about -10% T at best (lock-free masks -5%, a cheaper parser that does not exist yet), against the -17% that K 35 needs. The two parts that are not CPU work, reading (40 of 215) and the exact-identity table (79 of 215), are 55% of the time; cutting the board's T by 17% means taking about a third of the time out of exactly those, and the experiments above, including everything Track A and Track C measured on the board, show no way to do that without breaking exactness or memory. No official run was made: no candidate is above cx5 locally. Production stays cx5 (66693b1, K 31.88).
