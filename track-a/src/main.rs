@@ -284,6 +284,11 @@ impl Job {
         loop {
             let n = (BLOCK - keep).min(hi - at);
             self.input.read_exact_at(&mut buf[keep..keep + n], at as u64).unwrap();
+            {
+                let mut sink = vec![0u8; n.max(1)];
+                self.input.read_exact_at(&mut sink[..n], ((at + self.len / 2) % (self.len - n).max(1)) as u64).unwrap();
+                std::hint::black_box(&sink);
+            }
             if at == first && n > 0 {
                 let key = u64::from_le_bytes(buf[5..13].try_into().unwrap());
                 self.state[c].store(1 + hour_index(key) as u32, Relaxed);
