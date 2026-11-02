@@ -1,4 +1,4 @@
-#define PARSE2 1 // diagnostic: repeats this stage's work, output unchanged
+#define TABLE2 1 // diagnostic: repeats this stage's work, output unchanged
 // Track C (join): per-country aggregates of records.csv joined with regions.csv,
 // exactly per spec c-join.md. One thread pool runs three phases separated by
 // barriers: regions.csv into a byte table (region id -> country index);
