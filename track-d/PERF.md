@@ -559,3 +559,6 @@ d >> 4 <= 3750 < 4096; keys never wrap around ring. pop() uses 1-cycle 	zcnt on 
 | **Single Thread Pool (std::jthread)** | 12 threads spawned once at start of main() with std::barrier across all phases | Saves ~6-8 ms of thread spawn/join latency across build phases |
 | **Sized Spill & Queue Pools** | Sized sp to 131,072 entries and POOL to 8,192 entries (L1D-resident) | Drops peak cgroup memory from 74 MB down to ~53-55 MB |
 | **Source Line Count Compaction** | Formatted with clang-format --style=LLVM to 342 non-comment lines ( = 349$ with Dockerfile) | $-52$ lines vs baseline ($-229$ lines vs SweetDreams), $+7.9\%$ score multiplier advantage |
+
+**Board run 18c1dcf (step 35): T 0.12248 s (122.48 ms), M 66.09 MB, S 349, K 29.953, 73.822 pts (Rank #9 of 117; +1.71 K, +1.27 pts over baseline).**
+
