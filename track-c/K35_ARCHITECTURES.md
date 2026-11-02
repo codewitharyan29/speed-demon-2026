@@ -225,3 +225,19 @@ Sources in `docs/track-c-cpp-candidates/`. All are correct on 9/9 fixtures unles
 Reading: removing instructions that the per-record work does not need is the only change here that moved wall time, about 0.6% of
 time per 1% of instructions on the VM; the board is expected to be at least as sensitive (SMT pairs share issue width, and the
 parse stage is 33% of board T), but that is an inference, not a measurement.
+
+## 10. cx19b on the board (Nov 2, 04:03-04:09 UTC) and promotion
+
+Source `docs/track-c-cpp-candidates/cx19b_fewer_checks.cpp`, main.cpp sha256 `b180dbe112729c5b...` (S 428). Verified before submission:
+9/9 fixtures normal; ASan+UBSan, a 200-byte-block / 3,000-byte-chunk build, and TSan on that build over 8 fixtures (24/24 clean).
+cx5 recovery point: `66693b1` (main.cpp sha256 `e016cdf08682676b`), also the tree of `830b2e6` and `851376d` on speed-demon.
+
+| Run | Commit | T | M | S | K |
+|---|---|---:|---:|---:|---:|
+| cx19b `run-d8a78803f209` | `9bfa8af` | **33.983 ms** | 13.61 MB | 428 | **32.417** (all gates) |
+| cx19b again, same source, docs-only commit `run-ce49af63c10e` | `00030b3` | 34.530 ms | 14.13 MB | 428 | 31.919 (all gates) |
+| cx5 reference, five runs | | 34.514 / 34.706 / 34.699 / 34.773 / 35.179 (mean 34.774, sd 0.246) | 13.7-14.1 | 432 | 31.76-31.92 |
+
+The best single official K is now 32.417. The honest expectation for this source is the two-run mean T 34.26 ms / K about 32.17,
+about 0.5 ms (1.5%) better than cx5, which is what a 3.7% reduction in instructions should give; the first run was at the lucky
+end. Promoted: speed-demon's Track C is cx19b. It is nowhere near K35 (needs T 28.8 ms).
