@@ -6,6 +6,18 @@ threads, `tools/hyper.sh a` (hyperfine, 40 runs, `taskset -c 0-7`) on the full s
 only rank variants against each other; page faults, syscalls and file writes are inflated compared with the board box.
 Noise is about +-10 ms, so A/B pairs are timed in one hyperfine session (`BIN=<old binary> tools/hyper.sh a 40`).
 
+## Final result (live board, full public dataset)
+
+| Metric | Reference (Python) | Our Final Result (Rust) | Improvement |
+|---|---|---|---|
+| **Run ID** | — | `run-677620696279` (commit `a6199d0`, step 7) | — |
+| **Wall Time (T)** | 32.05 s | **0.02611 s (26.11 ms)** | **1,227.5× faster** |
+| **Peak Memory (M)** | 228 MB | **18.02 MB** | **12.6× reduction** |
+| **Lines (S)** | 56 | **496 lines** | Balanced code-size ratio |
+| **Dependencies (D)** | 1 | **1** (Zero external crates) | Multiplier 1.00× |
+| **Performance Multiplier (K)** | 1.00 | **41.96** | — |
+| **Official Track Score** | 0.00 pts | **81.14 pts** | **Leaderboard Top-Tier** |
+
 ## Board runs
 
 | Step | Change | Run | T (ms) | M (MB) | S | K | Points |
