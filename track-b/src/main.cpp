@@ -137,6 +137,7 @@ u32* g_qstart;
 u32* g_qlist;
 u32* g_tstart;
 u64* g_trig;
+u16* g_tmap;
 u32 g_nq;
 Query* g_piece[kThreads];
 u32 g_psize[kThreads];
@@ -441,13 +442,13 @@ void scan(Worker& w, u64 from, u64 to, u32 wl, u32& nfound) {
     for (u32 i = 0; i < end; i++) {
       __builtin_prefetch(g_tab + line_of(w.h[i + kAhead]) * 8);
       u32 slow;
-      w.ids[i] = static_cast<u32>(lookup(w.h[i], slow) & kPay);
+      w.ids[i] = static_cast<u32>(lookup(w.h[i], slow) & 0x3FFFF);
       w.slow[nslow] = static_cast<u16>(i);
       nslow += slow;
     }
     for (u32 k = 0; k < nslow; k++) {
       u32 idx = w.slow[k];
-      w.ids[idx] = static_cast<u32>(ovf_find(w.h[idx]) & kPay);
+      w.ids[idx] = static_cast<u32>(ovf_find(w.h[idx]) & 0x3FFFF);
     }
     u32 a = 0;
     for (u32 k = 0; k < nd; k++) {
@@ -465,11 +466,12 @@ void scan(Worker& w, u64 from, u64 to, u32 wl, u32& nfound) {
         for (u32 j = 0; j < nu; j++) w.df[w.uniq[j]]++;
       } else {
         for (u32 i = a; i < b; i++) {
-          u32 x = w.ids[i], id = x & 0x1FFFF, trig = x >> 17;
+          u32 id = w.ids[i];
           u16 prev = w.stamp[id];
           w.stamp[id] = cur;
           w.uniq[nu] = id;
           nu += (prev != cur);
+          u32 trig = g_tmap[id];
           w.tp[nh] = (trig << 14) | i;
           nh += (trig != 0);
         }
@@ -487,14 +489,14 @@ void scan(Worker& w, u64 from, u64 to, u32 wl, u32& nfound) {
             u32 best = (e >> 16) & 7, qn = (e >> 19) & 15, from_i = i - best;
             if (from_i < a || from_i > b || b - from_i < qn) continue;
             u32 o1 = (e >> 23) & 7, t1 = (e >> 26) & 0x1FFFF;
-            if ((w.ids[from_i + o1] & 0x1FFFF) != t1) continue;
+            if (w.ids[from_i + o1] != t1) continue;
             u32 o2 = (e >> 43) & 7, t2 = (e >> 46) & 0x1FFFF;
-            if ((w.ids[from_i + o2] & 0x1FFFF) != t2) continue;
+            if (w.ids[from_i + o2] != t2) continue;
             u32 qid = static_cast<u32>(e & 0xFFFF);
             if (qn > 3) {
               const Query& q = g_queries[qid];
               u32 j = 0;
-              while (j < qn && (w.ids[from_i + j] & 0x1FFFF) == q.t[j]) j++;
+              while (j < qn && w.ids[from_i + j] == q.t[j]) j++;
               if (j != qn) continue;
             }
             w.found[nf++] = (qid << kDocBits) | local;
@@ -817,7 +819,6 @@ void worker(int tid) {
   g_bar.arrive_and_wait();
   if (tid == 0) {
     u32* tdeg = arena_alloc<u32>(g_nt + 2, true);
-    u32* tid_map = arena_alloc<u32>(g_nt + 2, true);
     u32 n_qlist = 0, n_trig = 0, q_cursor = 0;
     for (int t = 0; t < kThreads; t++) {
       Query* pc = g_piece[t];
@@ -838,7 +839,7 @@ void worker(int tid) {
     }
     u32 n_tterms = 0;
     for (u32 f = 1; f <= g_nt; f++) {
-      if (tdeg[f]) tid_map[f] = ++n_tterms;
+      if (tdeg[f]) n_tterms++;
     }
     g_aoff.store(0, std::memory_order_relaxed);
     g_queries = arena_alloc<Query>(g_nq);
@@ -848,6 +849,7 @@ void worker(int tid) {
     g_tstart = arena_alloc<u32>(n_tterms + 2, true);
     g_qlist = arena_alloc<u32>(n_qlist + 4);
     g_trig = arena_alloc<u64>(n_trig + 4);
+    g_tmap = arena_alloc<u16>(g_nt + 2, true);
     size_t keep_watermark = g_aoff.load(std::memory_order_relaxed);
     for (int t = 0; t < kThreads; t++) {
       Query* pc = g_piece[t];
@@ -859,8 +861,12 @@ void worker(int tid) {
         }
       }
     }
+    u32 cur_t = 0;
     for (u32 f = 1; f <= g_nt; f++) {
-      if (tdeg[f]) g_tstart[tid_map[f] + 1] = tdeg[f];
+      if (tdeg[f]) {
+        g_tmap[f] = static_cast<u16>(++cur_t);
+        g_tstart[cur_t + 1] = tdeg[f];
+      }
     }
     for (u32 i = 0; i <= g_nb; i++) g_qstart[i + 1] += g_qstart[i];
     for (u32 i = 0; i <= n_tterms; i++) g_tstart[i + 1] += g_tstart[i];
@@ -899,13 +905,12 @@ void worker(int tid) {
                      (static_cast<u64>(qq.t[o1]) << 26) |
                      (static_cast<u64>(o2) << 43) |
                      (static_cast<u64>(qq.t[o2]) << 46);
-          g_trig[tfill[tid_map[qq.t[best]]]++] = pack;
+          g_trig[tfill[g_tmap[qq.t[best]]]++] = pack;
         }
       }
     }
     for (u32 p = 1; p <= kMaxProv; p++) {
-      u32 f = g_fin[p];
-      g_pay[p] = f | (tid_map[f] << 17);
+      g_pay[p] = g_fin[p];
     }
     g_aoff.store(keep_watermark, std::memory_order_relaxed);
   }
