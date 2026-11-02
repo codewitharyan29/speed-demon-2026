@@ -4,8 +4,9 @@
 // records.csv in 1 MiB chunks, each parsed with a SIMD structural index and its
 // names looked up in batches in a shared table; then the distinct names per
 // country are counted from the masks. A chunk starts at an LF followed by a
-// digit 1-9 or a BOM, which never happens inside a quoted field (spec 2.2). If
-// any record does not fit, the whole file is parsed again as one chunk.
+// digit 1-9 or a BOM, which never happens inside a quoted field (spec 2.2); the
+// parity of the quotes of each chunk proves it (see run). If a cut is inside
+// quotes or a record does not fit, the whole file is parsed again as one chunk.
 #include <algorithm>
 #include <atomic>
 #include <barrier>
@@ -45,17 +46,29 @@ static u64 load8(const u8 *p) {
   memcpy(&w, p, 8);
   return w;
 }
-// The n >= 1 digits at p (up to 8 at once, without a branch).
-static u64 num(const u8 *p, size_t n) {
-  if (n > 8) {
-    u64 v = 0;
-    for (size_t i = 0; i < n; i++) v = v * 10 + p[i] - '0';
-    return v;
+// shuffle[n] moves the n digits of a field to the end of the low 8 bytes, zeros elsewhere.
+struct Shuffles {
+  alignas(16) u8 m[9][16];
+  constexpr Shuffles() : m{} {
+    for (int n = 0; n < 9; n++)
+      for (int j = 0; j < 16; j++) m[n][j] = 0x80;
+    for (int n = 1; n < 9; n++)
+      for (int i = 0; i < n; i++) m[n][8 - n + i] = i;
   }
-  u64 w = n ? load8(p) << (64 - 8 * n) : 0;
-  w = ((w & 0x0F0F0F0F0F0F0F0F) * 2561) >> 8;
-  w = ((w & 0x00FF00FF00FF00FF) * 6553601) >> 16;
-  return ((w & 0x0000FFFF0000FFFF) * 42949672960001) >> 32;
+};
+static constexpr Shuffles shuffles;
+// The n digits at p (readable: 16 bytes). 1..8 digits at once: align them, then combine pairs, quads and
+// eights with multiply-adds; longer ones (or, in a misparse, absurd ones) digit by digit.
+static u64 num(const u8 *p, size_t n) {
+  if (n - 1 < 8) {
+    __m128i x = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)p), _mm_load_si128((const __m128i *)shuffles.m[n]));
+    x = _mm_maddubs_epi16(_mm_and_si128(x, _mm_set1_epi8(0x0F)), _mm_set1_epi16(0x010A));
+    x = _mm_madd_epi16(x, _mm_set1_epi32(0x00010064));
+    return u32(_mm_cvtsi128_si32(_mm_madd_epi16(_mm_packus_epi32(x, x), _mm_set1_epi32(0x00012710))));
+  }
+  u64 v = 0;
+  for (size_t i = 0; i < (n & 31); i++) v = v * 10 + p[i] - '0';
+  return v;
 }
 
 // A name's 32-byte key: byte 0 is its length + 1 (255 if longer than 31: then
@@ -159,7 +172,8 @@ static Names *names;
 
 struct Agg {
   u64 count = 0, ids = 0, nb = 0, tb = 0;
-  i64 sum = 0, lo = INT64_MAX, hi = INT64_MIN;
+  u64 sum = 0; // wraps in the arithmetic of a misparse; the real sums fit
+  i64 lo = INT64_MAX, hi = INT64_MIN;
 };
 struct Rec {
   u64 id, hash;
@@ -170,8 +184,6 @@ struct Rec {
 
 struct Worker {
   vector<u8> buf;
-  unique_ptr<u32[]> at; // separator positions, never zeroed
-  size_t at_cap = 0, seps = 0;
   vector<u64> qw; // quote bits of each 64-byte word
   vector<u32> qb; // quotes before each word
   Rec b[3][BATCH];
@@ -181,15 +193,17 @@ struct Worker {
   u32 quotes(size_t p) const {
     return qb[p / 64] + __builtin_popcountll(qw[p / 64] & ((1ULL << p % 64) - 1));
   }
-  // Stage 1: commas and LFs outside quotes in buf[0..end) go to `at`. A quote
+  // Stage 1: the commas and LFs outside quotes in buf[0..end), as one mask per
+  // 64-byte word in `sm`. A quote
   // toggles being inside quotes, and so does each half of a "" pair, so the
   // bytes inside are the prefix XOR of the quote bits (a carry-less product).
+  vector<u64> sm; // separator mask of each 64-byte word (a sentinel word at the end is all ones)
+  size_t seps = 0;
   void structure(size_t end) {
     size_t words = (end + 63) / 64, cnt = 0;
-    if (at_cap < words * 64 + 8) at.reset(new u32[at_cap = words * 64 + 8]);
-    qw.resize(words + 1), qb.resize(words + 1);
+    qw.resize(words + 1), qb.resize(words + 1), sm.resize(words + 2);
     u64 inside = 0;
-    u32 seen = 0, *out = at.get();
+    u32 seen = 0;
     for (size_t w = 0; w < words; w++) {
       V lo = _mm256_loadu_si256((const V *)&buf[64 * w]);
       V hi = _mm256_loadu_si256((const V *)&buf[64 * w + 32]);
@@ -202,35 +216,27 @@ struct Worker {
       __m128i m = _mm_clmulepi64_si128(_mm_set_epi64x(0, q), _mm_set1_epi8(-1), 0);
       u64 in = _mm_cvtsi128_si64(m) ^ inside, sep = (bits(',') | bits('\n')) & ~in;
       inside = u64(i64(in) >> 63);
-      size_t k = __builtin_popcountll(sep);
-      for (int j = 0; j < 8; j++, sep &= sep - 1) // more than 8 is rare
-        out[cnt + j] = u32(64 * w + __builtin_ctzll(sep | 1ULL << 63));
-      for (size_t j = 8; j < k; j++, sep &= sep - 1)
-        out[cnt + j] = u32(64 * w + __builtin_ctzll(sep));
-      cnt += k, qw[w] = q, qb[w] = seen, seen += __builtin_popcountll(q);
+      cnt += __builtin_popcountll(sep), sm[w] = sep, qw[w] = q, qb[w] = seen, seen += __builtin_popcountll(q);
     }
+    sm[words] = ~0ULL, sm[words + 1] = ~0ULL;
     qw[words] = 0, qb[words] = seen, seps = cnt;
   }
-  // Stage 2: the record at s0 with separators s[0..5) into r; false if they
-  // are not ",,,,\n". An unquoted field has no quotes; a quoted one has two
+  // Stage 2: the record at s0 with separators e1..e5 into r. The separators of
+  // well-formed input are ",,,,\n". An unquoted field has no quotes; a quoted one has two
   // delimiters and two more per "" pair. A name is looked up by its bytes as
   // written: writing a value with every " doubled is one to one, so two names
   // are equal exactly when these bytes are.
-  bool record(size_t s0, const u32 *s, Rec &r) {
+  bool record(size_t s0, size_t e1, size_t e2, size_t e3, size_t e4, size_t e5, Rec &r) {
     const u8 *b = buf.data();
-    size_t e1 = s[0], e2 = s[1], e3 = s[2], e4 = s[3], e5 = s[4];
-    if ((b[e1] ^ ',') | (b[e2] ^ ',') | (b[e3] ^ ',') | (b[e4] ^ ',') |
-        (b[e5] ^ '\n'))
-      return false;
     bool bom = b[s0] == 0xEF, neg = b[e4 + 1] == '-';
     size_t p = s0 + 3 * bom, dot = e5 - (b[e5 - 1] == '\r') - 3;
     size_t whole = e4 + 1 + neg, qn = quotes(e2) - quotes(e1);
     size_t qt = quotes(e3) - quotes(e2), nq = qn != 0, tq = qt != 0;
-    i64 c = num(b + whole, dot - whole) * 100 + (b[dot + 1] - '0') * 10 +
+    u64 c = num(b + whole, dot - whole) * 100 + (b[dot + 1] - '0') * 10 +
             (b[dot + 2] - '0');
-    size_t len = e2 - e1 - 1 - 2 * nq;
+    size_t len = min(e2 - e1 - 1 - 2 * nq, e2 - e1 - 1); // the minimum only matters for a misparse
     u64 reg = num(b + e3 + 1, e4 - e3 - 1);
-    r = {num(b + p, e1 - p), 0, neg ? -c : c, b + e1 + 1 + nq, 0, u32(len),
+    r = {num(b + p, e1 - p), 0, i64(neg ? -c : c), b + e1 + 1 + nq, 0, u32(len),
          u32(len - (qn / 2 - nq)), u32(e3 - e2 - 1 - tq - qt / 2), 0};
     r.reg = reg > max_id ? 0 : u32(reg), r.hash = hsh(key(r.name, len), len);
     _mm_prefetch((const char *)(names->tags + (r.hash & (names->n - 1))), _MM_HINT_T0);
@@ -249,7 +255,7 @@ struct Worker {
       u64 bit = 1ULL << (c & 63);
       counts[c] += !(e->mask[c >> 6].fetch_or(bit, RX) & bit);
       Agg &a = agg[c];
-      a.count++, a.ids += r.id, a.sum += r.cents, a.nb += r.nb, a.tb += r.tb;
+      a.count++, a.ids += r.id, a.sum += u64(r.cents), a.nb += r.nb, a.tb += r.tb;
       a.lo = min(a.lo, r.cents), a.hi = max(a.hi, r.cents);
     }
     bn[k] = 0;
@@ -257,18 +263,28 @@ struct Worker {
   // The records between the record starts lo and hi; false if one does not
   // fit. Three batches are in flight: one is parsed while the one before has
   // its tags read and its entry prefetched, and the one before that resolved.
-  bool chunk(size_t lo, size_t hi) {
+  bool chunk(size_t lo, size_t hi, u8 &parity) {
     for (size_t next = lo, keep = 0, now = 0;;) {
       size_t n = min(BLOCK, hi - next), end = keep + n, start = 0;
       buf.resize(end + PAD + 1), rd(fd_rec, &buf[keep], n, next), next += n;
       if (next == hi && buf[end - 1] != '\n') buf[end++] = '\n'; // unterminated
       memset(&buf[end], 0, PAD), structure(end);
-      for (size_t k = 0; k + 5 <= seps; k += 5) {
-        if (!record(start, &at[k], b[now][bn[now]++])) return false;
-        start = at[k + 4] + 1;
+      size_t w = 0, rem = seps;
+      u64 m = sm[0];
+      auto sep = [&]() {
+        while (!m) m = sm[++w];
+        size_t p = 64 * w + __builtin_ctzll(m);
+        m &= m - 1;
+        return p;
+      };
+      for (; rem >= 5; rem -= 5) {
+        size_t e1 = sep(), e2 = sep(), e3 = sep(), e4 = sep(), e5 = sep();
+        if (!record(start, e1, e2, e3, e4, e5, b[now][bn[now]++])) return false;
+        start = e5 + 1;
         if (bn[now] == BATCH) warm((now + 2) % 3), resolve((now + 1) % 3), now = (now + 1) % 3;
       }
       for (int k : {1, 2, 0}) warm((now + k) % 3), resolve((now + k) % 3);
+      parity ^= quotes(next == hi ? end : start) & 1; // the last block counts every byte
       if (next == hi) return start == end;
       keep = end - start, memmove(&buf[0], &buf[start], keep);
     }
@@ -325,6 +341,7 @@ static string run(int bits, size_t chunk) {
   threads = max<size_t>(threads, 1);
   atomic<size_t> next[4] = {0, 0, 0, 0};
   atomic<bool> bad{false};
+  vector<u8> parity(chunks); // parity of the quotes in each chunk
   barrier sync((ptrdiff_t)threads);
   vector<Worker> ws(threads);
   auto job = [&](int phase, size_t n) {
@@ -362,13 +379,18 @@ static string run(int bits, size_t chunk) {
       starts[j] = !j ? nl - h0 + 1 : j == chunks ? n_rec : record_start(cuts[j]);
     sync.arrive_and_wait();
     for (size_t j; !bad && (j = job(2, chunks)) != SIZE_MAX;)
-      if (starts[j] < starts[j + 1] && !ws[me].chunk(starts[j], starts[j + 1]))
+      if (starts[j] < starts[j + 1] && !ws[me].chunk(starts[j], starts[j + 1], parity[j]))
         bad = true;
   };
   vector<thread> pool;
   for (size_t i = 1; i < threads; i++) pool.emplace_back(work, i);
   work(0);
   for (auto &th : pool) th.join();
+  // A cut inside a quoted field leaves an odd number of quotes before it in its record. Chunk j then
+  // holds an odd number exactly when one of its two cuts is such a cut, so the xor of the parities
+  // up to j says whether cut j + 1 is. All cuts must be at record starts (cut 0 is, the file's end is).
+  for (size_t j = 0, odd = 0; j < chunks; j++)
+      if ((odd ^= parity[j])) bad = true;
   if (bad || names->full) return {};
   // Countries in the byte order of their codes, then _UNMATCHED (index 0).
   vector<pair<string, int>> order;
