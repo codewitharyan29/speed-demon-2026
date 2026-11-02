@@ -28,6 +28,14 @@ They are noisy in absolute terms (a Windows laptop VM, not the scoring box) and 
 | 18 | Unified single-pass renumber & prefix sum, 32K worker buffers | d736e45 | 0.268 | 93 | 62.312 (K 17.63, 557 lines) |
 | 19 | In-memory u64 edge ingestion (heap overhead regression) | 8f8dfeb | 0.265 | 104 | 60.052 (K 17.40, 564 lines) |
 | 20 | Direct unweighted BFS stream, eliminate edges0 & scatter, adj0/adj memory separation, 131K worker pools, S=541 (-23 lines) | | ~0.210 | ~55 | estimated ~68.0 pts |
+| 24 | C++ rewrite with dynamic chunk scheduling and flat array layouts | 9af42e6 | 0.245 | 76 | 64.159 (K 19.20, 564 lines) |
+| 30 | Reverse graph in 4-slot rows, radix-sorted spills, transparent huge pages disabled via MADV_NOHUGEPAGE | bdf483b | 0.1479 | 74.0 | 70.97 (K 26.25, 384 lines) |
+| 31 | BFS regions write edge array directly (in-cache scatter and offset resolution) | 9c7e08a | 0.1491 | 73.9 | 70.89 (K 26.17, 384 lines) |
+| 32 | Branchless 8-byte SWAR number parsing, zero-page load safety | db9072a | 0.1370 | 74.4 | 71.67 (K 27.13, 397 lines) |
+| 33 | Margin on queue pools (262,144 entries), lowest-distance frontier balancing | 4fa0bee | 0.1351 | 74.4 | 71.82 (K 27.32, 397 lines, ~#12) |
+| 35 | Symmetric in-place CSR reverse graph inside e4, zero-alloc fallback, loop-free monotone Dial & S=349 | 18c1dcf | 0.1225 | 66.09 | **73.822** (K 29.953, 349 lines, **Rank #9 of 117**) |
+| 36 | Metric-ball frontier balancing, templated step<SH>, 512B Dist pages & false-sharing elimination | c31c0dd | 0.1283 | 65.43 | 73.356 (K 29.317, 350 lines, **Rank #9 retained**) |
+| 37 | On-demand page zeroing, parallel 12-thread prefix sums, 1 MB compact scratch pool, templated search | 3cffee5 | ~0.118-0.125 | ~54-55 | Estimated ~74.5+ pts (Code freeze submission) |
 
 ## Local measurements behind step 2 (full data, in-process ms, 12 CPUs)
 

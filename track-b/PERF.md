@@ -36,7 +36,7 @@ They are only used to compare variants, never reported as results.
 | 26 | Evaluation operands prefetched a few queries ahead | c274b3a, a24571d | 0.187, 0.193 | 40 | 71.70 (K 27.53, 772 lines); reverted |
 | 27 | Fused query presence bitmask `g_has_q` for zero-cost empty term pruning | a844893 | 0.163 | 40 | 71.785 (K 27.27, 1285 lines) |
 | 28 | Rare-term selective anchoring for pure AND query slices | f4d7440 | 0.206 | 40 | 69.255 (K 24.27, 1292 lines) |
-| 34 | Truth Table evaluation engine: 64-bit truth table compilation for <=6-term BOOL queries, AVX2 gather (`_mm256_i32gather_epi32`) per-doc over L1 seen bitset, rarest-anchor in-scan phrase matching, parallel page dropping | 4a0b9ec | 0.105 | 40 | 77.508 (K 35.50, 961 lines) |
+| 34 | Truth Table evaluation engine: 64-bit truth table compilation for <=6-term BOOL queries, AVX2 gather (_mm256_i32gather_epi32) per-doc over L1 seen bitset, rarest-anchor in-scan phrase matching, parallel page dropping | 4a0b9ec (run-f7d2d327f20c) | 0.1054 | 39.65 | **77.508** (K 35.50, 961 lines, **Rank ~#15**) |
 
 ## Local measurements behind step 2 (in-process ms, median)
 
