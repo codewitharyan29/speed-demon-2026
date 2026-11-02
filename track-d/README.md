@@ -42,3 +42,32 @@ queries are sorted by source; each of the 12 workers starts on its own slice and
 **Memory.** Transparent huge pages are switched off for every allocation: with THP set to `always` (the board's behaviour, as far
 as its memory numbers show) the sparsely used per-worker regions are charged in whole 2 MB pieces, about 35 MB for 12 workers.
 The peak is the build's (the five arrays alive during the scatter), about 65-70 MB.
+
+## Dependencies
+
+None: C++23 standard library only, zero external libraries. `mmap`/`madvise`/`posix_fadvise` via POSIX headers.
+
+## Performance
+
+Best board result (commit `4fa0bee` / step 33, `db9072a` / step 32 for second best):
+
+| Step | T (s) | M (MB) | S (lines) | Points | Rank |
+|---|---|---|---|---|---|
+| 32 | 0.1370 | 74.4 | 397 | 71.67 | ~#12 |
+| 33 | 0.1351 | 74.4 | 397 | **71.82** | ~#12 |
+| 35 | 0.1225 | 66.1 | 349 | 73.82 | **#9** |
+| 36 | 0.1283 | 65.4 | 350 | 73.36 | #9 |
+
+The build time fell from 1.31 s at step 1 to **0.135 s** at step 33, a 9.7x speedup. The K factor (performance
+multiplier) rose from 7.68 to 27.32. Step 35 introduced the in-place symmetric reverse CSR and the loop-free monotone
+Dial, pushing us to **Rank #9** globally with 73.82 pts.
+
+## With another 24 hours
+
+- **Narrower CSR edges**: pack source + distance into 3 bytes (source ≤ 5.5 M nodes fits 23 bits) to halve the forward
+  CSR's footprint and keep it fully L3-resident.
+- **Parallel bidirectional BFS** as a fast-path for unweighted or near-uniform-weight subgraphs; the real data has
+  many short uniform chains where BFS is exact and 3-5x faster than Dijkstra.
+- **Query batching by source proximity**: after BFS renumbering, queries with nearby sources in the new id space share
+  hot frontier pages; sorting by new source id and processing in batches of 32 improves L1/L2 hit rates in the Dial.
+- **PGO** (profile-guided optimisation) as the final step after all other changes are stable.

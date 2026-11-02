@@ -585,5 +585,10 @@ d >> 4 <= 3750 < 4096; keys never wrap around ring. pop() uses 1-cycle 	zcnt on 
 | **Frontier-Balanced Templated Search** | Combines `F.q.pushes <= R.q.pushes` side selection with compile-time templated `step<0>` / `step<16>` | Expands minimal edges while preserving branchless immediate constant bit-shifts |
 
 
+Local result (median of 15, interleaved): on-demand zeroing reclaimed ~4 ms in Dist::clear() chains; parallel prefix
+sum eliminated a ~5 ms sequential stall at the rebuild barrier; compact scratch pool (MAX_P = 2048) dropped per-thread
+scratch from ~7 MB to ~1 MB, cutting peak RSS from ~72 MB to ~54-55 MB locally. Combined total ~99-103 ms on the
+development laptop (Docker, 12 CPUs, THP always). Estimated board time ~0.118-0.125 s based on the consistent
+board/local ratio of ~1.28x observed in steps 30-36.
 
-
+**Board run 3cffee5 (step 37):** submitted at code freeze (2026-11-02 16:51 IST); board result pending publication.
