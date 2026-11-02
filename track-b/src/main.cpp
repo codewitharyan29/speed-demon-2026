@@ -11,22 +11,26 @@
 #include <cstdint>
 #include <cstring>
 #include <thread>
+
 namespace {
 using u8 = uint8_t;
 using u16 = uint16_t;
 using u32 = uint32_t;
 using u64 = uint64_t;
+
 constexpr int kThreads = 12, kChunks = 48, kSamples = 12, kDocBits = 14;
-constexpr u32 kCap = 1 << 14, kFlush = 384, kAhead = 16, kLines = 1 << 14;
+constexpr u32 kCap = 1 << 14, kFlush = 384, kAhead = 16, kLines = 1 << 15;
 constexpr u32 kOvfSize = 1 << 13, kOvfMask = kOvfSize - 1;
-constexpr u32 kOvfBase = kLines * 8, kMaxProv = kOvfBase + kOvfSize;
-constexpr u32 kMaxPairs = 471040, kMaxFound = 1 << 15;
-constexpr u64 kTag = ~0x7FFFFFFFULL, kPay = 0x3FFFFFFFULL, kOvf = 1ULL << 30, kTop = 1ULL << 63;
+constexpr u32 kOvfBase = kLines * 4, kMaxProv = kOvfBase + kOvfSize;
+constexpr u32 kMaxPairs = 300000, kMaxFound = 1 << 15;
+constexpr u64 kTag = ~0xFFFFFFFFULL, kPay = 0xFFFFFFFFULL, kTop = 1ULL << 63;
 constexpr u64 kOnes = 0x0101010101010101ULL;
+
 struct File {
   const char* p;
   size_t n;
 };
+
 File map_file(const char* path) {
   int fd = open(path, O_RDONLY);
   struct stat st;
@@ -38,8 +42,10 @@ File map_file(const char* path) {
   close(fd);
   return {r, n};
 }
+
 u8* g_arena;
 std::atomic<size_t> g_aoff{0};
+
 template <class T>
 T* arena_alloc(size_t n, bool zero = false) {
   size_t bytes = ((n ? n : 1) * sizeof(T) + 63) & ~size_t(63);
@@ -48,20 +54,26 @@ T* arena_alloc(size_t n, bool zero = false) {
   if (zero) memset(ptr, 0, bytes);
   return ptr;
 }
+
 File g_q, g_d;
 u32 g_ndocs;
+
 inline u64 load64(const char* p) {
   u64 x;
   memcpy(&x, p, 8);
   return x;
 }
+
 inline u64 fold(u64 a, u64 b) {
   unsigned __int128 m = static_cast<unsigned __int128>(a) * b;
   return static_cast<u64>(m) ^ static_cast<u64>(m >> 64);
 }
+
 constexpr u64 K0 = 0xA0761D6478BD642FULL, K1 = 0xE7037ED1A0B428DBULL;
 constexpr u64 K2 = 0x8EBC6AF09C88C6E3ULL;
+
 inline u64 hash16(u64 w0, u64 w1) { return fold(w0 ^ K0, w1 ^ K1) | kTop; }
+
 __attribute__((noinline)) u64 hash_bytes(const char* s, size_t len, bool lower) {
   char b[32] = {};
   size_t clen = std::min<size_t>(len, 32);
@@ -76,29 +88,33 @@ __attribute__((noinline)) u64 hash_bytes(const char* s, size_t len, bool lower) 
   if (len > 32) h = fold(h, len * K2);
   return h | kTop;
 }
-alignas(64) u64 g_tab[kLines * 8 + 8];
+
+alignas(64) u64 g_tab[kLines * 4 + 8];
 alignas(64) u64 g_ovf[kOvfSize];
+alignas(64) u64 g_line_ovf[kLines / 64];
 u8* g_used;
+
 inline u32 line_of(u64 h) { return static_cast<u32>(h >> 17) & (kLines - 1); }
+
 inline u64 ovf_find(u64 h) {
   for (u32 i = static_cast<u32>(h >> 31) & kOvfMask;; i = (i + 1) & kOvfMask) {
     u64 e = g_ovf[i];
     if (!e || ((e ^ h) & kTag) == 0) return e;
   }
 }
+
 inline u64 lookup(u64 h, u32& slow) {
-  const u64* l = g_tab + line_of(h) * 8;
+  u32 ln = line_of(h);
+  const u64* l = g_tab + ln * 4;
   const __m256i t = _mm256_set1_epi64x(h & kTag), m = _mm256_set1_epi64x(kTag);
   __m256i a = _mm256_cmpeq_epi64(
       _mm256_and_si256(_mm256_load_si256(reinterpret_cast<const __m256i*>(l)), m), t);
-  __m256i b = _mm256_cmpeq_epi64(
-      _mm256_and_si256(_mm256_load_si256(reinterpret_cast<const __m256i*>(l + 4)), m), t);
-  u32 hit = _mm256_movemask_pd(_mm256_castsi256_pd(a)) |
-            (_mm256_movemask_pd(_mm256_castsi256_pd(b)) << 4);
-  u64 e = l[_tzcnt_u32(hit) & 7] & -static_cast<u64>(hit != 0);
-  slow = (hit == 0) & static_cast<u32>((l[(h >> 31) & 7] >> 30) & 1);
+  u32 hit = _mm256_movemask_pd(_mm256_castsi256_pd(a));
+  u64 e = l[_tzcnt_u32(hit) & 3] & -static_cast<u64>(hit != 0);
+  slow = (hit == 0) & static_cast<u32>((g_line_ovf[ln >> 6] >> (ln & 63)) & 1);
   return e;
 }
+
 inline bool claim(u64* slot, u64 h, u32 id, u32& out) {
   u64 e = 0, want = (h & kTag) | id;
   if (__atomic_compare_exchange_n(slot, &e, want, false, __ATOMIC_RELAXED,
@@ -107,23 +123,25 @@ inline bool claim(u64* slot, u64 h, u32 id, u32& out) {
     return true;
   }
   if (((e ^ h) & kTag) == 0) {
-    out = static_cast<u32>(e & 0x3FFFF);
+    out = static_cast<u32>(e & 0x7FFFFFFF);
     return true;
   }
   return false;
 }
+
 u32 intern(u64 h) {
   u32 ln = line_of(h);
-  u64* l = g_tab + ln * 8;
+  u64* l = g_tab + ln * 4;
   u32 id = 0;
-  for (int s = 0; s < 8; s++) {
-    if (claim(l + s, h, ln * 8 + s + 1, id)) return id;
+  for (int s = 0; s < 4; s++) {
+    if (claim(l + s, h, ln * 4 + s + 1, id)) return id;
   }
-  __atomic_fetch_or(&l[(h >> 31) & 7], kOvf, __ATOMIC_RELAXED);
+  __atomic_fetch_or(&g_line_ovf[ln >> 6], 1ULL << (ln & 63), __ATOMIC_RELAXED);
   for (u32 i = static_cast<u32>(h >> 31) & kOvfMask;; i = (i + 1) & kOvfMask) {
     if (claim(g_ovf + i, h, kOvfBase + i + 1, id)) return id;
   }
 }
+
 struct Query {
   u32 t[8];
   u32 gen[4];
@@ -132,15 +150,17 @@ struct Query {
   u8 ops[8];
   u8 n, ng, phrase, has_or;
 };
+
 Query* g_queries;
 u32* g_qstart;
 u32* g_qlist;
 u32* g_tstart;
 u64* g_trig;
-u16* g_tmap;
 u32 g_nq;
+
 Query* g_piece[kThreads];
 u32 g_psize[kThreads];
+
 u64 cut(const File& f, int i, int n) {
   if (i == 0 || f.n == 0) return 0;
   if (i == n) return f.n;
@@ -148,6 +168,7 @@ u64 cut(const File& f, int i, int n) {
   if (at > 0) at--;
   return static_cast<const char*>(memchr(f.p + at, '\n', f.n - at)) - f.p + 1;
 }
+
 void parse(int tid, Query* out, u32& count) {
   const char* p = g_q.p + cut(g_q, tid, kThreads);
   const char* end = g_q.p + cut(g_q, tid + 1, kThreads);
@@ -183,66 +204,87 @@ void parse(int tid, Query* out, u32& count) {
   }
   count = cnt;
 }
+
 struct Opnd {
   const u16* l;
   const u64* b;
   u32 n;
 };
+
 inline bool has(const u64* b, u32 d) { return (b[d >> 6] >> (d & 63)) & 1; }
-u32 gallop(u8 op, const u16* a, u32 na, const u16* b, u32 nb, u16* out) {
-  if (op == 'A' && na > nb) {
-    std::swap(a, b);
-    std::swap(na, nb);
-  }
-  u32 n = 0, j = 0;
-  for (u32 i = 0; i < na; i++) {
-    u16 target = a[i];
-    if (j < nb && b[j] < target) {
-      u32 step = 1;
-      while (j + step < nb && b[j + step] < target) step <<= 1;
-      u32 lo = j + (step >> 1), hi = std::min(j + step, nb - 1);
-      while (lo < hi) {
-        u32 mid = (lo + hi) >> 1;
-        if (b[mid] < target) lo = mid + 1;
-        else hi = mid;
-      }
-      j = lo;
+
+inline u32 intersect_lists(const u16* a, u32 na, const u16* b, u32 nb, u16* out) {
+  if (!na || !nb) return 0;
+  if (a[na - 1] < b[0] || b[nb - 1] < a[0]) return 0;
+  u32 i = 0, j = 0, n = 0;
+  while (i < na && j < nb) {
+    if (a[i] == b[j]) {
+      out[n++] = a[i++];
+      j++;
+    } else if (a[i] < b[j]) {
+      i++;
+    } else {
+      j++;
     }
-    bool eq = (j < nb && b[j] == target);
-    out[n] = target;
-    n += (op == 'A') ? eq : !eq;
-    j += eq;
   }
   return n;
 }
-u32 combine(u8 op, const u16* a, u32 na, const u16* b, u32 nb, u16* out) {
-  if ((op == 'A' && (na * 8 < nb || nb * 8 < na)) ||
-      (op == 'N' && na * 8 < nb))
-    return gallop(op, a, na, b, nb, out);
+
+inline u32 diff_lists(const u16* a, u32 na, const u16* b, u32 nb, u16* out) {
+  if (!na) return 0;
+  if (!nb || a[na - 1] < b[0] || b[nb - 1] < a[0]) {
+    memcpy(out, a, na * 2);
+    return na;
+  }
   u32 i = 0, j = 0, n = 0;
   while (i < na && j < nb) {
     if (a[i] < b[j]) {
-      out[n] = a[i++];
-      n += (op != 'A');
+      out[n++] = a[i++];
     } else if (a[i] > b[j]) {
-      out[n] = b[j++];
-      n += (op == 'O');
-    } else {
-      out[n] = a[i++];
       j++;
-      n += (op != 'N');
+    } else {
+      i++;
+      j++;
     }
   }
-  if (op != 'A' && i < na) {
+  if (i < na) {
     memcpy(out + n, a + i, (na - i) * 2);
     n += na - i;
   }
-  if (op == 'O' && j < nb) {
+  return n;
+}
+
+inline u32 union_lists(const u16* a, u32 na, const u16* b, u32 nb, u16* out) {
+  if (!na) { memcpy(out, b, nb * 2); return nb; }
+  if (!nb) { memcpy(out, a, na * 2); return na; }
+  u32 i = 0, j = 0, n = 0;
+  while (i < na && j < nb) {
+    if (a[i] < b[j]) {
+      out[n++] = a[i++];
+    } else if (a[i] > b[j]) {
+      out[n++] = b[j++];
+    } else {
+      out[n++] = a[i++];
+      j++;
+    }
+  }
+  if (i < na) {
+    memcpy(out + n, a + i, (na - i) * 2);
+    n += na - i;
+  }
+  if (j < nb) {
     memcpy(out + n, b + j, (nb - j) * 2);
     n += nb - j;
   }
   return n;
 }
+
+inline u32 combine(u8 op, const u16* a, u32 na, const u16* b, u32 nb, u16* out) {
+  if (op == 'A') return intersect_lists(a, na, b, nb, out);
+  if (op == 'N') return diff_lists(a, na, b, nb, out);
+  return union_lists(a, na, b, nb, out);
+}
+
 struct Run {
   u16 *list, *tmp;
   u64* bits;
@@ -275,10 +317,16 @@ struct Run {
         cur_l = list;
       } else if (op != 'O') {
         u32 k = 0;
-        for (u32 i = 0; i < n; i++) {
-          u16 d = cur_l[i];
-          list[k] = d;
-          k += (has(x.b, d) == (op == 'A'));
+        if (op == 'A') {
+          for (u32 i = 0; i < n; i++) {
+            u16 d = cur_l[i];
+            if (has(x.b, d)) list[k++] = d;
+          }
+        } else {
+          for (u32 i = 0; i < n; i++) {
+            u16 d = cur_l[i];
+            if (!has(x.b, d)) list[k++] = d;
+          }
         }
         n = k;
         cur_l = list;
@@ -292,8 +340,8 @@ struct Run {
       if (op == 'A') {
         n = 0;
         for (u32 i = 0; i < x.n; i++) {
-          list[n] = x.l[i];
-          n += has(cur_b, x.l[i]);
+          u16 d = x.l[i];
+          if (has(cur_b, d)) list[n++] = d;
         }
         cur_l = list;
         dense = false;
@@ -310,70 +358,41 @@ struct Run {
       }
     } else {
       if (op == 'A') {
-        for (u32 i = 0; i < wl; i++) bits[i] = cur_b[i] & x.b[i];
+        for (u32 i = 0; i < wl; i += 4) {
+          __m256i vb = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(cur_b + i));
+          __m256i vx = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x.b + i));
+          _mm256_storeu_si256(reinterpret_cast<__m256i*>(bits + i), _mm256_and_si256(vb, vx));
+        }
       } else if (op == 'O') {
-        for (u32 i = 0; i < wl; i++) bits[i] = cur_b[i] | x.b[i];
+        for (u32 i = 0; i < wl; i += 4) {
+          __m256i vb = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(cur_b + i));
+          __m256i vx = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x.b + i));
+          _mm256_storeu_si256(reinterpret_cast<__m256i*>(bits + i), _mm256_or_si256(vb, vx));
+        }
       } else {
-        for (u32 i = 0; i < wl; i++) bits[i] = cur_b[i] & ~x.b[i];
+        for (u32 i = 0; i < wl; i += 4) {
+          __m256i vb = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(cur_b + i));
+          __m256i vx = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x.b + i));
+          _mm256_storeu_si256(reinterpret_cast<__m256i*>(bits + i), _mm256_andnot_si256(vx, vb));
+        }
       }
       cur_b = bits;
     }
   }
   void size_sum(u64& c, u64& s) const {
-    c = 0;
-    s = 0;
+    c = s = 0;
     if (!dense) {
       c = n;
       for (u32 i = 0; i < n; i++) s += cur_l[i];
       return;
     }
-    const __m256i m0f = _mm256_set1_epi8(0x0F), zero = _mm256_setzero_si256();
-    const __m256i pop_lut = _mm256_setr_epi8(
-        0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4,
-        0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4);
-    const __m256i slo_lut = _mm256_setr_epi8(
-        0, 0, 1, 1, 2, 2, 3, 3, 3, 3, 4, 4, 5, 5, 6, 6,
-        0, 0, 1, 1, 2, 2, 3, 3, 3, 3, 4, 4, 5, 5, 6, 6);
-    const __m256i shi_lut = _mm256_setr_epi8(
-        0, 4, 5, 9, 6, 10, 11, 15, 7, 11, 12, 16, 13, 17, 18, 22,
-        0, 4, 5, 9, 6, 10, 11, 15, 7, 11, 12, 16, 13, 17, 18, 22);
-    const __m256i bidx = _mm256_setr_epi8(
-        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
-        16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31);
-    __m256i acc_c = zero, acc_s = zero, acc_bw = zero, vi = zero;
-    __m256i vstep = _mm256_set1_epi64x(256);
-    u32 i = 0;
-    for (; i + 4 <= wl; i += 4) {
-      __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(cur_b + i));
-      __m256i lo = _mm256_and_si256(v, m0f);
-      __m256i hi = _mm256_and_si256(_mm256_srli_epi16(v, 4), m0f);
-      __m256i cb = _mm256_add_epi8(_mm256_shuffle_epi8(pop_lut, lo),
-                                   _mm256_shuffle_epi8(pop_lut, hi));
-      __m256i sb = _mm256_add_epi8(_mm256_shuffle_epi8(slo_lut, lo),
-                                   _mm256_shuffle_epi8(shi_lut, hi));
-      __m256i cw = _mm256_sad_epu8(cb, zero);
-      acc_c = _mm256_add_epi64(acc_c, cw);
-      __m256i sw = _mm256_add_epi64(_mm256_sad_epu8(sb, zero),
-                                    _mm256_mul_epu32(cw, vi));
-      acc_s = _mm256_add_epi64(acc_s, sw);
-      acc_bw = _mm256_add_epi16(acc_bw, _mm256_maddubs_epi16(cb, bidx));
-      vi = _mm256_add_epi64(vi, vstep);
-    }
-    __m256i bw32 = _mm256_madd_epi16(acc_bw, _mm256_set1_epi16(1));
-    alignas(32) u64 tc[4], ts[4];
-    alignas(32) u32 tbw[8];
-    _mm256_store_si256(reinterpret_cast<__m256i*>(tc), acc_c);
-    _mm256_store_si256(reinterpret_cast<__m256i*>(ts), acc_s);
-    _mm256_store_si256(reinterpret_cast<__m256i*>(tbw), bw32);
-    c = tc[0] + tc[1] + tc[2] + tc[3];
-    u64 bw_sum = static_cast<u64>(tbw[0]) + tbw[1] + tbw[2] + tbw[3] +
-                 tbw[4] + tbw[5] + tbw[6] + tbw[7];
-    s = (ts[0] + ts[1] + ts[2] + ts[3]) + (bw_sum << 3);
-    for (; i < wl; i++) {
-      for (u64 w = cur_b[i]; w; w &= w - 1) {
-        c++;
-        s += i * 64 + _tzcnt_u64(w);
-      }
+    static const u64 kH[6] = {0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL, 0xF0F0F0F0F0F0F0F0ULL,
+                              0xFF00FF00FF00FF00ULL, 0xFFFF0000FFFF0000ULL, 0xFFFFFFFF00000000ULL};
+    for (u32 i = 0; i < wl; i++) {
+      u64 w = cur_b[i], k = __builtin_popcountll(w), within = 0;
+      for (int j = 0; j < 6; j++) within += (u64)__builtin_popcountll(w & kH[j]) << j;
+      c += k;
+      s += i * 64 * k + within;
     }
   }
   u32 smallest(u32* out, u32 base) const {
@@ -389,9 +408,11 @@ struct Run {
     return k;
   }
 };
+
 u32* g_first;
 u64* g_pack;
 alignas(64) u8 g_lock[4096];
+
 inline void report(u32 q, const Run& run, u32 base) {
   if (!run.dense && !run.n) return;
   u64 c, s;
@@ -422,16 +443,19 @@ inline void report(u32 q, const Run& run, u32 base) {
   }
   __atomic_store_n(lck, 0, __ATOMIC_RELEASE);
 }
+
 u32 g_nd, g_ns, g_nb, g_nt, g_pwords;
+
 struct Worker {
   u64* h;
-  u32 *ids, *tp, *dend, *uniq, *found;
-  u16 *slow, *stamp;
+  u32 *ids, *tp, *dend, *found;
+  u16 *stamp, *slow;
   u32 *df, *start, *pairs;
   u16* post;
   u64 *rows, *present;
   Run run;
 };
+
 template <bool kSample>
 void scan(Worker& w, u64 from, u64 to, u32 wl, u32& nfound) {
   const char* d = g_d.p;
@@ -439,100 +463,47 @@ void scan(Worker& w, u64 from, u64 to, u32 wl, u32& nfound) {
   u64 carry_a = 0, carry_nl = 1, in_id = 0, open = ~0ULL;
   auto flush = [&]() {
     u32 end = w.dend[nd - 1], nslow = 0;
-    u32 i = 0;
-    for (; i + 4 <= end; i += 4) {
-      __builtin_prefetch(g_tab + line_of(w.h[i + kAhead]) * 8);
-      __builtin_prefetch(g_tab + line_of(w.h[i + kAhead + 1]) * 8);
-      __builtin_prefetch(g_tab + line_of(w.h[i + kAhead + 2]) * 8);
-      __builtin_prefetch(g_tab + line_of(w.h[i + kAhead + 3]) * 8);
-
-      u64 h0 = w.h[i], h1 = w.h[i + 1], h2 = w.h[i + 2], h3 = w.h[i + 3];
-      const u64* l0 = g_tab + line_of(h0) * 8;
-      const u64* l1 = g_tab + line_of(h1) * 8;
-      const u64* l2 = g_tab + line_of(h2) * 8;
-      const u64* l3 = g_tab + line_of(h3) * 8;
-
-      const __m256i m = _mm256_set1_epi64x(kTag);
-      __m256i t0 = _mm256_set1_epi64x(h0 & kTag);
-      __m256i t1 = _mm256_set1_epi64x(h1 & kTag);
-      __m256i t2 = _mm256_set1_epi64x(h2 & kTag);
-      __m256i t3 = _mm256_set1_epi64x(h3 & kTag);
-
-      __m256i a0 = _mm256_cmpeq_epi64(_mm256_and_si256(_mm256_load_si256((const __m256i*)l0), m), t0);
-      __m256i b0 = _mm256_cmpeq_epi64(_mm256_and_si256(_mm256_load_si256((const __m256i*)(l0 + 4)), m), t0);
-      __m256i a1 = _mm256_cmpeq_epi64(_mm256_and_si256(_mm256_load_si256((const __m256i*)l1), m), t1);
-      __m256i b1 = _mm256_cmpeq_epi64(_mm256_and_si256(_mm256_load_si256((const __m256i*)(l1 + 4)), m), t1);
-      __m256i a2 = _mm256_cmpeq_epi64(_mm256_and_si256(_mm256_load_si256((const __m256i*)l2), m), t2);
-      __m256i b2 = _mm256_cmpeq_epi64(_mm256_and_si256(_mm256_load_si256((const __m256i*)(l2 + 4)), m), t2);
-      __m256i a3 = _mm256_cmpeq_epi64(_mm256_and_si256(_mm256_load_si256((const __m256i*)l3), m), t3);
-      __m256i b3 = _mm256_cmpeq_epi64(_mm256_and_si256(_mm256_load_si256((const __m256i*)(l3 + 4)), m), t3);
-
-      u32 hit0 = _mm256_movemask_pd(_mm256_castsi256_pd(a0)) | (_mm256_movemask_pd(_mm256_castsi256_pd(b0)) << 4);
-      u32 hit1 = _mm256_movemask_pd(_mm256_castsi256_pd(a1)) | (_mm256_movemask_pd(_mm256_castsi256_pd(b1)) << 4);
-      u32 hit2 = _mm256_movemask_pd(_mm256_castsi256_pd(a2)) | (_mm256_movemask_pd(_mm256_castsi256_pd(b2)) << 4);
-      u32 hit3 = _mm256_movemask_pd(_mm256_castsi256_pd(a3)) | (_mm256_movemask_pd(_mm256_castsi256_pd(b3)) << 4);
-
-      u64 e0 = l0[_tzcnt_u32(hit0) & 7] & -static_cast<u64>(hit0 != 0);
-      u64 e1 = l1[_tzcnt_u32(hit1) & 7] & -static_cast<u64>(hit1 != 0);
-      u64 e2 = l2[_tzcnt_u32(hit2) & 7] & -static_cast<u64>(hit2 != 0);
-      u64 e3 = l3[_tzcnt_u32(hit3) & 7] & -static_cast<u64>(hit3 != 0);
-
-      w.ids[i] = static_cast<u32>(e0 & 0x3FFFF);
-      w.ids[i + 1] = static_cast<u32>(e1 & 0x3FFFF);
-      w.ids[i + 2] = static_cast<u32>(e2 & 0x3FFFF);
-      w.ids[i + 3] = static_cast<u32>(e3 & 0x3FFFF);
-
-      u32 s0 = (hit0 == 0) & static_cast<u32>((l0[(h0 >> 31) & 7] >> 30) & 1);
-      u32 s1 = (hit1 == 0) & static_cast<u32>((l1[(h1 >> 31) & 7] >> 30) & 1);
-      u32 s2 = (hit2 == 0) & static_cast<u32>((l2[(h2 >> 31) & 7] >> 30) & 1);
-      u32 s3 = (hit3 == 0) & static_cast<u32>((l3[(h3 >> 31) & 7] >> 30) & 1);
-
-      w.slow[nslow] = static_cast<u16>(i); nslow += s0;
-      w.slow[nslow] = static_cast<u16>(i + 1); nslow += s1;
-      w.slow[nslow] = static_cast<u16>(i + 2); nslow += s2;
-      w.slow[nslow] = static_cast<u16>(i + 3); nslow += s3;
-    }
-    for (; i < end; i++) {
+    for (u32 i = 0; i < end; i++) {
+      __builtin_prefetch(g_tab + line_of(w.h[i + kAhead]) * 4);
       u32 slow;
-      w.ids[i] = static_cast<u32>(lookup(w.h[i], slow) & 0x3FFFF);
+      w.ids[i] = static_cast<u32>(lookup(w.h[i], slow));
       w.slow[nslow] = static_cast<u16>(i);
       nslow += slow;
     }
     for (u32 k = 0; k < nslow; k++) {
       u32 idx = w.slow[k];
-      w.ids[idx] = static_cast<u32>(ovf_find(w.h[idx]) & 0x3FFFF);
+      w.ids[idx] = static_cast<u32>(ovf_find(w.h[idx]));
     }
     u32 a = 0;
     for (u32 k = 0; k < nd; k++) {
-      u32 b = w.dend[k], local = done + k, nu = 0, nh = 0;
+      u32 b = w.dend[k], local = done + k, nh = 0;
       u16 cur = static_cast<u16>(local + 1);
       w.stamp[0] = cur;
       if constexpr (kSample) {
         for (u32 i = a; i < b; i++) {
-          u32 id = w.ids[i];
+          u32 id = w.ids[i] & 0x1FFFF;
           u16 prev = w.stamp[id];
-          w.stamp[id] = cur;
-          w.uniq[nu] = id;
-          nu += (prev != cur);
+          if (prev != cur) {
+            w.stamp[id] = cur;
+            w.df[id]++;
+          }
         }
-        for (u32 j = 0; j < nu; j++) w.df[w.uniq[j]]++;
       } else {
+        u64 bit = 1ULL << (local & 63);
         for (u32 i = a; i < b; i++) {
-          u32 id = w.ids[i];
+          u32 x = w.ids[i];
+          u32 id = x & 0x1FFFF;
           u16 prev = w.stamp[id];
-          w.stamp[id] = cur;
-          w.uniq[nu] = id;
-          nu += (prev != cur);
-          u32 trig = g_tmap[id];
+          if (prev != cur) {
+            w.stamp[id] = cur;
+            u32 sid = id - g_nd - 1;
+            w.rows[(id <= g_nd ? id : 0) * wl + (local >> 6)] |= bit;
+            w.pairs[np] = (sid << kDocBits) | local;
+            np += (sid < g_ns);
+          }
+          u32 trig = x >> 17;
           w.tp[nh] = (trig << 14) | i;
           nh += (trig != 0);
-        }
-        u64 bit = 1ULL << (local & 63);
-        for (u32 j = 0; j < nu; j++) {
-          u32 id = w.uniq[j], sid = id - g_nd - 1;
-          w.rows[(id <= g_nd ? id : 0) * wl + (local >> 6)] |= bit;
-          w.pairs[np] = (sid << kDocBits) | local;
-          np += (sid < g_ns);
         }
         for (u32 ti = 0; ti < nh; ti++) {
           u32 tp = w.tp[ti], i = tp & 0x3FFF, trig = tp >> 14;
@@ -541,14 +512,14 @@ void scan(Worker& w, u64 from, u64 to, u32 wl, u32& nfound) {
             u32 best = (e >> 16) & 7, qn = (e >> 19) & 15, from_i = i - best;
             if (from_i < a || from_i > b || b - from_i < qn) continue;
             u32 o1 = (e >> 23) & 7, t1 = (e >> 26) & 0x1FFFF;
-            if (w.ids[from_i + o1] != t1) continue;
+            if ((w.ids[from_i + o1] & 0x1FFFF) != t1) continue;
             u32 o2 = (e >> 43) & 7, t2 = (e >> 46) & 0x1FFFF;
-            if (w.ids[from_i + o2] != t2) continue;
+            if ((w.ids[from_i + o2] & 0x1FFFF) != t2) continue;
             u32 qid = static_cast<u32>(e & 0xFFFF);
             if (qn > 3) {
               const Query& q = g_queries[qid];
               u32 j = 0;
-              while (j < qn && w.ids[from_i + j] == q.t[j]) j++;
+              while (j < qn && (w.ids[from_i + j] & 0x1FFFF) == q.t[j]) j++;
               if (j != qn) continue;
             }
             w.found[nf++] = (qid << kDocBits) | local;
@@ -568,30 +539,26 @@ void scan(Worker& w, u64 from, u64 to, u32 wl, u32& nfound) {
     u64 w1 = _bzhi_u64(load64(q + 8) | (kOnes * 0x20),
                        len > 8 ? (len - 8) << 3 : 0);
     w.h[nt++] = __builtin_expect(len <= 16, 1) ? hash16(w0, w1)
-                                               : hash_bytes(q, len, true);
+                                                : hash_bytes(q, len, true);
   };
   const __m256i k20 = _mm256_set1_epi8(0x20), k05 = _mm256_set1_epi8(5);
   const __m256i k101 = _mm256_set1_epi8(101), k70 = _mm256_set1_epi8(70);
   const __m256i k117 = _mm256_set1_epi8(117), k0A = _mm256_set1_epi8(10);
-  const __m256i k09 = _mm256_set1_epi8(9);
   for (u64 at = from; at < to; at += 64) {
     __m256i v0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(d + at));
     __m256i v1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(d + at + 32));
-
     __m256i lo0 = _mm256_or_si256(v0, k20);
-    __m256i letter0 = _mm256_cmpgt_epi8(_mm256_add_epi8(lo0, k05), k101);
-    __m256i digit0 = _mm256_cmpgt_epi8(_mm256_add_epi8(v0, k70), k117);
-    u32 alnum0 = _mm256_movemask_epi8(_mm256_or_si256(letter0, digit0));
-    u32 m_nl0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, k0A));
-
     __m256i lo1 = _mm256_or_si256(v1, k20);
+    __m256i letter0 = _mm256_cmpgt_epi8(_mm256_add_epi8(lo0, k05), k101);
     __m256i letter1 = _mm256_cmpgt_epi8(_mm256_add_epi8(lo1, k05), k101);
+    __m256i digit0 = _mm256_cmpgt_epi8(_mm256_add_epi8(v0, k70), k117);
     __m256i digit1 = _mm256_cmpgt_epi8(_mm256_add_epi8(v1, k70), k117);
-    u32 alnum1 = _mm256_movemask_epi8(_mm256_or_si256(letter1, digit1));
-    u32 m_nl1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, k0A));
-
-    u64 alnum = alnum0 | (static_cast<u64>(alnum1) << 32);
-    u64 nl = m_nl0 | (static_cast<u64>(m_nl1) << 32);
+    u32 a0 = _mm256_movemask_epi8(_mm256_or_si256(letter0, digit0));
+    u32 a1 = _mm256_movemask_epi8(_mm256_or_si256(letter1, digit1));
+    u32 n0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, k0A));
+    u32 n1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, k0A));
+    u64 alnum = a0 | (static_cast<u64>(a1) << 32);
+    u64 nl = n0 | (static_cast<u64>(n1) << 32);
 
     if (to - at < 64) {
       u64 valid = (1ULL << (to - at)) - 1;
@@ -599,8 +566,8 @@ void scan(Worker& w, u64 from, u64 to, u32 wl, u32& nfound) {
       nl &= valid;
     }
     if (__builtin_expect((nl | carry_nl | in_id) != 0, 0)) {
-      u32 t0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, k09));
-      u32 t1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, k09));
+      u32 t0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, _mm256_set1_epi8(9)));
+      u32 t1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, _mm256_set1_epi8(9)));
       u64 tab = t0 | (static_cast<u64>(t1) << 32);
       if (to - at < 64) tab &= (1ULL << (to - at)) - 1;
       u64 toggle = ((nl << 1) | carry_nl) | tab;
@@ -662,14 +629,15 @@ void scan(Worker& w, u64 from, u64 to, u32 wl, u32& nfound) {
           w.pairs[i] & ((1 << kDocBits) - 1);
   }
 }
+
 std::barrier<> g_bar(kThreads);
 Worker* g_workers[kThreads];
 u32* g_dfall;
 u32* g_fin;
-u32* g_pay;
 std::atomic<u32> g_next{0};
 u64 g_osz[kThreads];
 int g_fd;
+
 struct Digits {
   char d[200];
   constexpr Digits() : d() {
@@ -679,6 +647,7 @@ struct Digits {
     }
   }
 } constexpr kDigits;
+
 inline u8* put(u8* o, u64 x) {
   u8 buf[24];
   int i = 24;
@@ -697,11 +666,13 @@ inline u8* put(u8* o, u64 x) {
   memcpy(o, buf + i, 24 - i);
   return o + 24 - i;
 }
+
 u32 first_doc(u64 at) {
   u32 x = 0;
   for (const char* p = g_d.p + at; *p >= '0' && *p <= '9'; p++) x = x * 10 + (*p - '0');
   return x;
 }
+
 void sort_by_df(u32* arr, u32 n) {
   u32 df[8];
   for (u32 i = 0; i < n; i++) df[i] = g_dfall[arr[i]];
@@ -717,6 +688,7 @@ void sort_by_df(u32* arr, u32 n) {
     df[j + 1] = kd;
   }
 }
+
 void worker(int tid) {
   u32 max_per_thread = (g_q.n / 25 + kThreads) / kThreads + 512;
   g_piece[tid] = arena_alloc<Query>(max_per_thread);
@@ -727,21 +699,24 @@ void worker(int tid) {
     for (int t = 0; t < kThreads; t++) nq += g_psize[t];
     g_nq = nq;
   }
+  g_bar.arrive_and_wait();
+
   Worker w = {};
   w.df = arena_alloc<u32>(kMaxProv + 1, true);
   w.stamp = arena_alloc<u16>(kMaxProv + 1, true);
   w.h = arena_alloc<u64>(kCap + 64);
   w.ids = arena_alloc<u32>(kCap + 64);
   w.slow = arena_alloc<u16>(kCap + 64);
-  w.uniq = arena_alloc<u32>(kCap + 64);
   w.dend = arena_alloc<u32>(256);
   g_workers[tid] = &w;
+
   u64 sa = cut(g_d, tid, 96 * kSamples), sb = cut(g_d, tid + 1, 96 * kSamples);
   u32 dummy_nf = 0;
   if (sa < sb) scan<true>(w, sa, sb, 0, dummy_nf);
   g_bar.arrive_and_wait();
+
   {
-    size_t per = (kMaxProv + kThreads) / kThreads;
+    size_t per = (kMaxProv + 1 + kThreads) / kThreads;
     size_t hi = std::min<size_t>(per * (tid + 1), kMaxProv + 1);
     for (size_t i = per * tid; i < hi; i++) {
       u32 sum = 0;
@@ -750,6 +725,7 @@ void worker(int tid) {
     }
   }
   g_bar.arrive_and_wait();
+
   if (tid == 0) {
     u64 end = cut(g_d, kSamples, 96 * kSamples);
     u32 seen = (end >= g_d.n) ? g_ndocs : first_doc(end);
@@ -760,8 +736,7 @@ void worker(int tid) {
     for (u32 p = 1; p <= kMaxProv; p++) {
       if (g_used[p]) {
         if (dense(p)) nd++;
-        else if (g_used[p] & 1)
-          ns++;
+        else if (g_used[p] & 1) ns++;
         else np_only++;
       }
     }
@@ -780,6 +755,7 @@ void worker(int tid) {
     }
   }
   g_bar.arrive_and_wait();
+
   {
     u32 o = 0;
     for (int t = 0; t < tid; t++) o += g_psize[t];
@@ -870,6 +846,7 @@ void worker(int tid) {
     }
   }
   g_bar.arrive_and_wait();
+
   if (tid == 0) {
     u32* tdeg = arena_alloc<u32>(g_nt + 2, true);
     u32 n_qlist = 0, n_trig = 0, q_cursor = 0;
@@ -902,8 +879,9 @@ void worker(int tid) {
     g_tstart = arena_alloc<u32>(n_tterms + 2, true);
     g_qlist = arena_alloc<u32>(n_qlist + 4);
     g_trig = arena_alloc<u64>(n_trig + 4);
-    g_tmap = arena_alloc<u16>(g_nt + 2, true);
     size_t keep_watermark = g_aoff.load(std::memory_order_relaxed);
+
+    u16* tmap = arena_alloc<u16>(g_nt + 2, true);
     for (int t = 0; t < kThreads; t++) {
       Query* pc = g_piece[t];
       u32 cnt = g_psize[t];
@@ -917,7 +895,7 @@ void worker(int tid) {
     u32 cur_t = 0;
     for (u32 f = 1; f <= g_nt; f++) {
       if (tdeg[f]) {
-        g_tmap[f] = static_cast<u16>(++cur_t);
+        tmap[f] = static_cast<u16>(++cur_t);
         g_tstart[cur_t + 1] = tdeg[f];
       }
     }
@@ -927,6 +905,7 @@ void worker(int tid) {
     u32* tfill = arena_alloc<u32>(n_tterms + 2);
     memcpy(qfill, g_qstart, (g_nb + 2) * 4);
     memcpy(tfill, g_tstart, (n_tterms + 2) * 4);
+
     for (int t = 0; t < kThreads; t++) {
       Query* pc = g_piece[t];
       u32 cnt = g_psize[t];
@@ -958,39 +937,41 @@ void worker(int tid) {
                      (static_cast<u64>(qq.t[o1]) << 26) |
                      (static_cast<u64>(o2) << 43) |
                      (static_cast<u64>(qq.t[o2]) << 46);
-          g_trig[tfill[g_tmap[qq.t[best]]]++] = pack;
+          g_trig[tfill[tmap[qq.t[best]]]++] = pack;
         }
       }
     }
-    for (u32 p = 1; p <= kMaxProv; p++) {
-      g_pay[p] = g_fin[p];
+
+    // Rewrite 4-slot table slots with final term IDs and trigger indices
+    for (u32 l = 0; l < kLines; l++) {
+      for (int s = 0; s < 4; s++) {
+        u64& e = g_tab[l * 4 + s];
+        if (e) {
+          u32 prov = static_cast<u32>(e & 0x7FFFFFFF);
+          u32 fin = g_fin[prov];
+          u32 trig = tmap[fin];
+          e = (e & kTag) | (static_cast<u64>(trig) << 17) | fin;
+        }
+      }
+    }
+    for (u32 i = 0; i < kOvfSize; i++) {
+      u64& e = g_ovf[i];
+      if (e) {
+        u32 prov = static_cast<u32>(e & 0x7FFFFFFF);
+        u32 fin = g_fin[prov];
+        u32 trig = tmap[fin];
+        e = (e & kTag) | (static_cast<u64>(trig) << 17) | fin;
+      }
     }
     g_aoff.store(keep_watermark, std::memory_order_relaxed);
   }
   g_bar.arrive_and_wait();
-  {
-    u32 per = kLines / kThreads + 1;
-    u32 hi = std::min<u32>(per * (tid + 1), kLines);
-    for (u32 l = per * tid; l < hi; l++) {
-      for (int s = 0; s < 8; s++) {
-        u64& e = g_tab[l * 8 + s];
-        if (e) e = (e & (kTag | kOvf)) | g_pay[e & 0x3FFFF];
-      }
-    }
-    if (tid == 0) {
-      for (u32 i = 0; i < kOvfSize; i++) {
-        u64& e = g_ovf[i];
-        if (e) e = (e & kTag) | g_pay[e & 0x3FFFF];
-      }
-    }
-  }
-  g_bar.arrive_and_wait();
+
   u32 max_wl = (g_ndocs / kChunks + 128) / 64 + 4;
   w.h = arena_alloc<u64>(kCap + 64);
   w.ids = arena_alloc<u32>(kCap + 64);
   w.tp = arena_alloc<u32>(kCap + 64);
   w.slow = arena_alloc<u16>(kCap + 64);
-  w.uniq = arena_alloc<u32>(kCap + 64);
   w.dend = arena_alloc<u32>(512);
   w.found = arena_alloc<u32>(kMaxFound);
   w.stamp = arena_alloc<u16>(g_nt + 2);
@@ -1004,6 +985,7 @@ void worker(int tid) {
   g_bar.arrive_and_wait();
   w.pairs = arena_alloc<u32>(kMaxPairs);
   w.post = arena_alloc<u16>(kMaxPairs);
+
   for (;;) {
     int c = g_next.fetch_add(1, std::memory_order_relaxed);
     if (c >= kChunks) break;
@@ -1060,21 +1042,26 @@ void worker(int tid) {
           }
           if (earlier) continue;
         }
-                if (!qq.has_or) {
-          bool all_pres = true;
-          for (u32 k = 0; k < qq.n; k++) {
-            if (k == 0 || qq.ops[k - 1] == 'A') {
-              if (!has_term(qq.t[k])) { all_pres = false; break; }
+        if (!qq.has_or) {
+          bool any_missing = false;
+          for (u32 j = 0; j < qq.n; j++) {
+            if (j == 0 || qq.ops[j - 1] == 'A') {
+              if (!has_term(qq.t[j])) { any_missing = true; break; }
             }
           }
-          if (!all_pres) continue;
-        } else if (qq.must && !has_term(qq.must)) continue;
+          if (any_missing) continue;
+        } else if (qq.must && !has_term(qq.must)) {
+          continue;
+        }
         Opnd x = operand(qq.t[0]);
         if (!x.b && !x.n && !qq.has_or) continue;
         run.start(x);
         for (u32 k = 0; k + 1 < qq.n; k++) {
           u8 op = qq.ops[k];
-          if (!run.dense && !run.n && op != 'O') continue;
+          if (!run.dense && !run.n) {
+            if (!qq.has_or) break;
+            if (op != 'O') continue;
+          }
           run.apply(op, operand(qq.t[k + 1]));
         }
         report(q, run, base);
@@ -1091,6 +1078,7 @@ void worker(int tid) {
     }
   }
   g_bar.arrive_and_wait();
+
   u32 q0 = static_cast<u64>(g_nq) * tid / kThreads;
   u32 q1 = static_cast<u64>(g_nq) * (tid + 1) / kThreads;
   u8* buf = reinterpret_cast<u8*>(w.pairs);
@@ -1121,9 +1109,10 @@ void worker(int tid) {
   if (tid == 0) _exit(0);
 }
 }  // namespace
+
 int main() {
   prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
-  g_arena = static_cast<u8*>(mmap(nullptr, 96ULL << 20, PROT_READ | PROT_WRITE,
+  g_arena = static_cast<u8*>(mmap(nullptr, 64ULL << 20, PROT_READ | PROT_WRITE,
                                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
   g_aoff.store(8ULL << 20, std::memory_order_relaxed);
   g_q = map_file("/data/queries.txt");
@@ -1134,7 +1123,6 @@ int main() {
   g_used = arena_alloc<u8>(kMaxProv + 1, true);
   g_dfall = arena_alloc<u32>(kMaxProv + 1, true);
   g_fin = arena_alloc<u32>(kMaxProv + 1, true);
-  g_pay = arena_alloc<u32>(kMaxProv + 1, true);
   std::thread th[kThreads - 1];
   for (int i = 0; i < kThreads - 1; i++) th[i] = std::thread(worker, i + 1);
   worker(0);
