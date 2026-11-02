@@ -356,7 +356,7 @@ impl Job {
             // MADV_DONTNEED: the records are not needed any more, so the output can reuse their memory.
             unsafe { madvise(first.0 as _, last.0 + REGION - first.0, 4) };
         }
-        let mut out = Vec::with_capacity(1 << 17);
+        let mut out: Vec<u8> = Vec::with_capacity(1 << 17);
         let abs = h + 18;
         let prefix = format!("{}T{:02}:00:00Z ", DAYS[abs / 24], abs % 24);
         for &id in &order {
@@ -368,14 +368,25 @@ impl Job {
             }
             let end = starts[id as usize];
             let (p50, p95, p99) = percentiles(&mut values[end - n..end]);
-            out.extend_from_slice(prefix.as_bytes());
-            out.extend_from_slice(self.dict.key(id as usize));
             let [p50, p95, p99] = [p50, p95, p99].map(u64::from);
-            for v in [n as u64, p50, p95, p99, errs, errs * 1_000_000 / n as u64] {
-                out.push(b' ');
-                number(&mut out, v);
+            out.reserve(512); // a line has at most 21 + 125 + 6 * 21 bytes; the stores below run up to 32 bytes past it
+            // SAFETY: the reserved capacity covers the line and the stores past its end; a key has STRIDE bytes.
+            unsafe {
+                let (key, base) = (self.dict.ptr(id as usize), out.as_mut_ptr());
+                let mut p = base.add(out.len());
+                std::ptr::copy_nonoverlapping(prefix.as_ptr(), p, 21);
+                p = p.add(21);
+                for o in (0..*key.add(STRIDE - 1) as usize).step_by(32) {
+                    _mm256_storeu_si256(p.add(o) as _, _mm256_loadu_si256(key.add(o) as _));
+                }
+                p = p.add(*key.add(STRIDE - 1) as usize);
+                for v in [n as u64, p50, p95, p99, errs, errs * 1_000_000 / n as u64] {
+                    *p = b' ';
+                    p = put(p.add(1), v);
+                }
+                *p = b'\n';
+                out.set_len(p.add(1).offset_from(base) as usize);
             }
-            out.push(b'\n');
         }
         out
     }
@@ -436,18 +447,22 @@ fn percentiles(v: &mut [u32]) -> (u32, u32, u32) {
     (*p50, *p95, p99)
 }
 
-/// Appends `v` in decimal.
-fn number(out: &mut Vec<u8>, mut v: u64) {
-    let (mut digits, mut i) = ([0u8; 20], 20);
-    loop {
-        i -= 1;
-        digits[i] = b'0' + (v % 10) as u8;
-        v /= 10;
-        if v == 0 {
-            break;
-        }
+/// Writes `v` in decimal at `p` and returns the end. The eight digits are made at once with multiplications, then the leading zeros are shifted out.
+#[inline(always)]
+unsafe fn put(p: *mut u8, v: u64) -> *mut u8 {
+    if v >= 100_000_000 {
+        let s = v.to_string(); // absurd values only
+        std::ptr::copy_nonoverlapping(s.as_ptr(), p, s.len());
+        return p.add(s.len());
     }
-    out.extend_from_slice(&digits[i..]);
+    let w = v / 10_000 | (v % 10_000) << 32; // two numbers below 10^4, one in each half
+    let h = (w.wrapping_mul(5243) >> 19) & 0x0000_007F_0000_007F; // each divided by 100
+    let y = h | (w - h * 100) << 16; // four numbers below 100
+    let t = (y.wrapping_mul(103) >> 10) & 0x000F_000F_000F_000F; // each divided by 10
+    let z = t | (y - t * 10) << 8; // the eight digits, first digit in the lowest byte
+    let lead = ((z | 1 << 63).trailing_zeros() / 8).min(7); // leading zero digits, keeping the last digit
+    (p as *mut u64).write_unaligned((z | 0x3030_3030_3030_3030) >> (8 * lead));
+    p.add(8 - lead as usize)
 }
 
 fn main() {
