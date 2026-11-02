@@ -34,6 +34,9 @@ They are only used to compare variants, never reported as results.
 | 23 | A list term's pair written without a branch (every token stamps and writes; the count moves by 0 or 1) | 84edbf2 | 0.182 | 62 | 70.904 (K 26.19, 750 lines); reverted |
 | 25 | Bitset rows stored in BOOL queries (one random read less per operand in the evaluation) | 7341f08, 90ca9fe, 809b213 | 0.185, 0.180, 0.186 | 40 | 72.499 (K 28.18, 758 lines) |
 | 26 | Evaluation operands prefetched a few queries ahead | c274b3a, a24571d | 0.187, 0.193 | 40 | 71.70 (K 27.53, 772 lines); reverted |
+| 27 | Fused query presence bitmask `g_has_q` for zero-cost empty term pruning | a844893 | 0.163 | 40 | 71.785 (K 27.27, 1285 lines) |
+| 28 | Rare-term selective anchoring for pure AND query slices | f4d7440 | 0.206 | 40 | 69.255 (K 24.27, 1292 lines) |
+| 34 | Truth Table evaluation engine: 64-bit truth table compilation for <=6-term BOOL queries, AVX2 gather (`_mm256_i32gather_epi32`) per-doc over L1 seen bitset, rarest-anchor in-scan phrase matching, parallel page dropping | 4a0b9ec | 0.105 | 40 | 77.508 (K 35.50, 961 lines) |
 
 ## Local measurements behind step 2 (in-process ms, median)
 
@@ -577,3 +580,29 @@ same container: Rust 125 ms (range 121-130).
 Per-thread time split on the laptop after step 33 (ms): tokenise ~10, hash ~8.5, lookup ~14.5, record ~17.5, local counting sort ~5, BOOL
 evaluation ~28 (reporting ~5, size_sum ~4). Startup ~7 ms wall, output ~3 ms.
 Parameter sweeps in the noise: flush size 192/384/768 tokens, prefetch distance 8/16/24/32 (kept 384 / 16).
+
+## Step 34: Final Optimization & Return to Rust with Truth Table Evaluation Engine
+
+While the exploratory C++ experiments provided useful profiling insights into lookup branch penalties and selective anchoring, the C++ allocator overhead and memory footprint pushed RSS close to the 44 MB multiplier boundary without breaking the 150 ms floor on the live cluster. 
+
+We returned to our primary Rust implementation (`track-b-rust-best` from `rust-backup/`), dedicating several hours of focused optimization to overhaul the evaluation architecture:
+
+1. **64-bit Integer Truth Table Evaluation**:
+   - The query specification guarantees that all boolean queries have $\le 6$ terms evaluated strictly left-to-right.
+   - We compile each boolean query into a compact 64-bit integer truth table (`u64 table`).
+   - During document tokenization, we maintain a thread-local L1 bitset `seen` of terms present in the current document.
+   - Rather than allocating posting lists, counting sorts, and list intersections (which accounted for over 60% of runtime in previous iterations), we evaluate queries per-document using vectorized AVX2 gathers (`_mm256_i32gather_epi32`).
+   - The 6 term presence bits are loaded in parallel, forming a 6-bit index: `hit = (table >> mask) & 1`. On match, the running count and document ID sums are updated directly.
+
+2. **In-Scan Phrase Matching**:
+   - Rather than storing token positions or bigram lists, phrase queries are validated directly during document scanning at their rarest anchor term. Neighbouring token hashes are checked inline, eliminating multi-pass rescans.
+
+3. **Memory Dropping & Multiplier Preservation**:
+   - Each thread releases completed document chunk pages back to the kernel via `madvise(MADV_DONTNEED)` in parallel while output is formatted.
+   - Pinned rustc 2024 edition compilation with `-C target-cpu=alderlake -C llvm-args=-align-loops=64 -C relocation-model=static`.
+
+**Board Run Results (Commit 4a0b9ec, run-f7d2d327f20c)**:
+- **T**: **0.1054 s (105.4 ms)** (down from 0.163 s, ~36% latency reduction).
+- **M**: **39.65 MB** (41,578,496 bytes), cleanly preserving the **maximum 50.0x memory multiplier** ($M \le 44.0\text{ MB}$).
+- **Lines ($S$)**: **961 lines**.
+- **Score**: **77.508 points (K = 35.50)** — placing **Bharat Labs at #15 on the global leaderboard**.
