@@ -209,3 +209,19 @@ measurement was made since the work is unchanged. Not submitted.
 What this implies for the parse bottleneck [board: 11.5 ms for the record stage]: a cut of 40% (K 34.3) needs about 120 fewer
 instructions per record, which no local rewriting of this formulation removed. The formulation itself (separator array from
 stage 1, then per-field scalar decoding) would have to change, and the measured attempts at that (cx12-cx14) were not faster.
+
+## 9. Broadened search, Nov 2 (local VM; the VM was restarted and ran 25-40% slower than before, so only interleaved comparisons are used)
+
+Sources in `docs/track-c-cpp-candidates/`. All are correct on 9/9 fixtures unless noted.
+
+| ID | What | Instructions (cachegrind, sample) | 4-thread wall vs cx5 (interleaved) | Decision |
+|---|---|---|---|---|
+| cx17 (`cx17_vector_numbers_gather.cpp`) | cx14 boundaries + vector number parse of 4 records at a time (`vpgatherqq`, `vpsllvq`, `vpmaddubsw`, `vpmaddwd`) for id, region id, amount | 202.4 M vs cx14 208.3 M | +17% (88.9 vs 75.7) | rejected: the gather is slow (-30 ms against scalar loads), and filling the offset/count arrays costs what the vector arithmetic saves |
+| cx17s (`cx17s_..._scalar_loads.cpp`) | same with four scalar loads instead of the gather | similar | +7% (80.5 vs 75.3); equal to cx14 (79.3) | rejected |
+| cx18 (`cx18_lookup_diet.cpp`) | 8-byte SWAR tag probe in `warm()`; key block carried in the record | | +3% (81.0 vs 78.8); split: SWAR probe alone +3%, key in record alone 0% | rejected |
+| cx19a (`cx19a_no_checks.cpp`) | cx5 without the per-record validation (separator-type check, BOM bytes, field bounds) | 184.2 M vs 199.8 M (-7.8%) | **-4.9% in both of two interleaved rounds of 80 runs** (82.8 vs 87.1; 78.5 vs 82.6) | not submitted: also removes the fallback for a chunk cut inside a quoted field |
+| cx19b (`cx19b_fewer_checks.cpp`) | cx5 without the BOM-byte check and the field-bounds check; the separator-type check stays (the fallback for a chunk cut inside a quoted field still fires) | 192.5 M (-3.7%) | **-2.7% and -2.8%** (84.9 vs 87.1; 80.3 vs 82.6) | candidate |
+
+Reading: removing instructions that the per-record work does not need is the only change here that moved wall time, about 0.6% of
+time per 1% of instructions on the VM; the board is expected to be at least as sensitive (SMT pairs share issue width, and the
+parse stage is 33% of board T), but that is an inference, not a measurement.
