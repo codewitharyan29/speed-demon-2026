@@ -39,6 +39,7 @@ One pool of threads (as many as the CPUs the process may use) runs three phases 
   those. Check: every record's five separators must be `,,,,` and LF, and a chunk's last record must end exactly where the next
   chunk starts. If any chunk fails, the whole file is parsed again as one chunk (no cut, so no assumption) with a table of 2^22
   entries. Tested with `tools/c_hostile_lf.py` inputs, where the fallback fires and the output is still exact.
+* **Fields are well formed** (spec 2.1/2.2: ids and region ids are 1-9 digit-started integers, amounts `-?d+.dd`, BOM bytes complete). The per-record checks that only guard against malformed fields were removed; the separator-type check stays, so a chunk cut inside a quoted field still falls back.
 * **At most 255 countries** (the spec has 240, plus `_UNMATCHED`), **ids 1 and above, region ids and fields as the grammar
   says** (spec 2.1 allows assuming well-formed input). An invalid `regions.csv` line or more countries makes the run give up
   (exit 1); empty number fields fail the record checks, and so trigger the fallback.
