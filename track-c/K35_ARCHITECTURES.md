@@ -270,3 +270,33 @@ Peak RSS of cx21: 12.04 MB (4 threads) = 9.95 MB anonymous + 2.09 MB file-backed
 Linking statically (`-static` instead of `-static-libgcc -static-libstdc++`) gives 0.96 MB file-backed: -1.1 MB peak (1.2% -> about +1.6% of K if the board
 counts the same pages), and a 0.05-0.2 ms faster start. Timing of the full run was inconclusive (noisy VM). Board M varies by about 0.8 MB between runs of the
 same source (13.30-14.13 MB), which is as large as many of the time gains above.
+
+## 12. Owner-sharded tables built and measured (cx30, local VM) and interleaved board comparison
+
+**cx30** (`docs/track-c-cpp-candidates/cx30_owner_sharded.cpp`): the name table is split into one private shard per worker (a name's shard
+is chosen by 32 bits of its hash). Workers parse as before and send, per record, a 40-byte message (32-byte key block, low 32 bits of the hash,
+tag, country) through a single-producer ring per (producer, owner) pair, published in groups of 8 with a release store of `tail`; the owner
+consumes with acquire loads, runs the tag-probe/lookup pipeline on its own shard with plain loads and stores (no atomic read-modify-write, no
+shared written line), and frees slots with a release store of `head`. Producers that find a ring full drain their own inbound rings while they
+wait (no cyclic wait); termination is a `done` count with a final drain; names over 31 bytes use one exact mutex-protected map. Exact identity
+is unchanged (the full key block is compared). 9/9 fixtures correct, no deadlock, S 522.
+
+Local result (4 vCPUs, interleaved, 40 rounds x 2): cx19b 88.3-92.7 ms; cx30 141-152 ms (+55%), with 64-slot rings; 256 slots 137-148 ms;
+1,024 slots 133-141 ms (+50%). Single thread: +3%. Cycle counters (1 thread): consuming a message costs 92 cycles, against 78 for the shared-table
+path including its locked update. At 4 threads 417 M cycles are spent consuming and 132 M waiting for full rings, and the CPU time per run doubles
+(580 vs 330 ms). The cost is the movement of 133 MB of messages between cores (stores to ring lines that the owner's cache holds, 0.6 line per
+message), which is no cheaper than the 3.2 M cross-core mask-line transfers it replaces. **Falsified by the cheapest experiment (a 4-core run); the
+L2 residency the design relies on cannot offset a 50% loss.** My earlier rejection estimate (+3.5 ms from instruction counts) was the wrong
+quantity; the measured loss is in data movement, not instructions.
+
+**Interleaved board comparison** (3 sources x 2, one run each in turn, 04:39-05:07 UTC, all gates passed):
+
+| Source | T runs (ms) | mean T | K runs | M (MB) |
+|---|---|---:|---|---|
+| cx5 (`e016cdf08682676b`) | 35.418 / 35.158 | 35.29 | 31.439 / 31.709 | 14.20 / 13.86 |
+| cx19b (`b180dbe112729c5b`) | 34.247 / 34.444 | 34.35 | 32.142 / 32.122 | 13.93 / 13.77 |
+| cx22 (`4127cd63166718ff`) | 33.605 / 34.743 | 34.17 | 32.300 / 32.025 | 13.59 / 13.05 |
+
+cx19b beats cx5 in both pairs by 0.94 ms on average (-2.7%), a margin that held when the two were measured next to each other, so the earlier
+claim stands in this form. cx22 against cx19b is a tie in T (its two runs span 33.6-34.7), its S (456 against 428) costs about 0.9% of K, so its K
+is level; M was lower in both of its runs (13.1-13.6 against 13.8-13.9), within the spread seen for one source (13.1-14.2). cx19b stays in production.
