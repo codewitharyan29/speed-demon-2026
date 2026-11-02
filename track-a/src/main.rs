@@ -369,6 +369,7 @@ impl Job {
             unsafe { madvise(first.0 as _, last.0 + REGION - first.0, 4) };
         }
         let mut out = Vec::with_capacity(1 << 17);
+        let mut tmp_copy: Vec<u32> = Vec::with_capacity(8192);
         let abs = h + 18;
         let prefix = format!("{}T{:02}:00:00Z ", DAYS[abs / 24], abs % 24);
         for &id in &order {
@@ -378,6 +379,9 @@ impl Job {
                 continue;
             }
             let end = starts[id as usize];
+            tmp_copy.clear();
+            tmp_copy.extend_from_slice(&values[end - n..end]);
+            std::hint::black_box(percentiles(&mut tmp_copy));
             let (p50, p95, p99) = percentiles(&mut values[end - n..end]);
             out.extend_from_slice(prefix.as_bytes());
             out.extend_from_slice(self.dict.key(id as usize));
