@@ -112,3 +112,48 @@ they cannot be promoted; they need your approval to be run (one run each, 4 runs
 Local deltas for the same builds are in section 1 so that a board delta can be compared with them stage by stage. The sum of the
 four local deltas at 4 threads is 48 of 68.5 ms; the rest (cache misses on the entry line, ownership transfers, fixed costs) is
 not covered by any of them.
+
+## 5. Board diagnostics, run Nov 2 (approved by the user; diagnostics only, never promoted)
+
+Each ran the exact source in `docs/track-c-cpp-candidates/diag_*.cpp` (cx5 plus one `#define`) as `track-c/src/main.cpp` on
+`speed-demon` (team Bharat Labs). All gates passed for all four (check, build, correctness, timeout, sandbox): output equals the
+reference. After the four, cx5 was restored (commit `830b2e6`, tree identical to `41735ce`, main.cpp sha256 `e016cdf08682676b`).
+
+| Run | Commit | Source sha256 (first 16) | Board T | M | S | Official K (not meaningful) |
+|---|---|---|---:|---:|---:|---:|
+| cx5 reference (4 runs of the same source) | `66693b1`, `da56952`, `41735ce`, `830b2e6` | `e016cdf08682676b` | 34.514 / 34.706 / 34.699 / 34.773 ms (mean **34.673**, spread 0.26) | 13.86-14.14 MB | 432 | 31.86-31.92 |
+| diag_read2 `run-06073db82245` | `417d6bd` | `32b1ec2b84eb9c33` | 37.888 | 14.01 | 457 | 30.23 |
+| diag_struct2 `run-66f42f9d1b90` | `7333749` | `b3e1e25c7430c4d4` | 38.895 | 13.77 | 457 | 29.94 |
+| diag_parse2 `run-8dd98bf7319c` | `2daa676` | `abc9d55eccf4dd50` | 46.261 | 14.15 | 457 | 27.30 |
+| diag_table2 `run-b8818122f2c7` | `8ba2758` | `f85705d59b4ea3bc` | 42.586 | 13.86 | 457 | 28.57 |
+| cx5 restored `run-0d2d7eecb6f1` | `830b2e6` | `e016cdf08682676b` | 34.773 | 13.91 | 432 | 31.86 |
+
+Output hash: the board scores correctness against the reference and all four passed; the feed does not publish the output hash.
+The same builds produce the published full-seed-1 hash `d8088b1c...` locally.
+
+**Marginal cost of repeating each stage [board], against the cx5 mean of 34.673 ms (run-to-run spread 0.26 ms):**
+
+| Stage repeated | Board marginal | Share of T | Local 4-thread marginal (VM) | Share of local wall |
+|---|---:|---:|---:|---:|
+| `pread` of 202 MB (cold offsets) | **3.21 ms** | 9.3% | 12.9 ms | 19% |
+| structural pass | **4.22 ms** | 12.2% | 7.7 ms | 11% |
+| record parse + hash + prefetches | **11.59 ms** | 33.4% | 15.9 ms | 23% |
+| lookup + bit set on a now-hot line | **7.91 ms** | 22.8% | 11.7 ms | 17% |
+| sum | 26.94 ms | 78% | | |
+| not attributed (entry-line misses, line ownership transfers, startup, regions, tail) | 7.74 ms | 22% | | |
+
+The board and the VM disagree about the read (3.2 ms against a local 12.9 ms) and about the parse (a third of T on the board). A
+marginal cost is an upper bound on what a stage can give back, and assumes its repetition does not overlap with other work.
+
+## 6. Decision
+
+* **B (SMT-paired ingest): rejected.** Reading costs 3.21 ms. Hiding all of it gives T 31.46 and K 33.49 (exact formula, M 13.91,
+  S 432); at 50% overlap K 32.66. K35 is out of reach even at the ceiling, and the threshold in the plan (4 ms) was not met.
+* **A (owner-sharded tables): not built.** The whole hot lookup-plus-lock costs 7.91 ms; removing locks and line transfers can
+  return part of that, and the exchange adds 25-30 instructions per record at the board's measured parse rate (about 3.9 ms per 100
+  instructions per record), i.e. about +3.5 ms. Net about zero.
+* **Where the board says the time is:** record parse 11.6 ms, table path 7.9 ms, structural pass 4.2 ms, read 3.2 ms, unattributed 7.7.
+  K35 needs T 28.8 ms: -5.9 ms. Exact-formula projections: parse -40% (-4.6 ms) K 34.3; parse -50% K 34.95; parse -40% with
+  structure -40% and table path -30% (-8.7 ms) K 36.9.
+* **Next experiment:** cut the record-parse stage (about 300 of 540 instructions per record) by 40% or more with real instruction
+  reductions, then the table path; measure with cachegrind first, then wall time, then a board run if K is projected above 31.9.
