@@ -8,9 +8,10 @@ using u16 = uint16_t;
 using u32 = uint32_t;
 using u64 = uint64_t;
 using Ov = std::vector<std::pair<u32, u64>>;
-constexpr u32 RING = 4096, POOL = 1 << 13, T = 12, CHUNKS = 48, MSP = 1 << 17;
+constexpr u32 RING = 4096, POOL = 1 << 13, T = 12, CHUNKS = 48, MSP = 1 << 17, MAX_P = 2048;
 constexpr auto rx = std::memory_order_relaxed;
 static u32 n, m, *first, *adj, *rfirst, *radj, *e4;
+static u32 f_buf[T + 1], r_buf[T + 1];
 struct Sp {
   u32 u, e;
   u64 w;
@@ -55,14 +56,14 @@ static u64 heavy(const Ov &o, u32 edge) {
 
 struct Dial {
   u16 head[RING] = {}, fr = 0, used = 0;
-  u32 at = 0;
+  u32 at = 0, pushes = 0;
   u64 bits[RING / 64] = {}, top = 0, *__restrict pool;
   Dial(u64 *p) : pool(p) {}
   void push(u32 b, u32 node) {
     u16 h = head[b], i = fr ? fr : ++used;
     !h && (bits[b >> 6] |= 1ULL << (b & 63), top |= 1ULL << (b >> 6));
     fr = fr ? pool[i] >> 32 : 0;
-    pool[i] = node | (u64)h << 32, head[b] = i;
+    pool[i] = node | (u64)h << 32, head[b] = i, pushes++;
   }
   bool pop(u32 &b, u32 &node) {
     if (!top)
@@ -81,7 +82,7 @@ struct Dial {
     for (; top; top &= top - 1)
       for (u32 w = std::countr_zero(top); bits[w]; bits[w] &= bits[w] - 1)
         head[w << 6 | std::countr_zero(bits[w])] = 0;
-    fr = used = at = 0;
+    fr = used = at = pushes = 0;
   }
 };
 
@@ -91,12 +92,12 @@ struct Dist {
   u32 get(u32 v) { return pool[(u32)pt[v >> 7] << 7 | (v & 127)]; }
   void set(u32 v, u32 x) {
     u16 &p = pt[v >> 7];
-    !p && (own[np] = v >> 7, p = np++, 1);
+    !p && np < MAX_P &&
+        (own[np] = v >> 7, p = np++, memset(pool + ((size_t)p << 7), 0, 512), 1);
     pool[(u32)p << 7 | (v & 127)] = x;
   }
   void clear() {
-    for (u32 i = 1; i < np; i++)
-      memset(pool + (i << 7), 0, 512), pt[own[i]] = 0;
+    for (u32 i = 1; i < np; i++) pt[own[i]] = 0;
     np = 1;
   }
 };
@@ -172,9 +173,10 @@ static long fast(u32 s, u32 t, Dist &D, Side &F, Side &R) {
     }
     return 1;
   };
-  while (F.low <= R.low ? step.operator()<0>(F, R.low)
-                        : step.operator()<16>(R, F.low))
+  while (F.q.pushes <= R.q.pushes ? step.operator()<0>(F, R.low)
+                                  : step.operator()<16>(R, F.low))
     ;
+  big |= (D.np >= MAX_P - 4);
   F.q.clear(), R.q.clear(), D.clear();
   long ans = mu < 60000 || (mu != ~0u && !big) ? (long)mu : -1;
   return ans < 0 && big ? slow(s, t) : ans;
@@ -279,11 +281,11 @@ int main() {
         }
       }
     sync.arrive_and_wait();
-    !tid &&munmap((char *)e4 + e4b, tot * 4 + 4096 - e4b);
+    !tid && munmap((char *)e4 + e4b, tot * 4 + 4096 - e4b);
     for (size_t x = nlo; x < nhi; x++)
       first[x] = e4[4 * x];
     sync.arrive_and_wait();
-    !tid &&e4b > keep &&munmap((char *)e4 + keep, e4b - keep);
+    !tid && e4b > keep && munmap((char *)e4 + keep, e4b - keep);
     memset(rfirst + nlo, 0, (nhi - nlo + (tid == T - 1 ? 2 : 0)) * 4);
     for (size_t x = nlo; x < nhi; x++)
       radj[first[x] & 0xFFFFFF] = first[x] >> 24, first[x] &= 0xFFFFFF;
@@ -306,9 +308,23 @@ int main() {
         if (s != t && rfirst[b + 2] && radj[a])
           work.push_back({a, b, (u32)ans.size() - 1});
       }
-      std::partial_sum(radj, radj + n, first + 1), first[0] = 0;
-      std::partial_sum(rfirst + 1, rfirst + n + 2, rfirst + 1);
     }
+    u32 fs = 0, rs = 0;
+    for (size_t i = nlo; i < nhi; i++)
+      fs += radj[i], rs += rfirst[i + 2];
+    f_buf[tid + 1] = fs, r_buf[tid + 1] = rs;
+    sync.arrive_and_wait();
+    if (!tid) {
+      f_buf[0] = r_buf[0] = first[0] = rfirst[0] = 0;
+      for (u32 i = 1; i <= T; i++)
+        f_buf[i] += f_buf[i - 1], r_buf[i] += r_buf[i - 1];
+    }
+    sync.arrive_and_wait();
+    u32 fc = f_buf[tid], rc = r_buf[tid];
+    for (size_t i = nlo; i < nhi; i++)
+      first[i + 1] = (fc += radj[i]), rfirst[i + 1] = rc, rc += rfirst[i + 2];
+    if (tid == T - 1)
+      rfirst[n + 1] = rc;
     sync.arrive_and_wait();
     for (size_t u = nlo; u < nhi; u++)
       for (u32 i = first[u]; i < first[u + 1]; i++) {
@@ -328,9 +344,12 @@ int main() {
     }
     sync.arrive_and_wait();
     u32 P = (n >> 7) + 2;
-    auto pool = anon<u64>(2 * POOL + 65 * (size_t)P + 2);
+    size_t pt_w = (P * 2 + 7) / 8, own_w = (MAX_P * 2 + 7) / 8, pool_w = MAX_P * 64;
+    auto pool = anon<u64>(2 * POOL + pt_w + own_w + pool_w + 2);
     auto pt = (u16 *)(pool + 2 * POOL);
-    Dist D{pt, pt + P, 1, (u32 *)(pt + 2 * P)};
+    auto own = (u16 *)((char *)pt + P * 2);
+    auto dpool = (u32 *)((char *)own + MAX_P * 2);
+    Dist D{pt, own, 1, dpool};
     Side F{first, adj, &ov, Dial(pool)},
         R{rfirst, radj, &rov, Dial(pool + POOL)};
     for (u32 k = 0; k < T; k++)

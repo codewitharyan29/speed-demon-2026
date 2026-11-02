@@ -575,5 +575,15 @@ d >> 4 <= 3750 < 4096; keys never wrap around ring. pop() uses 1-cycle 	zcnt on 
 
 **Board run c31c0dd (step 36): T 0.12826 s (128.26 ms), M 65.43 MB, S 350, K 29.317, 73.356 pts (Rank #9 retained; memory dropped to 65.43 MB).**
 
+## Step 37: On-demand page zeroing, parallel 12-thread prefix sums, 1 MB scratch pools & frontier-balanced templated search
+
+| Change | Rationale | Observed / Expected Effect |
+|---|---|---|
+| **On-Demand Page Zeroing in Dist** | Eliminates eager `memset` inside `Dist::clear()`. Only newly allocated 512B pages (`!p`) are zeroed on demand | `clear()` becomes an $O(1)$ loop over touched page IDs (`pt[own[i]] = 0`); keeps hot pages in L1D cache |
+| **Parallel 12-Thread Prefix Sums** | Replaces single-threaded `std::partial_sum` on `radj` and `rfirst` with parallel 12-thread chunk reductions | Eliminates ~5 ms of sequential stall while 11 threads waited idle at barrier |
+| **Compact 2048-Page Scratch Pool** | Trims per-thread scratch pool (`MAX_P = 2048` pages, 1 MB) instead of 7 MB full-graph backing | Drops total per-thread scratch memory from 85 MB to ~14.5 MB; peak RSS drops to ~54-55 MB |
+| **Frontier-Balanced Templated Search** | Combines `F.q.pushes <= R.q.pushes` side selection with compile-time templated `step<0>` / `step<16>` | Expands minimal edges while preserving branchless immediate constant bit-shifts |
+
+
 
 
