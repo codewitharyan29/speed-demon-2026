@@ -195,3 +195,17 @@ The extra line read is a *read* of a line that other threads write: it measures 
   sharded table (architecture A) could, at a measured-instruction cost of about +3.5 ms. Realistic gain: 0-1.5 ms. Not pursued now.
 * The measured bottleneck is the record parse (11.5 ms, 33%) and, behind it, the lookup path (7.8 ms) and the structural pass
   (4.1 ms). Work continues on the parse.
+
+## 8. Parse diet cx16 (local, Nov 2): rejected
+
+`docs/track-c-cpp-candidates/cx16_parse_diet.cpp`: branch-free `num8` for 1-8 digit numbers (generic loop only beyond 8), fields stored
+directly instead of building a 48-byte aggregate, and `quotes(e1)` carried from the previous record's `quotes(e3)` (two prefix-count
+lookups per record instead of three). Correct on 9/9 fixtures (normal, adversarial, hostile-LF, stress, twins); S 442.
+**Cachegrind, sample seed 1, [local]: 198.5 M instructions against 199.8 M for cx5 (-0.7%); mispredicts 323,779 against 323,522.**
+GCC had already produced most of these savings from the cx5 source; the roughly 300 instructions of `record()` are spread over about
+40 lines (3 number parses about 80, quote counts about 34, struct build about 42, checks about 27, key and hash about 15). No wall-time
+measurement was made since the work is unchanged. Not submitted.
+
+What this implies for the parse bottleneck [board: 11.5 ms for the record stage]: a cut of 40% (K 34.3) needs about 120 fewer
+instructions per record, which no local rewriting of this formulation removed. The formulation itself (separator array from
+stage 1, then per-field scalar decoding) would have to change, and the measured attempts at that (cx12-cx14) were not faster.
