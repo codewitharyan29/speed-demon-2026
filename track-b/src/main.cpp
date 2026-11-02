@@ -158,6 +158,7 @@ u32* g_qlist;
 u32* g_tstart;
 u64* g_trig;
 u16* g_tmap;
+u64* g_has_q;
 u32 g_nq;
 
 Query* g_piece[kThreads];
@@ -954,6 +955,7 @@ void worker(int tid) {
     g_qlist = arena_alloc<u32>(n_qlist + 4);
     g_trig = arena_alloc<u64>(n_trig + 4);
     g_tmap = arena_alloc<u16>(g_nt + 2, true);
+    g_has_q = arena_alloc<u64>(g_pwords + 2, true);
     size_t keep_watermark = g_aoff.load(std::memory_order_relaxed);
     for (int t = 0; t < kThreads; t++) {
       Query* pc = g_piece[t];
@@ -974,6 +976,12 @@ void worker(int tid) {
     }
     for (u32 i = 0; i <= g_nb; i++) g_qstart[i + 1] += g_qstart[i];
     for (u32 i = 0; i <= n_tterms; i++) g_tstart[i + 1] += g_tstart[i];
+    for (u32 sid = 0; sid < g_ns; sid++) {
+      u32 term = g_nd + 1 + sid;
+      if (g_qstart[term + 1] > g_qstart[term]) {
+        g_has_q[sid >> 6] |= 1ULL << (sid & 63);
+      }
+    }
     u32* qfill = arena_alloc<u32>(g_nb + 2);
     u32* tfill = arena_alloc<u32>(n_tterms + 2);
     memcpy(qfill, g_qstart, (g_nb + 2) * 4);
@@ -1138,11 +1146,10 @@ void worker(int tid) {
     };
     eval_slice(g_qstart[0], g_qstart[g_nd + 1]);
     for (u32 pw = 0; pw < g_pwords; pw++) {
-      for (u64 mask = pres[pw]; mask; mask &= mask - 1) {
+      for (u64 mask = pres[pw] & g_has_q[pw]; mask; mask &= mask - 1) {
         u32 sid = pw * 64 + _tzcnt_u64(mask);
         u32 term = g_nd + 1 + sid;
-        u32 qa = g_qstart[term], qb = g_qstart[term + 1];
-        if (qa < qb) eval_slice(qa, qb);
+        eval_slice(g_qstart[term], g_qstart[term + 1]);
       }
     }
   }
